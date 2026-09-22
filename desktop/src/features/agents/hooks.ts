@@ -1,3 +1,4 @@
+import { refreshDirectoryAfterMembershipChange } from "@/features/channels/membershipDirectorySync";
 import * as React from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
@@ -711,7 +712,11 @@ export function useAttachManagedAgentToChannelMutation(
         throw new Error("No channel selected.");
       }
 
-      return attachManagedAgentToChannel(effectiveChannelId, rest);
+      return attachManagedAgentToChannel(effectiveChannelId, {
+        ...rest,
+        onMembershipAdded: () =>
+          refreshDirectoryAfterMembershipChange(queryClient),
+      });
     },
     onSuccess: (result, variables) => {
       const effectiveChannelId = variables.channelId ?? channelId;
@@ -760,7 +765,11 @@ export function useEnsureChannelAgentPresetMutation(channelId: string | null) {
         throw new Error("No channel selected.");
       }
 
-      return ensureChannelAgentPresetInChannel(channelId, input);
+      return ensureChannelAgentPresetInChannel(channelId, {
+        ...input,
+        onMembershipAdded: () =>
+          refreshDirectoryAfterMembershipChange(queryClient),
+      });
     },
     onSettled: () => {
       invalidateAgentQueriesInBackground(queryClient, channelId);
@@ -782,7 +791,11 @@ export function useCreateChannelManagedAgentMutation(channelId: string | null) {
       }
 
       const result = await createChannelManagedAgents(effectiveChannelId, [
-        rest,
+        {
+          ...rest,
+          onMembershipAdded: () =>
+            refreshDirectoryAfterMembershipChange(queryClient),
+        },
       ]);
       const success = result.successes[0];
       if (success) {
@@ -882,7 +895,14 @@ export function useCreateChannelManagedAgentsMutation(
         throw new Error("No channel selected.");
       }
 
-      return createChannelManagedAgents(channelId, inputs);
+      return createChannelManagedAgents(
+        channelId,
+        inputs.map((input) => ({
+          ...input,
+          onMembershipAdded: () =>
+            refreshDirectoryAfterMembershipChange(queryClient),
+        })),
+      );
     },
     onSettled: () => {
       invalidateAgentQueriesInBackground(queryClient, channelId);

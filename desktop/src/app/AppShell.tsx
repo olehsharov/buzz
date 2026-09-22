@@ -1,3 +1,4 @@
+import { refreshDirectoryAfterMembershipChange } from "@/features/channels/membershipDirectorySync";
 import * as React from "react";
 import { ProtectedGlobalOverlay } from "@protected-feature-components";
 import { useQueryClient } from "@tanstack/react-query";
@@ -533,6 +534,7 @@ export function AppShell() {
   const handleBrowseChannelJoin = React.useCallback(
     async (channelId: string) => {
       await joinChannel(channelId);
+      refreshDirectoryAfterMembershipChange(queryClient);
       await queryClient.invalidateQueries({ queryKey: channelsQueryKey });
     },
     [queryClient],

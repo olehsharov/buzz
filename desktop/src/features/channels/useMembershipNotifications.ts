@@ -1,3 +1,4 @@
+import { refreshDirectoryAfterMembershipChange } from "./membershipDirectorySync";
 import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
 
@@ -27,6 +28,7 @@ export function useMembershipNotifications(currentPubkey?: string) {
         return;
       }
 
+      refreshDirectoryAfterMembershipChange(queryClient, event.id);
       void queryClient.invalidateQueries({
         queryKey: ["channels", channelId, "detail"],
       });
