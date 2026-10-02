@@ -76,10 +76,31 @@ export function duplicatePersonaDialogState(
       // The user sees the inherited values in the dialog and can clear
       // them if they want a blank template.
       namePool: persona.namePool ?? [],
-      envVars: persona.envVars ?? {},
+      envVars: duplicateEnvVars(persona.envVars),
       ...behaviorEntry(persona),
     },
   };
+}
+
+/**
+ * Env keys that bind one agent to one provider session and must not follow
+ * it into a duplicate. `BUZZ_ACP_RESUME_SESSION` names a session transcript
+ * that lives under the source agent's working directory; the duplicate picks
+ * its own run location, so the fork fails on every turn wherever that
+ * directory differs.
+ */
+const NON_DUPLICABLE_ENV_KEYS: ReadonlySet<string> = new Set([
+  "BUZZ_ACP_RESUME_SESSION",
+]);
+
+function duplicateEnvVars(
+  envVars: Record<string, string> | undefined,
+): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(envVars ?? {}).filter(
+      ([key]) => !NON_DUPLICABLE_ENV_KEYS.has(key),
+    ),
+  );
 }
 
 /**

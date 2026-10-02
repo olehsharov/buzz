@@ -128,6 +128,31 @@ test("duplicatePersonaDialogState carries envVars and namePool into the duplicat
   assert.deepEqual(state.initialValues.namePool, ["alice", "bob"]);
 });
 
+test("duplicatePersonaDialogState drops the source agent's resume session", () => {
+  // The resume id names a transcript under the source agent's working
+  // directory; a duplicate that runs elsewhere fails every turn on it.
+  const state = duplicatePersonaDialogState({
+    id: "persona-resumed",
+    displayName: "Robot",
+    avatarUrl: null,
+    systemPrompt: "",
+    runtime: null,
+    model: null,
+    isBuiltIn: false,
+    isActive: true,
+    envVars: {
+      ANTHROPIC_BASE_URL: "http://localhost:4001",
+      BUZZ_ACP_RESUME_SESSION: "35477ccb-3acc-499e-8b62-028f5b194ffd",
+    },
+    createdAt: "2025-01-01T00:00:00Z",
+    updatedAt: "2025-01-02T00:00:00Z",
+  });
+
+  assert.deepEqual(state.initialValues.envVars, {
+    ANTHROPIC_BASE_URL: "http://localhost:4001",
+  });
+});
+
 test("editPersonaDialogState preserves the persona id for updates", () => {
   const state = editPersonaDialogState({
     id: "persona-2",
