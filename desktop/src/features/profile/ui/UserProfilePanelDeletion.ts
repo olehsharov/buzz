@@ -1,4 +1,3 @@
-import { refreshDirectoryAfterMembershipChange } from "@/features/channels/membershipDirectorySync";
 import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
 
@@ -67,9 +66,7 @@ export function useProfileAgentDeletion({
       if (channelIds.size === 0) return;
       await Promise.allSettled(
         [...channelIds].map((channelId) =>
-          removeChannelMember(channelId, agentPubkey).then(() => {
-            refreshDirectoryAfterMembershipChange(queryClient);
-          }),
+          removeChannelMember(channelId, agentPubkey),
         ),
       );
       // Direct writes bypass the member mutations' invalidation; without

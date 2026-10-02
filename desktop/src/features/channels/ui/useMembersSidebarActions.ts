@@ -1,5 +1,4 @@
 import { isRelayRemovedError } from "@/features/agents/managedAgentRelayCleanup";
-import { refreshDirectoryAfterMembershipChange } from "@/features/channels/membershipDirectorySync";
 import {
   agentPresenceStartBlockReason,
   type AgentAvailabilityReader,
@@ -315,7 +314,6 @@ export function useMembersSidebarActions({
     }
 
     await removeChannelMember(channelId, pubkey);
-    refreshDirectoryAfterMembershipChange(queryClient);
   }
 
   async function invalidateSidebarQueries() {

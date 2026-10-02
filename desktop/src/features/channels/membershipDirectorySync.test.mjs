@@ -2,9 +2,13 @@ import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 import { QueryClient, QueryObserver } from "@tanstack/react-query";
 import {
+  getMembershipAdmissionEpoch,
   refreshDirectoryAfterMembershipChange as refresh,
+  refreshDirectoryOnMembershipChange,
   resetMembershipDirectorySync,
 } from "./membershipDirectorySync.ts";
+import { resetChannelMembershipWrites } from "@/shared/api/channelMembershipWrites";
+import { addChannelMembers } from "@/shared/api/tauri";
 
 const KEY = ["relay-agents"];
 const clients = [];
@@ -35,6 +39,7 @@ function observe(value, queryFn, initialData = []) {
   return observer;
 }
 afterEach(() => {
+  resetChannelMembershipWrites();
   resetMembershipDirectorySync();
   for (const dispose of disposers.splice(0)) dispose();
   for (const value of clients.splice(0)) value.clear();
@@ -137,4 +142,50 @@ test("community reset cancels queued work and event deduplication is client-scop
   await settle();
   assert.equal(firstCalls, 0);
   assert.equal(secondCalls, 1);
+});
+
+test("a direct membership write (Welcome provisioning path) retires admission and the directory", async () => {
+  const previousWindow = globalThis.window;
+  globalThis.window = {
+    __TAURI_INTERNALS__: {
+      invoke: async (cmd) => {
+        if (cmd === "add_channel_members")
+          return { added: ["agent"], errors: [] };
+        throw new Error(`unmocked ${cmd}`);
+      },
+    },
+  };
+  const value = client();
+  let calls = 0;
+  observe(value, async () => {
+    calls += 1;
+    return [];
+  });
+  const unsubscribe = refreshDirectoryOnMembershipChange(value);
+  try {
+    // An admission check captured this epoch before the write.
+    const admissionEpoch = getMembershipAdmissionEpoch();
+    await addChannelMembers({
+      channelId: "channel-1",
+      pubkeys: ["agent"],
+      role: "bot",
+    });
+    assert.notEqual(getMembershipAdmissionEpoch(), admissionEpoch);
+    assert.equal(value.getQueryState(KEY).isInvalidated, true);
+    await settle();
+    assert.equal(calls, 1);
+
+    unsubscribe();
+    resetChannelMembershipWrites();
+    const afterUnsubscribe = getMembershipAdmissionEpoch();
+    await addChannelMembers({
+      channelId: "channel-2",
+      pubkeys: ["agent"],
+      role: "bot",
+    });
+    assert.equal(getMembershipAdmissionEpoch(), afterUnsubscribe);
+  } finally {
+    unsubscribe();
+    globalThis.window = previousWindow;
+  }
 });

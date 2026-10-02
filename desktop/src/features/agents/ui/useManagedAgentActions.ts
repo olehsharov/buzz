@@ -1,6 +1,5 @@
 import { isRelayRemovedError } from "@/features/agents/managedAgentRelayCleanup";
 import { useCommunities } from "@/features/communities/useCommunities";
-import { refreshDirectoryAfterMembershipChange } from "@/features/channels/membershipDirectorySync";
 import * as React from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -319,11 +318,7 @@ export function useManagedAgentActions() {
     const channelIds = getAgentChannelIds(pubkey);
     if (channelIds.length === 0) return;
     await Promise.allSettled(
-      channelIds.map((channelId) =>
-        removeChannelMember(channelId, pubkey).then(() => {
-          refreshDirectoryAfterMembershipChange(queryClient);
-        }),
-      ),
+      channelIds.map((channelId) => removeChannelMember(channelId, pubkey)),
     );
     // Direct writes bypass the member mutations' invalidation; without this,
     // the deleted agent stays in cached rosters for the freshness window.

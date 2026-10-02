@@ -7,6 +7,7 @@ import {
 } from "@tanstack/react-query";
 
 import {
+  addChannelMembers,
   archiveChannel,
   createChannel,
   deleteChannel,
@@ -14,13 +15,17 @@ import {
   getChannelMembers,
   getChannels,
   hideDm,
+  joinChannel,
+  leaveChannel,
   openDm,
+  removeChannelMember,
   setChannelPurpose,
   setChannelTopic,
   unarchiveChannel,
   updateChannel,
 } from "@/shared/api/tauri";
 import type {
+  AddChannelMembersInput,
   Channel,
   ChannelDetail,
   CreateChannelInput,
@@ -28,9 +33,10 @@ import type {
   SetChannelTopicInput,
   UpdateChannelInput,
 } from "@/shared/api/types";
-import type {
-  GetChannelsPayload,
-  OpenDmInput,
+import {
+  syncAgentsToActiveHuddle,
+  type GetChannelsPayload,
+  type OpenDmInput,
 } from "@/shared/api/tauriChannels";
 import { mergeConcurrentChannelRecency } from "@/features/channels/lib/channelRecencyMerge";
 import { useIdentityQuery } from "@/shared/api/hooks";
@@ -815,6 +821,101 @@ export function useDeleteChannelMutation(channelId: string | null) {
   });
 }
 
+export function useAddChannelMembersMutation(channelId: string | null) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (
+      input: Omit<AddChannelMembersInput, "channelId"> & {
+        channelId?: string;
+      },
+    ) => {
+      const { channelId: capturedChannelId, ...rest } = input;
+      const effectiveChannelId = capturedChannelId ?? channelId;
+      if (!effectiveChannelId) {
+        throw new Error("No channel selected.");
+      }
+
+      return addChannelMembers({ ...rest, channelId: effectiveChannelId });
+    },
+    onSuccess: (result, variables) => {
+      const effectiveChannelId = variables.channelId ?? channelId;
+      if (
+        effectiveChannelId &&
+        variables.role === "bot" &&
+        result.added.length > 0
+      ) {
+        void syncAgentsToActiveHuddle(effectiveChannelId, result.added).catch(
+          (error) => {
+            console.warn("Could not sync added agents into Huddle:", error);
+          },
+        );
+      }
+    },
+    onSettled: async (_data, _err, variables) => {
+      // Invalidate the effective channel (the one actually mutated) not the
+      // live hook-closure channel, which may have changed mid-send.
+      const effectiveChannelId = variables?.channelId ?? channelId;
+      await invalidateChannelState(queryClient, effectiveChannelId);
+    },
+  });
+}
+
+export function useRemoveChannelMemberMutation(channelId: string | null) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async (pubkey: string) => {
+      if (!channelId) {
+        throw new Error("No channel selected.");
+      }
+
+      await removeChannelMember(channelId, pubkey);
+    },
+    onSettled: async () => {
+      await Promise.all([
+        invalidateChannelState(queryClient, channelId),
+        queryClient.invalidateQueries({ queryKey: ["managed-agents"] }),
+        queryClient.invalidateQueries({ queryKey: ["relay-agents"] }),
+      ]);
+    },
+  });
+}
+
+export function useJoinChannelMutation(channelId: string | null) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async () => {
+      if (!channelId) {
+        throw new Error("No channel selected.");
+      }
+
+      await joinChannel(channelId);
+    },
+    onSettled: async () => {
+      await invalidateChannelState(queryClient, channelId);
+    },
+  });
+}
+
+export function useLeaveChannelMutation(channelId: string | null) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: async () => {
+      if (!channelId) {
+        throw new Error("No channel selected.");
+      }
+
+      await leaveChannel(channelId);
+    },
+    onSettled: async () => {
+      await invalidateChannelState(queryClient, channelId);
+    },
+  });
+}
+
 export function useSelectedChannel(
   channels: Channel[],
   preferredChannelId: string | null,
@@ -867,10 +968,3 @@ export {
   useCanvasQuery,
   useSetCanvasMutation,
 } from "@/features/channels/canvasHooks";
-
-export {
-  useAddChannelMembersMutation,
-  useJoinChannelMutation,
-  useLeaveChannelMutation,
-  useRemoveChannelMemberMutation,
-} from "./channelMembershipMutations";

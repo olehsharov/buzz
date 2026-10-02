@@ -1,5 +1,3 @@
-import { useQueryClient } from "@tanstack/react-query";
-import { refreshDirectoryAfterMembershipChange } from "@/features/channels/membershipDirectorySync";
 import { Trash2 } from "lucide-react";
 import * as React from "react";
 import { toast } from "sonner";
@@ -75,7 +73,6 @@ export function ProjectAgentChatPanel({
   widthPx?: number;
 }) {
   const { activeCommunity } = useCommunities();
-  const queryClient = useQueryClient();
   const identityQuery = useIdentityQuery();
   // Repository coordinates (`kind:owner:dtag`) are not globally unique — the
   // same address can exist on two relays. Scope persistence, drafts, and
@@ -170,7 +167,7 @@ export function ProjectAgentChatPanel({
               normalizePubkey(pubkey) === normalizePubkey(selectedAgent.pubkey),
           );
           if (!alreadyMember) {
-            const membership = await addChannelMembers(
+            await addChannelMembers(
               projectAgentMembershipInput({
                 channelId: homeChannel.id,
                 agentPubkey: selectedAgent.pubkey,
@@ -178,8 +175,6 @@ export function ProjectAgentChatPanel({
                 signerScope,
               }),
             );
-            if (membership.added.length > 0)
-              refreshDirectoryAfterMembershipChange(queryClient);
           }
         }
         const { channel, sent } = await submitProjectAgentMessage({
@@ -248,7 +243,6 @@ export function ProjectAgentChatPanel({
       identityQuery.data?.pubkey,
       isSending,
       openDmMutation,
-      queryClient,
       relayScope,
       selectedAgent,
       signerScope,

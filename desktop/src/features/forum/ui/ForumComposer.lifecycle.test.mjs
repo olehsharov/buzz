@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import vm from "node:vm";
 import { after, afterEach, before, test } from "node:test";
+import { act } from "@testing-library/react";
 import { JSDOM } from "jsdom";
 import * as React from "react";
 import ts from "typescript";
@@ -305,6 +306,20 @@ async function setup(options = {}) {
       { pubkey: KEY, name: "Scout", personaId: "persona", status: "running" },
     ];
     control.teams = [{ id: "team", name: "Crew", personaIds: ["persona"] }];
+    control.cachedMembers = [];
+    control.liveMembers = [];
+    window.__TAURI_INTERNALS__ = {
+      invoke: async (command) => {
+        if (command === "get_channel_members") {
+          calls.push(["members"]);
+          if (control.members) await control.members.promise;
+          return { members: control.liveMembers };
+        }
+        if (command === "get_channels")
+          return { hash: "h", channels: [], last_messages: {} };
+        throw new Error(`unmocked ${command}`);
+      },
+    };
     const agentHooks = {
       useManagedAgentsQuery: () => query(() => control.agents),
       useRelayAgentsQuery: () => query(() => []),
@@ -334,7 +349,9 @@ async function setup(options = {}) {
       {
         "@/features/agents/hooks": agentHooks,
         "@/features/channels/hooks": {
-          useChannelMembersQuery: () => query(() => []),
+          // The cached roster the picker and Invite prompt read. Live member
+          // reads go through the Tauri bridge below and can diverge from it.
+          useChannelMembersQuery: () => query(() => control.cachedMembers),
           useChannelsQuery: () => query(() => []),
         },
         "@/features/identity-archive/hooks": {
@@ -350,6 +367,8 @@ async function setup(options = {}) {
         "./agentMentionRevalidation": revalidation,
       },
     );
+    // One module instance, so the send flow recognizes its error classes.
+    stubs["@/features/messages/lib/agentMentionRevalidation"] = revalidation;
     stubs["@/features/messages/lib/useMentions"] = {
       useMentions: (...args) => {
         const result = productionMentions.useMentions(...args);
@@ -404,6 +423,7 @@ async function setup(options = {}) {
         useComposerVoiceNote: () => ({
           acceptsAttachment: true,
           hasAttachmentRef: { current: false },
+          statusRef: { current: "idle" },
         }),
       },
       "./ComposerDockToolbar": { ComposerDockToolbar: () => null },
@@ -434,6 +454,11 @@ async function setup(options = {}) {
       ? { rootTags: [], rootEventId: "root" }
       : undefined,
     onSubmit: async (...args) => {
+      calls.push(["send", source, ...args]);
+      if (transport) await transport.promise;
+    },
+    // The main composer's publish callback; the forum composer ignores it.
+    onSend: async (...args) => {
       calls.push(["send", source, ...args]);
       if (transport) await transport.promise;
     },
@@ -1012,4 +1037,60 @@ for (const active of [false, true]) {
       active ? 1 : 0,
     );
   });
+}
+
+const HUMAN = "d".repeat(64);
+const PAT = {
+  pubkey: HUMAN,
+  role: "member",
+  is_agent: false,
+  display_name: "Pat",
+};
+for (const main of [false, true]) {
+  for (const removal of ["none", "after-selection", "during-publish-read"]) {
+    test(`mounted ${main ? "main" : "forum"} publish checks a person's membership: removed ${removal}`, async () => {
+      const s = await setup({ realMentions: true, main });
+      s.control.cachedMembers = [
+        { pubkey: HUMAN, role: "member", isAgent: false, displayName: "Pat" },
+      ];
+      s.control.liveMembers = [PAT];
+      s.navigate("b");
+      await s.open();
+      await s.choose("Pat");
+      assert.deepEqual(s.mentions.extractMentionPubkeys(s.text), [HUMAN]);
+      const text = s.text;
+      // The cached roster still lists Pat, so no Invite prompt intervenes.
+      let gate;
+      if (removal === "after-selection") s.control.liveMembers = [];
+      if (removal === "during-publish-read")
+        s.control.members = gate = deferred();
+      await s.submit();
+      if (gate) {
+        s.control.liveMembers = [];
+        await s.finish(gate);
+        await act(async () => {});
+      }
+      await act(async () => {});
+      const sends = s.calls.filter(([name]) => name === "send");
+      if (removal === "none") {
+        assert.equal(sends.length, 1);
+        assert.ok(sends[0].flat(2).includes(HUMAN), "a member is still tagged");
+        return;
+      }
+      assert.equal(sends.length, 0);
+      assert.deepEqual(
+        s.calls
+          .filter(([name]) => name === "error")
+          .map(([, message]) => message),
+        [
+          "A mentioned person is no longer in this channel. Invite them or remove the mention, then retry.",
+        ],
+      );
+      assert.equal(
+        s.text.trim(),
+        text.trim(),
+        "the draft is retained for retry",
+      );
+    });
+  }
 }

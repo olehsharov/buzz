@@ -766,6 +766,7 @@ export function useMentions(
   const revalidateMentionPubkeys = useAgentMentionRevalidation({
     agentPubkeys: agentIdentityPubkeys,
     getSelectedAgentPubkeys,
+    channelType: options?.channelType,
     currentPubkey,
     eligibilityScope: mentionChannelId
       ? { type: "channel", channelId: mentionChannelId }

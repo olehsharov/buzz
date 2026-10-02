@@ -3,6 +3,7 @@ import {
   getMentionableAgentPubkeys,
   type AgentEligibilityScope,
 } from "@/features/agents/lib/agentAutocompleteEligibility";
+import { getChannelMembers } from "@/shared/api/tauriChannels";
 import { revalidateRelayAgents } from "@/shared/api/tauriRelayAgents";
 import type { ManagedAgent, RelayAgent } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
@@ -20,6 +21,58 @@ export class AgentMentionAuthorizationError extends Error {
     );
     this.name = "AgentMentionAuthorizationError";
   }
+}
+
+/** A mentioned person is not a member of the destination at publication. */
+export class MentionMembershipChangedError extends Error {
+  constructor(unverified = false) {
+    super(
+      unverified
+        ? "Could not check that the people you mentioned are still in this channel. Retry, or remove the mentions."
+        : "A mentioned person is no longer in this channel. Invite them or remove the mention, then retry.",
+    );
+    this.name = "MentionMembershipChangedError";
+  }
+}
+
+/** Errors whose message is safe and actionable for the composer to show. */
+export function isMentionAuthorizationError(error: unknown): error is Error {
+  return (
+    error instanceof AgentMentionAuthorizationError ||
+    error instanceof MentionMembershipChangedError
+  );
+}
+
+/**
+ * Publication signs a `p` tag for every person in `pubkeys`. Selection and
+ * the Invite prompt prove membership only at their own time, so read the
+ * destination's member list fresh and fail closed for any person who is not
+ * a member now (from the writer: a lagging replica can still list someone
+ * just removed). Send without inviting has already moved declined people to
+ * reference tags, and invited people are members by this point.
+ */
+export async function revalidateHumanMentionMembership({
+  pubkeys,
+  agentPubkeys,
+  channelId,
+  fetchMembers = (id) => getChannelMembers(id, { readYourWrites: true }),
+}: {
+  pubkeys: readonly string[];
+  agentPubkeys: ReadonlySet<string>;
+  channelId: string;
+  fetchMembers?: (channelId: string) => Promise<{ pubkey: string }[]>;
+}) {
+  const humans = [...new Set(pubkeys.map(normalizePubkey))].filter(
+    (pubkey) => !agentPubkeys.has(pubkey),
+  );
+  if (humans.length === 0) return;
+  const members = await fetchMembers(channelId).catch(() => null);
+  if (!members) throw new MentionMembershipChangedError(true);
+  const memberPubkeys = new Set(
+    members.map((member) => normalizePubkey(member.pubkey)),
+  );
+  if (humans.some((pubkey) => !memberPubkeys.has(pubkey)))
+    throw new MentionMembershipChangedError();
 }
 
 type DirectoryResult<T> = {
@@ -98,12 +151,14 @@ export async function revalidateAgentMentionPubkeys({
 export function useAgentMentionRevalidation({
   agentPubkeys,
   getSelectedAgentPubkeys,
+  channelType,
   currentPubkey,
   eligibilityScope,
   sharedChannelIds,
   refetchManagedAgents,
 }: {
   agentPubkeys: ReadonlySet<string>;
+  channelType?: string | null;
   getSelectedAgentPubkeys: () => ReadonlySet<string>;
   currentPubkey: string | null;
   eligibilityScope: AgentEligibilityScope;
@@ -124,13 +179,26 @@ export function useAgentMentionRevalidation({
             channelId: destinationChannelId,
           }
         : eligibilityScope;
-      return revalidateAgentMentionPubkeys({
+      const knownAgentPubkeys = new Set([
+        ...agentPubkeys,
+        ...getSelectedAgentPubkeys(),
+        ...(options.intendedAgentPubkeys ?? []).map(normalizePubkey),
+      ]);
+      // Only the explicit publish pass signs new recipients into a channel.
+      // DMs have fixed participants and no member list to change.
+      const humanMembership =
+        options.phase === "publish" &&
+        destinationChannelId &&
+        channelType !== "dm"
+          ? revalidateHumanMentionMembership({
+              pubkeys,
+              agentPubkeys: knownAgentPubkeys,
+              channelId: destinationChannelId,
+            })
+          : Promise.resolve();
+      const agents = revalidateAgentMentionPubkeys({
         pubkeys,
-        agentPubkeys: new Set([
-          ...agentPubkeys,
-          ...getSelectedAgentPubkeys(),
-          ...(options.intendedAgentPubkeys ?? []).map(normalizePubkey),
-        ]),
+        agentPubkeys: knownAgentPubkeys,
         phase: options.phase,
         currentPubkey,
         eligibilityScope: scope,
@@ -142,9 +210,11 @@ export function useAgentMentionRevalidation({
             "channelId" in scope ? (scope.channelId ?? undefined) : undefined,
           ),
       });
+      return Promise.all([agents, humanMembership]).then(([result]) => result);
     },
     [
       agentPubkeys,
+      channelType,
       currentPubkey,
       eligibilityScope,
       getSelectedAgentPubkeys,

@@ -371,7 +371,10 @@ export function useAgentAddressLockPicker({
   const toggleAlwaysAddressAgent = React.useCallback(
     (
       suggestion: MentionSuggestion,
-      options: { preserveMention?: boolean; owner?: MentionAdmissionOwner } = {},
+      options: {
+        preserveMention?: boolean;
+        owner?: MentionAdmissionOwner;
+      } = {},
     ) => {
       // Removal is always available, including after authority is revoked.
       if (lockedAgentPubkeys.has(normalizePubkey(suggestion.pubkey ?? ""))) {

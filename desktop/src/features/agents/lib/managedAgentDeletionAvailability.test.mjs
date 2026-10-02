@@ -470,9 +470,8 @@ test("successful cached snapshot remains authoritative during refetch; only sett
 
 for (const owner of ["agents", "profile"]) {
   test(`${owner} cleanup retires admission per accepted removal while another removal is pending or rejected`, async (t) => {
-    const { getMembershipAdmissionEpoch } = await import(
-      "../../channels/membershipDirectorySync.ts"
-    );
+    const { getMembershipAdmissionEpoch, refreshDirectoryOnMembershipChange } =
+      await import("../../channels/membershipDirectorySync.ts");
     setup();
     directory[0].channelIds = ["channel", "second-channel"];
     t.after(() => {
@@ -488,6 +487,9 @@ for (const owner of ["agents", "profile"]) {
         }),
     );
     const surface = mount(owner);
+    // The app-level subscription that turns recorded membership writes into
+    // admission retirement (CommunityQueryProvider).
+    t.after(refreshDirectoryOnMembershipChange(surface.client));
     await waitFor(() =>
       assert.equal(surface.current().getAvailability(PK), "offline"),
     );

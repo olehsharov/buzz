@@ -1,5 +1,7 @@
 import type { QueryClient } from "@tanstack/react-query";
 
+import { onChannelMembershipChange } from "@/shared/api/channelMembershipWrites";
+
 const directoryQueryKey = ["relay-agents"] as const;
 const COALESCE_MS = 200;
 const MAX_EVENT_IDS = 256;
@@ -32,6 +34,9 @@ export function resetMembershipDirectorySync(): void {
  * Membership changes invalidate the shared directory's channel projection.
  * Only accepted writes and membership events call this: local agent-store
  * rebuilds and policy replay must not create a directory refresh loop.
+ * Local writes and active-channel membership events reach it through
+ * `refreshDirectoryOnMembershipChange`; background channel events call it
+ * directly with their event id.
  *
  * Mark stale immediately, then coalesce bursts in a fixed window (not a sliding
  * debounce that could starve under load). Cancel even a cold in-flight read at
@@ -85,4 +90,19 @@ export function refreshDirectoryAfterMembershipChange(
       return queryClient.invalidateQueries({ queryKey: directoryQueryKey });
     });
   }, COALESCE_MS);
+}
+
+/**
+ * Retires directory reads and in-flight mention admission for every
+ * membership change the client records (see channelMembershipWrites): each
+ * membership write API and observed active-channel membership event. One
+ * subscription covers write paths that never pass through a mutation hook,
+ * such as Welcome-team provisioning and Huddle agent sync.
+ */
+export function refreshDirectoryOnMembershipChange(
+  queryClient: QueryClient,
+): () => void {
+  return onChannelMembershipChange(() =>
+    refreshDirectoryAfterMembershipChange(queryClient),
+  );
 }
