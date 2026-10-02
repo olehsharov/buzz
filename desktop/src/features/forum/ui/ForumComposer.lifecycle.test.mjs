@@ -317,11 +317,23 @@ async function setup(options = {}) {
         }
         if (command === "get_channels")
           return { hash: "h", channels: [], last_messages: {} };
+        // Main readiness syncs a mentioned member agent into any live Huddle.
+        if (command === "sync_agents_to_active_huddle")
+          return { changed_channel_ids: [], error: null };
         throw new Error(`unmocked ${command}`);
       },
     };
     const agentHooks = {
-      useManagedAgentsQuery: () => query(() => control.agents),
+      useManagedAgentsQuery: () => ({
+        ...query(() => control.agents),
+        refetch: async () => {
+          calls.push(["agents-read"]);
+          // Hold only the final publish pass, not chat's earlier prepare.
+          if (control.agentRead && control.phase === "publish")
+            await control.agentRead.promise;
+          return { data: control.agents, error: null };
+        },
+      }),
       useRelayAgentsQuery: () => query(() => []),
       usePersonasQuery: () => ({
         ...query(() => control.personas),
@@ -332,7 +344,7 @@ async function setup(options = {}) {
       }),
       useTeamsQuery: () => query(() => control.teams),
     };
-    const revalidation = await loadWithImports(
+    const productionRevalidation = await loadWithImports(
       "../../messages/lib/agentMentionRevalidation.ts",
       {
         "@/shared/api/tauriRelayAgents": {
@@ -344,6 +356,22 @@ async function setup(options = {}) {
         },
       },
     );
+    // Record the running pass so a test can hold only the publish pass.
+    const revalidation = {
+      ...productionRevalidation,
+      useAgentMentionRevalidation: (...args) => {
+        const revalidate = productionRevalidation.useAgentMentionRevalidation(
+          ...args,
+        );
+        return React.useCallback(
+          (pubkeys, channelId, options = {}) => {
+            control.phase = options.phase;
+            return revalidate(pubkeys, channelId, options);
+          },
+          [revalidate],
+        );
+      },
+    };
     const productionMentions = await loadWithImports(
       "../../messages/lib/useMentions.ts",
       {
@@ -1083,7 +1111,7 @@ for (const main of [false, true]) {
           .filter(([name]) => name === "error")
           .map(([, message]) => message),
         [
-          "A mentioned person is no longer in this channel. Invite them or remove the mention, then retry.",
+          "Someone you mentioned is not in this channel now. Add them or remove the mention, then retry.",
         ],
       );
       assert.equal(
@@ -1094,3 +1122,96 @@ for (const main of [false, true]) {
     });
   }
 }
+
+// Every signed recipient must be on the fresh roster, the managed agent
+// included, and that roster read must follow agent authorization. Hold the
+// managed-agent read, remove a recipient, then release it.
+const SCOUT = {
+  pubkey: KEY,
+  role: "bot",
+  is_agent: true,
+  display_name: "Scout",
+};
+for (const main of [false, true]) {
+  for (const [removed, when] of [
+    ["agent", "after-selection"],
+    ["agent", "during-agent-read"],
+    ["person", "during-agent-read"],
+  ]) {
+    test(`mounted ${main ? "main" : "forum"} publish refuses the ${removed} removed ${when}`, async () => {
+      const s = await setup({ realMentions: true, main });
+      s.control.cachedMembers = [
+        { pubkey: HUMAN, role: "member", isAgent: false, displayName: "Pat" },
+        { pubkey: KEY, role: "bot", isAgent: true, displayName: "Scout" },
+      ];
+      s.control.liveMembers = [PAT, SCOUT];
+      s.navigate("b");
+      await s.open();
+      await s.choose("Pat");
+      await s.open();
+      await s.choose("Scout");
+      assert.deepEqual(
+        [...s.mentions.extractMentionPubkeys(s.text)].sort(),
+        [KEY, HUMAN].sort(),
+      );
+      const text = s.text;
+      const remove = () => {
+        const gone = removed === "agent" ? KEY : HUMAN;
+        s.control.liveMembers = s.control.liveMembers.filter(
+          (member) => member.pubkey !== gone,
+        );
+      };
+      if (when === "after-selection") remove();
+      else s.control.agentRead = deferred();
+      const reads = s.calls.length;
+      await s.submit();
+      if (when === "during-agent-read") {
+        assert.equal(s.control.phase, "publish");
+        assert.ok(
+          s.calls.slice(reads).some(([name]) => name === "agents-read"),
+          "publish is held at agent authorization",
+        );
+        assert.equal(s.calls.filter(([name]) => name === "send").length, 0);
+        remove();
+        await s.finish(s.control.agentRead);
+        await act(async () => {});
+      }
+      await act(async () => {});
+      assert.equal(s.calls.filter(([name]) => name === "send").length, 0);
+      assert.deepEqual(
+        s.calls
+          .filter(([name]) => name === "error")
+          .map(([, message]) => message),
+        [
+          "Someone you mentioned is not in this channel now. Add them or remove the mention, then retry.",
+        ],
+      );
+      assert.equal(
+        s.text.trim(),
+        text.trim(),
+        "the draft is retained for retry",
+      );
+    });
+  }
+}
+
+for (const main of [false, true])
+  test(`mounted ${main ? "main" : "forum"} publish keeps a person and agent who are both still members`, async () => {
+    const s = await setup({ realMentions: true, main });
+    s.control.cachedMembers = [
+      { pubkey: HUMAN, role: "member", isAgent: false, displayName: "Pat" },
+      { pubkey: KEY, role: "bot", isAgent: true, displayName: "Scout" },
+    ];
+    s.control.liveMembers = [PAT, SCOUT];
+    s.navigate("b");
+    await s.open();
+    await s.choose("Pat");
+    await s.open();
+    await s.choose("Scout");
+    await s.submit();
+    await act(async () => {});
+    const sends = s.calls.filter(([name]) => name === "send");
+    assert.equal(sends.length, 1);
+    assert.ok(sends[0].flat(2).includes(HUMAN));
+    assert.ok(sends[0].flat(2).includes(KEY));
+  });

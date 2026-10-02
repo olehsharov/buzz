@@ -10,12 +10,15 @@ import { setup, deferred, KEY } from "./useMentionSendFlow.test-support.mjs";
 const HUMAN = "d".repeat(64);
 const TEXT = "@Pat @RemoteScout hello";
 const REMOVED =
-  "A mentioned person is no longer in this channel. Invite them or remove the mention, then retry.";
+  "Someone you mentioned is not in this channel now. Add them or remove the mention, then retry.";
+
+const AGENT_MEMBER = { pubkey: KEY, role: "bot", is_agent: true };
 
 async function membershipSetup(delay) {
   const live = {
     members: [{ pubkey: HUMAN, role: "member", is_agent: false }],
     gate: null,
+    agentRead: null,
   };
   window.__TAURI_INTERNALS__ = {
     invoke: async (command) => {
@@ -34,10 +37,12 @@ async function membershipSetup(delay) {
       currentPubkey: "a".repeat(64),
       eligibilityScope: { type: "channel", channelId: "general" },
       sharedChannelIds: new Set(),
-      refetchManagedAgents: async () => ({
-        data: [{ pubkey: KEY }],
-        error: null,
-      }),
+      refetchManagedAgents: async () => {
+        // Hold only the final publish pass, not the earlier prepare pass.
+        if (live.agentRead && live.phase === "publish")
+          await live.agentRead.promise;
+        return { data: [{ pubkey: KEY }], error: null };
+      },
     }),
   );
   const s = await setup();
@@ -49,6 +54,7 @@ async function membershipSetup(delay) {
   mentions.memberPubkeys = new Set([HUMAN]);
   mentions.revalidateMentionPubkeys = async (keys, channel, options) => {
     s.calls.push([options.phase, channel]);
+    live.phase = options.phase;
     return revalidate.current(keys, channel, options);
   };
   if (delay === "upload")
@@ -57,19 +63,28 @@ async function membershipSetup(delay) {
   return { s, live };
 }
 
+// Every signed recipient, the managed agent included, must be on the fresh
+// roster. The agent joins through the Invite prompt, then can be removed.
+const REMOVALS = {
+  none: (members) => members,
+  person: (members) => members.filter(({ pubkey }) => pubkey !== HUMAN),
+  agent: (members) => members.filter(({ pubkey }) => pubkey !== KEY),
+};
+
 for (const delay of ["upload", "invite"]) {
-  for (const removed of [false, true]) {
-    test(`chat publish ${removed ? "refuses" : "keeps"} a person ${removed ? "removed" : "still present"} during the ${delay} delay`, async () => {
+  for (const removed of Object.keys(REMOVALS)) {
+    test(`chat publish ${removed === "none" ? "keeps everyone present" : `refuses the ${removed} removed`} during the ${delay} delay`, async () => {
       const { s, live } = await membershipSetup(delay);
       if (delay === "invite") s.control.add = deferred();
       await s.prompt(TEXT);
       await s.invite();
       assert.equal(s.events("add").length, 1);
+      live.members = [...live.members, AGENT_MEMBER];
       if (delay === "upload") {
         assert.ok(s.control.uploadCallbacks);
         assert.equal(s.options.contentRef.current, "", "optimistic clear");
       }
-      if (removed) live.members = [];
+      live.members = REMOVALS[removed](live.members);
       if (delay === "invite") await s.finish(s.control.add);
       else
         await s.act(async () =>
@@ -79,24 +94,50 @@ for (const delay of ["upload", "invite"]) {
           ),
         );
       await s.flush();
-      const sends = s.events("SEND");
-      if (!removed) {
-        assert.equal(sends.length, 1);
-        assert.deepEqual(sends[0][2], [HUMAN, KEY]);
-        return;
-      }
-      assert.equal(sends.length, 0);
-      assert.deepEqual(
-        s.events("error").map(([, message]) => message),
-        [REMOVED],
-      );
-      assert.equal(
-        s.options.contentRef.current,
-        TEXT,
-        "the draft is kept for retry",
-      );
+      assertOutcome(s, removed !== "none");
     });
   }
+}
+
+function assertOutcome(s, refused) {
+  const sends = s.events("SEND");
+  if (!refused) {
+    assert.equal(sends.length, 1);
+    assert.deepEqual(sends[0][2], [HUMAN, KEY]);
+    return;
+  }
+  assert.equal(sends.length, 0);
+  assert.deepEqual(
+    s.events("error").map(([, message]) => message),
+    [REMOVED],
+  );
+  assert.equal(
+    s.options.contentRef.current,
+    TEXT,
+    "the draft is kept for retry",
+  );
+}
+
+// The roster read must be the last check. A removal while the agent
+// directory read is still pending has to be seen before signing.
+for (const removed of ["person", "agent"]) {
+  test(`chat publish refuses the ${removed} removed while agent authorization is held`, async () => {
+    const { s, live } = await membershipSetup("invite");
+    s.control.add = deferred();
+    await s.prompt(TEXT);
+    await s.invite();
+    live.members = [...live.members, AGENT_MEMBER];
+    live.agentRead = deferred();
+    await s.finish(s.control.add);
+    await s.flush();
+    assert.equal(live.phase, "publish", "held in the final publish pass");
+    assert.equal(s.events("SEND").length, 0);
+    assert.equal(s.events("error").length, 0, "not yet refused");
+    live.members = REMOVALS[removed](live.members);
+    await s.finish(live.agentRead);
+    await s.flush();
+    assertOutcome(s, true);
+  });
 }
 
 test("Send without inviting still publishes: a declined person becomes a reference", async () => {

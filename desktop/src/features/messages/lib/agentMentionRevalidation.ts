@@ -23,13 +23,13 @@ export class AgentMentionAuthorizationError extends Error {
   }
 }
 
-/** A mentioned person is not a member of the destination at publication. */
+/** A signed recipient is not a member of the destination at publication. */
 export class MentionMembershipChangedError extends Error {
   constructor(unverified = false) {
     super(
       unverified
-        ? "Could not check that the people you mentioned are still in this channel. Retry, or remove the mentions."
-        : "A mentioned person is no longer in this channel. Invite them or remove the mention, then retry.",
+        ? "Could not check that everyone you mentioned is still in this channel. Retry, or remove the mentions."
+        : "Someone you mentioned is not in this channel now. Add them or remove the mention, then retry.",
     );
     this.name = "MentionMembershipChangedError";
   }
@@ -44,34 +44,30 @@ export function isMentionAuthorizationError(error: unknown): error is Error {
 }
 
 /**
- * Publication signs a `p` tag for every person in `pubkeys`. Selection and
- * the Invite prompt prove membership only at their own time, so read the
- * destination's member list fresh and fail closed for any person who is not
- * a member now (from the writer: a lagging replica can still list someone
- * just removed). Send without inviting has already moved declined people to
- * reference tags, and invited people are members by this point.
+ * Publication signs a `p` tag for every recipient in `pubkeys`, people and
+ * agents alike. Selection, Invite and agent attach prove membership only at
+ * their own time, so read the destination's member list fresh and fail
+ * closed for any recipient who is not a member now (from the writer: a
+ * lagging replica can still list someone just removed). Send without
+ * inviting has already moved declined people to reference tags.
  */
-export async function revalidateHumanMentionMembership({
+export async function revalidateRecipientMembership({
   pubkeys,
-  agentPubkeys,
   channelId,
   fetchMembers = (id) => getChannelMembers(id, { readYourWrites: true }),
 }: {
   pubkeys: readonly string[];
-  agentPubkeys: ReadonlySet<string>;
   channelId: string;
   fetchMembers?: (channelId: string) => Promise<{ pubkey: string }[]>;
 }) {
-  const humans = [...new Set(pubkeys.map(normalizePubkey))].filter(
-    (pubkey) => !agentPubkeys.has(pubkey),
-  );
-  if (humans.length === 0) return;
+  const recipients = [...new Set(pubkeys.map(normalizePubkey))];
+  if (recipients.length === 0) return;
   const members = await fetchMembers(channelId).catch(() => null);
   if (!members) throw new MentionMembershipChangedError(true);
   const memberPubkeys = new Set(
     members.map((member) => normalizePubkey(member.pubkey)),
   );
-  if (humans.some((pubkey) => !memberPubkeys.has(pubkey)))
+  if (recipients.some((pubkey) => !memberPubkeys.has(pubkey)))
     throw new MentionMembershipChangedError();
 }
 
@@ -184,18 +180,6 @@ export function useAgentMentionRevalidation({
         ...getSelectedAgentPubkeys(),
         ...(options.intendedAgentPubkeys ?? []).map(normalizePubkey),
       ]);
-      // Only the explicit publish pass signs new recipients into a channel.
-      // DMs have fixed participants and no member list to change.
-      const humanMembership =
-        options.phase === "publish" &&
-        destinationChannelId &&
-        channelType !== "dm"
-          ? revalidateHumanMentionMembership({
-              pubkeys,
-              agentPubkeys: knownAgentPubkeys,
-              channelId: destinationChannelId,
-            })
-          : Promise.resolve();
       const agents = revalidateAgentMentionPubkeys({
         pubkeys,
         agentPubkeys: knownAgentPubkeys,
@@ -210,7 +194,23 @@ export function useAgentMentionRevalidation({
             "channelId" in scope ? (scope.channelId ?? undefined) : undefined,
           ),
       });
-      return Promise.all([agents, humanMembership]).then(([result]) => result);
+      // Only the explicit publish pass signs new recipients into a channel.
+      // DMs have fixed participants and no member list to change. The roster
+      // read is the last awaited step: a removal during agent authorization
+      // must still be seen before signing.
+      if (
+        options.phase !== "publish" ||
+        !destinationChannelId ||
+        channelType === "dm"
+      )
+        return agents;
+      return agents.then(async (validated) => {
+        await revalidateRecipientMembership({
+          pubkeys: validated,
+          channelId: destinationChannelId,
+        });
+        return validated;
+      });
     },
     [
       agentPubkeys,
