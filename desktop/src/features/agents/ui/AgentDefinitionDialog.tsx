@@ -1,4 +1,5 @@
 import * as React from "react";
+import type { BackendIntent } from "../lib/instanceInputForDefinition";
 import { ChevronDown } from "lucide-react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import type {
@@ -120,6 +121,11 @@ type AgentDefinitionDialogProps = {
 };
 export type AgentDefinitionSubmitOptions = {
   publishCatalogUpdates: boolean;
+  /**
+   * Where the started instance runs, from the create-mode "Where to run"
+   * section. Absent for edits and when no run section is shown.
+   */
+  backendIntent?: BackendIntent | null;
 };
 export function AgentDefinitionDialog({
   open,

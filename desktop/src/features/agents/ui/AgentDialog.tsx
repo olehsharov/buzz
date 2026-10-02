@@ -114,12 +114,51 @@ export function AgentDialog(props: AgentDialogProps) {
     );
   }
   if (props.mode === "definition-edit") {
-    // A definition has no instance and no run draft, so the run location stays
-    // unknown and the warning uses its local-wording fallback.
     const { mode: _mode, ...definitionProps } = props;
+    if (props.initialValues && !("id" in props.initialValues)) {
+      // Duplicate/import creates and starts a new agent, so it owns a run
+      // draft exactly like the create flow.
+      return <DefinitionCreateDialogRouter {...definitionProps} />;
+    }
+    // An edit has no new instance and no run draft, so the run location stays
+    // unknown and the warning uses its local-wording fallback.
     return <AgentDefinitionDialog {...definitionProps} />;
   }
   return <AgentCreateDialogRouter {...props} />;
+}
+
+export function DefinitionCreateDialogRouter({
+  onSubmit,
+  open,
+  ...definitionProps
+}: Omit<AgentDialogDefinitionEditProps, "mode">) {
+  const [runDraft, setRunDraft] = React.useState(emptyWhereToRunDraft);
+  React.useEffect(() => {
+    if (open) setRunDraft(emptyWhereToRunDraft);
+  }, [open]);
+
+  return (
+    <AgentRunLocationProvider runLocation={runLocationForRunOn(runDraft.runOn)}>
+      <AgentDefinitionDialog
+        {...definitionProps}
+        createRunSection={
+          <WhereToRunSection
+            draft={runDraft}
+            isPending={definitionProps.isPending}
+            onDraftChange={setRunDraft}
+          />
+        }
+        createSubmitBlocked={!canSubmitWhereToRun(runDraft)}
+        onSubmit={(input, options) =>
+          onSubmit(input, {
+            ...options,
+            backendIntent: resolveBackendIntent(runDraft),
+          })
+        }
+        open={open}
+      />
+    </AgentRunLocationProvider>
+  );
 }
 
 function AgentCreateDialogRouter({

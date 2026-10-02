@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { AgentDialog } from "./AgentDialog.tsx";
+import { AgentDialog, DefinitionCreateDialogRouter } from "./AgentDialog.tsx";
 import { AgentDefinitionDialog } from "./AgentDefinitionDialog.tsx";
 import { AgentInstanceEditDialog } from "./AgentInstanceEditDialog.tsx";
 import { AgentRunLocationProvider } from "./AgentRunLocationContext.tsx";
@@ -20,7 +20,7 @@ test("definition-edit routes to AgentDefinitionDialog with exact pass-through", 
   const props = {
     description: "Edit the agent definition.",
     error: null,
-    initialValues: { displayName: "Brain" },
+    initialValues: { id: "persona-1", displayName: "Brain" },
     isPending: false,
     onOpenChange: noop,
     onSubmit: async () => {},
@@ -40,6 +40,30 @@ test("definition-edit routes to AgentDefinitionDialog with exact pass-through", 
     false,
     "the mode discriminant must not leak into AgentDefinitionDialog",
   );
+});
+
+test("create-mode definition-edit (duplicate/import) routes to the run-location router", () => {
+  const props = {
+    description: "Copy this agent.",
+    error: null,
+    initialValues: { displayName: "Brain copy" },
+    isPending: false,
+    onOpenChange: noop,
+    onSubmit: async () => {},
+    open: true,
+    runtimes: [],
+    submitLabel: "Create agent",
+    title: "Duplicate Brain",
+  };
+
+  const element = AgentDialog({ mode: "definition-edit", ...props });
+
+  assert.equal(
+    element.type,
+    DefinitionCreateDialogRouter,
+    "a definition without an id creates and starts an agent, so it must offer Where to run",
+  );
+  assert.deepEqual(element.props, props);
 });
 
 test("instance-edit routes to AgentInstanceEditDialog with its contract props", () => {
