@@ -207,6 +207,10 @@ pub struct AcpClient {
     /// a JSON-RPC *success*, not `-32601` — which the main loop would read as
     /// a delivered steer and drop the user's message from the queue.
     steering_supported: bool,
+    /// True when the agent advertised both `sessionCapabilities.fork` and
+    /// `sessionCapabilities.resume` in its `initialize` response. Gates
+    /// [`session_fork`](Self::session_fork) for `BUZZ_ACP_RESUME_SESSION`.
+    fork_resume_supported: bool,
     /// Per-turn channel for receiving goose-native non-cancelling steer
     /// requests from the main loop. Installed by
     /// [`install_steer_rx`](Self::install_steer_rx) at dispatch and
@@ -629,6 +633,7 @@ impl AcpClient {
             observer_context: ObserverContext::default(),
             active_run_id: None,
             steering_supported: false,
+            fork_resume_supported: false,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
@@ -688,6 +693,11 @@ impl AcpClient {
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        self.fork_resume_supported = ["fork", "resume"].iter().all(|cap| {
+            result
+                .pointer(&format!("/agentCapabilities/sessionCapabilities/{cap}"))
+                .is_some_and(|v| !v.is_null())
+        });
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
     }
@@ -729,6 +739,77 @@ impl AcpClient {
         system_prompt: Option<SystemPromptTransport<'_>>,
         session_title: Option<&str>,
     ) -> Result<SessionNewResponse, AcpError> {
+        let params = self.session_setup_params(cwd, mcp_servers, system_prompt, session_title);
+        let result = self.send_request("session/new", params).await?;
+        let session_id = result["sessionId"]
+            .as_str()
+            .ok_or_else(|| AcpError::Protocol("session/new response missing sessionId".into()))?
+            .to_owned();
+        tracing::info!(target: "acp::session", "session created: {session_id}");
+        Ok(SessionNewResponse {
+            session_id,
+            raw: result,
+        })
+    }
+
+    /// Send `session/fork` for an existing provider session and return the new
+    /// session's ID. The adapter copies the source history into a new session;
+    /// the source is left untouched. The fork is not live until resumed with
+    /// [`session_resume_full`](Self::session_resume_full).
+    pub async fn session_fork(
+        &mut self,
+        source_session_id: &str,
+        cwd: &str,
+    ) -> Result<String, AcpError> {
+        let params = serde_json::json!({
+            "sessionId": source_session_id,
+            "cwd": cwd,
+            "mcpServers": [],
+        });
+        let result = self.send_request("session/fork", params).await?;
+        let session_id = result["sessionId"]
+            .as_str()
+            .ok_or_else(|| AcpError::Protocol("session/fork response missing sessionId".into()))?
+            .to_owned();
+        tracing::info!(target: "acp::session", "session forked: {source_session_id} -> {session_id}");
+        Ok(session_id)
+    }
+
+    /// Send `session/resume` for `session_id` with the same setup parameters
+    /// as [`session_new_full`](Self::session_new_full), so the resumed session
+    /// gets the harness system prompt, MCP servers, and title.
+    pub async fn session_resume_full(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        mcp_servers: Vec<McpServer>,
+        system_prompt: Option<SystemPromptTransport<'_>>,
+        session_title: Option<&str>,
+    ) -> Result<SessionNewResponse, AcpError> {
+        let mut params = self.session_setup_params(cwd, mcp_servers, system_prompt, session_title);
+        params["sessionId"] = serde_json::Value::String(session_id.to_owned());
+        let result = self.send_request("session/resume", params).await?;
+        // The resume response may omit `sessionId`; the requested ID is the
+        // session that is now live.
+        let session_id = result["sessionId"]
+            .as_str()
+            .unwrap_or(session_id)
+            .to_owned();
+        tracing::info!(target: "acp::session", "session resumed: {session_id}");
+        Ok(SessionNewResponse {
+            session_id,
+            raw: result,
+        })
+    }
+
+    /// Build the shared `session/new` / `session/resume` parameter object.
+    fn session_setup_params(
+        &self,
+        cwd: &str,
+        mcp_servers: Vec<McpServer>,
+        system_prompt: Option<SystemPromptTransport<'_>>,
+        session_title: Option<&str>,
+    ) -> serde_json::Value {
         let mut params = serde_json::json!({
             "cwd": cwd,
             "mcpServers": mcp_servers,
@@ -755,16 +836,7 @@ impl AcpClient {
             params["_meta"]["claudeCode"]["options"]["extraArgs"]["thinking-display"] =
                 serde_json::Value::String("summarized".to_owned());
         }
-        let result = self.send_request("session/new", params).await?;
-        let session_id = result["sessionId"]
-            .as_str()
-            .ok_or_else(|| AcpError::Protocol("session/new response missing sessionId".into()))?
-            .to_owned();
-        tracing::info!(target: "acp::session", "session created: {session_id}");
-        Ok(SessionNewResponse {
-            session_id,
-            raw: result,
-        })
+        params
     }
 
     /// Send `session/new` and return only the `sessionId` string.
@@ -961,6 +1033,12 @@ impl AcpClient {
     /// for the supervisor's post-initialize log line.
     pub fn steering_supported(&self) -> bool {
         self.steering_supported
+    }
+
+    /// Whether the agent advertised `sessionCapabilities.fork` and `.resume`
+    /// at `initialize` time.
+    pub fn fork_resume_supported(&self) -> bool {
+        self.fork_resume_supported
     }
 
     /// Consume per-turn usage for NIP-AM publishing. Goose/buzz-agent is an

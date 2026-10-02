@@ -32,7 +32,7 @@ use uuid::Uuid;
 use crate::acp::{
     extract_model_config_options, extract_model_state, extract_thought_level_config_id,
     model_in_catalog, resolve_model_switch_method, AcpClient, AcpError, EnvVar, McpServer,
-    ModelSwitchMethod, StopReason, SystemPromptTransport, BUZZ_PI_ACP_NAME,
+    ModelSwitchMethod, SessionNewResponse, StopReason, SystemPromptTransport, BUZZ_PI_ACP_NAME,
 };
 use crate::config::{compose_scoped_session_title, DedupMode, PermissionMode};
 use crate::observer;
@@ -937,6 +937,9 @@ pub struct PromptContext {
     /// the desktop keys per (agent, relay) pair, e.g. `session_config_captured`,
     /// mirroring the `managed_agent_runtime_lifecycle` frames.
     pub relay_url: String,
+    /// Provider session the first channel/DM session forks and resumes.
+    /// Holds `None` when `BUZZ_ACP_RESUME_SESSION` is unset or consumed.
+    pub resume_session: ResumeSessionSlot,
 }
 
 impl AgentPool {
@@ -1578,6 +1581,51 @@ struct NewSessionChannelContext<'a> {
     channel_type: Option<&'a str>,
 }
 
+/// One-shot provider session to continue from (`BUZZ_ACP_RESUME_SESSION`),
+/// shared by every worker so exactly one channel/DM session consumes it.
+pub type ResumeSessionSlot = Arc<Mutex<Option<String>>>;
+
+fn take_resume_session(slot: &ResumeSessionSlot) -> Option<String> {
+    slot.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+fn restore_resume_session(slot: &ResumeSessionSlot, source: String) {
+    let mut pending = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if pending.is_none() {
+        *pending = Some(source);
+    }
+}
+
+/// Fork `source` and resume the fork as a live session with the harness
+/// setup parameters. The source session is never written to.
+async fn fork_and_resume_session(
+    agent: &mut OwnedAgent,
+    source: &str,
+    cwd: &str,
+    mcp_servers: Vec<McpServer>,
+    system_prompt: Option<SystemPromptTransport<'_>>,
+    session_title: Option<&str>,
+) -> Result<SessionNewResponse, AcpError> {
+    if !agent.acp.fork_resume_supported() {
+        return Err(AcpError::Protocol(format!(
+            "BUZZ_ACP_RESUME_SESSION is set, but agent {:?} does not advertise \
+             sessionCapabilities.fork and .resume",
+            agent.agent_name
+        )));
+    }
+    let forked = agent.acp.session_fork(source, cwd).await?;
+    let resp = agent
+        .acp
+        .session_resume_full(&forked, cwd, mcp_servers, system_prompt, session_title)
+        .await?;
+    tracing::info!(
+        target: "pool::session",
+        "continuing provider session {source} as fork {}",
+        resp.session_id
+    );
+    Ok(resp)
+}
+
 async fn create_session_and_apply_model(
     agent: &mut OwnedAgent,
     ctx: &PromptContext,
@@ -1623,20 +1671,52 @@ async fn create_session_and_apply_model(
         ctx.session_title.as_deref(),
     );
 
-    let resp = agent
-        .acp
-        .session_new_full(
-            &ctx.cwd,
-            mcp_servers,
-            session_new_system_prompt(
-                is_goose,
-                agent.protocol_version,
-                &agent.agent_name,
-                combined_system_prompt.as_deref(),
-            ),
-            session_title.as_deref(),
-        )
-        .await?;
+    let system_prompt = session_new_system_prompt(
+        is_goose,
+        agent.protocol_version,
+        &agent.agent_name,
+        combined_system_prompt.as_deref(),
+    );
+    // Only channel/DM sessions continue a configured provider session;
+    // heartbeat and isolated-task sessions always start fresh.
+    let resume_source = if channel.scope.is_some() {
+        take_resume_session(&ctx.resume_session)
+    } else {
+        None
+    };
+    let resp = match resume_source {
+        Some(source) => {
+            match fork_and_resume_session(
+                agent,
+                &source,
+                &ctx.cwd,
+                mcp_servers,
+                system_prompt,
+                session_title.as_deref(),
+            )
+            .await
+            {
+                Ok(resp) => resp,
+                Err(error) => {
+                    // Keep the source pending so the next new session retries
+                    // instead of silently starting fresh.
+                    restore_resume_session(&ctx.resume_session, source);
+                    return Err(error);
+                }
+            }
+        }
+        None => {
+            agent
+                .acp
+                .session_new_full(
+                    &ctx.cwd,
+                    mcp_servers,
+                    system_prompt,
+                    session_title.as_deref(),
+                )
+                .await?
+        }
+    };
 
     if is_goose && agent.goose_system_prompt_supported != Some(false) {
         if let Some(prompt) = combined_system_prompt.as_deref() {
@@ -10455,6 +10535,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             memory_enabled: false,
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
+            resume_session: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -11786,6 +11867,193 @@ done"#
     // A `model`-category option offering the default model plus the target the
     // agent wants to switch to.
     const OPTS_MODEL_A_AND_B: &str = r#"[{"configId":"model","category":"model","currentValue":"model-a","options":[{"value":"model-a"},{"value":"model-b"}]}]"#;
+
+    #[tokio::test]
+    async fn resume_session_forks_then_resumes_first_scoped_session_only() {
+        let (mut agent, observer) = spawn_resume_agent(RESUME_CAPS, FORK_OK).await;
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.session_title = Some("Fizz".into());
+        ctx.resume_session = Arc::new(Mutex::new(Some("src-1".into())));
+        let first = SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+        let second = SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&first))
+            .await
+            .expect("resumed session");
+        assert_eq!(sid, "fork-1");
+        assert_eq!(
+            *ctx.resume_session.lock().unwrap(),
+            None,
+            "slot is consumed"
+        );
+
+        let fork = acp_write(&observer, "session/fork").expect("session/fork sent");
+        assert_eq!(fork["params"]["sessionId"], "src-1");
+        assert_eq!(fork["params"]["cwd"], ctx.cwd);
+        let resume = acp_write(&observer, "session/resume").expect("session/resume sent");
+        assert_eq!(resume["params"]["sessionId"], "fork-1");
+        assert_eq!(resume["params"]["cwd"], ctx.cwd);
+        assert_eq!(resume["params"]["_meta"]["sessionTitle"], "Fizz");
+        assert!(resume["params"]["mcpServers"].is_array());
+        assert!(acp_write(&observer, "session/new").is_none());
+
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&second))
+            .await
+            .expect("fresh session");
+        assert!(
+            sid.starts_with("new-"),
+            "second scope starts fresh, got {sid}"
+        );
+        assert_eq!(
+            acp_writes(&observer, "session/fork"),
+            1,
+            "fork happens once"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_session_is_not_consumed_by_unscoped_sessions() {
+        let (mut agent, observer) = spawn_resume_agent(RESUME_CAPS, FORK_OK).await;
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.resume_session = Arc::new(Mutex::new(Some("src-1".into())));
+
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, unscoped())
+            .await
+            .expect("heartbeat session");
+        assert!(sid.starts_with("new-"));
+        assert!(acp_write(&observer, "session/fork").is_none());
+        assert_eq!(
+            ctx.resume_session.lock().unwrap().as_deref(),
+            Some("src-1"),
+            "heartbeat/isolated sessions leave the resume pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_session_failure_propagates_and_stays_pending() {
+        let fork_error = r#""error":{"code":-32602,"message":"no such session"}"#;
+        let (mut agent, observer) = spawn_resume_agent(RESUME_CAPS, fork_error).await;
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.resume_session = Arc::new(Mutex::new(Some("src-1".into())));
+        let scope = SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+
+        let err = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&scope))
+            .await
+            .expect_err("fork failure must not fall back to a fresh session");
+        assert!(
+            matches!(err, AcpError::AgentError { code: -32602, .. }),
+            "{err:?}"
+        );
+        assert!(acp_write(&observer, "session/new").is_none());
+        assert_eq!(ctx.resume_session.lock().unwrap().as_deref(), Some("src-1"));
+    }
+
+    #[tokio::test]
+    async fn resume_session_requires_advertised_fork_and_resume() {
+        let (mut agent, observer) = spawn_resume_agent(r#"{"fork":{}}"#, FORK_OK).await;
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.resume_session = Arc::new(Mutex::new(Some("src-1".into())));
+        let scope = SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+
+        let err = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&scope))
+            .await
+            .expect_err("missing resume capability must refuse");
+        assert!(matches!(err, AcpError::Protocol(_)), "{err:?}");
+        assert!(acp_write(&observer, "session/fork").is_none());
+        assert!(acp_write(&observer, "session/new").is_none());
+        assert_eq!(ctx.resume_session.lock().unwrap().as_deref(), Some("src-1"));
+    }
+
+    const RESUME_CAPS: &str = r#"{"fork":{},"resume":{}}"#;
+    const FORK_OK: &str = r#""result":{"sessionId":"fork-1"}"#;
+
+    /// Scripted ACP keyed on method: `initialize` advertises
+    /// `sessionCapabilities` = `caps`, `session/fork` answers `fork_reply`,
+    /// `session/resume` echoes `fork-1`, `session/new` mints `new-<id>`.
+    async fn spawn_resume_agent(
+        caps: &str,
+        fork_reply: &str,
+    ) -> (OwnedAgent, observer::ObserverHandle) {
+        let script = format!(
+            r#"while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  [ -z "$id" ] && continue
+  case "$line" in
+    *'"method":"initialize"'*) body='"result":{{"protocolVersion":2,"agentCapabilities":{{"sessionCapabilities":{caps}}}}}' ;;
+    *'"method":"session/fork"'*) body='{fork_reply}' ;;
+    *'"method":"session/resume"'*) body='"result":{{"sessionId":"fork-1"}}' ;;
+    *'"method":"session/new"'*) body='"result":{{"sessionId":"new-'"$id"'"}}' ;;
+    *) body='"result":{{}}' ;;
+  esac
+  printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"','"$body"'}}'
+done"#
+        );
+        let mut acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn resume ACP script");
+        acp.initialize().await.expect("initialize");
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "resume-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let observer = observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(observer.clone()), 0);
+        (agent, observer)
+    }
+
+    fn scoped(scope: &SessionScope) -> NewSessionChannelContext<'_> {
+        NewSessionChannelContext {
+            huddle_instructions: None,
+            canvas: None,
+            name: None,
+            scope: Some(scope),
+            channel_type: None,
+        }
+    }
+
+    fn unscoped() -> NewSessionChannelContext<'static> {
+        NewSessionChannelContext {
+            huddle_instructions: None,
+            canvas: None,
+            name: None,
+            scope: None,
+            channel_type: None,
+        }
+    }
+
+    fn acp_writes(observer: &observer::ObserverHandle, method: &str) -> usize {
+        observer
+            .snapshot()
+            .into_iter()
+            .filter(|e| e.kind == "acp_write" && e.payload["method"] == method)
+            .count()
+    }
+
+    fn acp_write(observer: &observer::ObserverHandle, method: &str) -> Option<serde_json::Value> {
+        observer
+            .snapshot()
+            .into_iter()
+            .find(|e| e.kind == "acp_write" && e.payload["method"] == method)
+            .map(|e| e.payload)
+    }
 
     #[tokio::test]
     async fn session_new_sends_policy_specific_base_and_scope_specific_title() {

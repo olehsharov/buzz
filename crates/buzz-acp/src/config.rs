@@ -461,6 +461,15 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_SESSION_TITLE")]
     pub session_title: Option<String>,
 
+    /// Provider session to continue from. The first channel or DM session
+    /// this harness creates forks this session (`session/fork`) and resumes
+    /// the fork (`session/resume`) instead of starting fresh; the source
+    /// session is never modified. Requires an adapter that advertises
+    /// `sessionCapabilities.fork` and `.resume` (e.g. `claude-agent-acp`), and
+    /// the harness cwd must be the directory the source session ran in.
+    #[arg(long, env = "BUZZ_ACP_RESUME_SESSION")]
+    pub resume_session: Option<String>,
+
     /// Permission mode for agents that support `session/set_config_option`
     /// with `configId: "mode"` (e.g. `claude-agent-acp`).
     ///
@@ -592,6 +601,9 @@ pub struct Config {
     /// Sanitized session title, sent as `_meta.sessionTitle` on `session/new`.
     /// `None` when unset or when the configured value sanitized to empty.
     pub session_title: Option<String>,
+    /// Provider session ID the first channel/DM session forks and resumes.
+    /// `None` when unset or blank.
+    pub resume_session: Option<String>,
     /// Permission mode to apply after session creation. `Default` = skip.
     pub permission_mode: PermissionMode,
     /// Inbound author gate mode.
@@ -1195,6 +1207,10 @@ impl Config {
                 .session_title
                 .as_deref()
                 .and_then(sanitize_session_title),
+            resume_session: args
+                .resume_session
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty()),
             permission_mode: args.permission_mode,
             respond_to: args.respond_to,
             respond_to_allowlist,
@@ -1573,6 +1589,7 @@ mod tests {
             model: None,
             effort_level: None,
             session_title: None,
+            resume_session: None,
             permission_mode: PermissionMode::BypassPermissions,
             respond_to: RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
