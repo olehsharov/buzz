@@ -120,14 +120,54 @@ pub enum AcpError {
 /// Build an [`AcpError::AgentError`] from a JSON-RPC error object,
 /// preserving the numeric code. When the `message` field is missing or
 /// non-string, fall back to the full JSON object so provider-specific
-/// detail (e.g. a `data` field) is not lost.
+/// detail (e.g. a `data` field) is not lost. When both are present, the
+/// `data` detail is appended to the message: ACP SDK adapters report every
+/// uncaught exception as a bare `-32603 "Internal error"` and carry the real
+/// cause only in `data.details` (e.g. `Session <id> not found in project
+/// directory for <cwd>`).
 fn agent_error_from_json(error: &serde_json::Value) -> AcpError {
     let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000);
     let message = match error.get("message").and_then(|m| m.as_str()) {
-        Some(m) => m.to_string(),
+        Some(m) => match error.get("data").and_then(agent_error_data_detail) {
+            Some(detail) if !m.contains(&detail) => format!("{m}: {detail}"),
+            _ => m.to_string(),
+        },
         None => error.to_string(),
     };
     AcpError::AgentError { code, message }
+}
+
+/// Upper bound on the `data` detail appended to an agent error message; the
+/// message is logged, persisted and posted to the channel.
+const AGENT_ERROR_DETAIL_MAX_CHARS: usize = 1000;
+
+/// Human-readable detail from a JSON-RPC error `data` value: its `details`
+/// (ACP SDK) or `message` string when present, else the compact JSON. Empty
+/// values yield `None`; long values are truncated.
+fn agent_error_data_detail(data: &serde_json::Value) -> Option<String> {
+    let detail = match data {
+        serde_json::Value::Null => return None,
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Object(map) if map.is_empty() => return None,
+        serde_json::Value::Object(map) => match ["details", "message"]
+            .iter()
+            .find_map(|key| map.get(*key).and_then(|v| v.as_str()))
+        {
+            Some(s) => s.to_string(),
+            None => data.to_string(),
+        },
+        other => other.to_string(),
+    };
+    let detail = detail.trim();
+    if detail.is_empty() {
+        return None;
+    }
+    let mut chars = detail.chars();
+    let mut bounded: String = chars.by_ref().take(AGENT_ERROR_DETAIL_MAX_CHARS).collect();
+    if chars.next().is_some() {
+        bounded.push('…');
+    }
+    Some(bounded)
 }
 
 fn build_initialize_params() -> serde_json::Value {
@@ -5059,6 +5099,81 @@ sleep 1"#,
             AcpError::AgentError { code, message } => {
                 assert_eq!(code, -32001);
                 assert_eq!(message, "auth denied");
+            }
+            other => panic!("expected AgentError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_error_from_json_appends_acp_sdk_internal_error_details() {
+        // ACP SDK adapters (claude-agent-acp) wrap an uncaught exception as a
+        // bare -32603 and carry the cause only in `data.details`.
+        let error = serde_json::json!({
+            "code": -32603,
+            "message": "Internal error",
+            "data": {"details": "Session abc not found in project directory for /home/u"}
+        });
+        match super::agent_error_from_json(&error) {
+            AcpError::AgentError { code, message } => {
+                assert_eq!(code, -32603);
+                assert_eq!(
+                    message,
+                    "Internal error: Session abc not found in project directory for /home/u"
+                );
+            }
+            other => panic!("expected AgentError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_error_from_json_appends_string_and_structured_data() {
+        let string_data =
+            serde_json::json!({"code": -32000, "message": "failed", "data": "quota exceeded"});
+        let structured = serde_json::json!({"code": -32602, "message": "Invalid params", "data": {"messageId": "m1"}});
+        let message = |e: &serde_json::Value| match super::agent_error_from_json(e) {
+            AcpError::AgentError { message, .. } => message,
+            other => panic!("expected AgentError, got {other:?}"),
+        };
+        assert_eq!(message(&string_data), "failed: quota exceeded");
+        assert_eq!(
+            message(&structured),
+            r#"Invalid params: {"messageId":"m1"}"#
+        );
+    }
+
+    #[test]
+    fn agent_error_from_json_ignores_empty_or_redundant_data() {
+        let message = |e: serde_json::Value| match super::agent_error_from_json(&e) {
+            AcpError::AgentError { message, .. } => message,
+            other => panic!("expected AgentError, got {other:?}"),
+        };
+        for data in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!("  "),
+            serde_json::json!({"details": "Internal error"}),
+        ] {
+            assert_eq!(
+                message(
+                    serde_json::json!({"code": -32603, "message": "Internal error", "data": data})
+                ),
+                "Internal error"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_error_from_json_bounds_appended_detail() {
+        let long = "x".repeat(super::AGENT_ERROR_DETAIL_MAX_CHARS + 50);
+        let error = serde_json::json!({"code": -32603, "message": "Internal error", "data": {"details": long}});
+        match super::agent_error_from_json(&error) {
+            AcpError::AgentError { message, .. } => {
+                let detail = message.strip_prefix("Internal error: ").expect("prefix");
+                assert_eq!(
+                    detail.chars().count(),
+                    super::AGENT_ERROR_DETAIL_MAX_CHARS + 1
+                );
+                assert!(detail.ends_with('…'));
             }
             other => panic!("expected AgentError, got {other:?}"),
         }

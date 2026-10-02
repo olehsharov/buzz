@@ -11955,6 +11955,33 @@ done"#
     }
 
     #[tokio::test]
+    async fn resume_session_failure_surfaces_adapter_error_details() {
+        // claude-agent-acp's shape when the source transcript is not under the
+        // harness cwd: a bare -32603 whose cause lives only in `data.details`.
+        let fork_error = r#""error":{"code":-32603,"message":"Internal error","data":{"details":"Session src-1 not found in project directory for /home/u"}}"#;
+        let (mut agent, _observer) = spawn_resume_agent(RESUME_CAPS, fork_error).await;
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.resume_session = Arc::new(Mutex::new(Some("src-1".into())));
+        let scope = SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+
+        let err = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&scope))
+            .await
+            .expect_err("fork failure must propagate");
+        match err {
+            AcpError::AgentError { code, message } => {
+                assert_eq!(code, -32603);
+                assert_eq!(
+                    message,
+                    "Internal error: Session src-1 not found in project directory for /home/u"
+                );
+            }
+            other => panic!("expected AgentError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn resume_session_requires_advertised_fork_and_resume() {
         let (mut agent, observer) = spawn_resume_agent(r#"{"fork":{}}"#, FORK_OK).await;
         let mut ctx = make_prompt_context_no_owner();
