@@ -141,9 +141,10 @@ async function setup(options = {}) {
     },
     "@/features/channels/hooks": {
       useAddChannelMembersMutation: () => ({
-        mutateAsync: async () => {
-          calls.push(["add"]);
+        mutateAsync: async (input) => {
+          calls.push(["add", input]);
           if (control.add) await control.add.promise;
+          if (control.onAdd) control.onAdd(input);
           return { errors: [] };
         },
       }),
@@ -1215,3 +1216,52 @@ for (const main of [false, true])
     assert.ok(sends[0].flat(2).includes(HUMAN));
     assert.ok(sends[0].flat(2).includes(KEY));
   });
+
+// A forum signs only current members, so a person outside the channel must
+// be invited first, as a member. Cancel keeps the draft and sends nothing.
+for (const choice of ["invite", "cancel"]) {
+  test(`mounted forum asks before mentioning a person outside the channel: ${choice}`, async () => {
+    const s = await setup({ realMentions: true });
+    s.control.cachedMembers = [
+      { pubkey: HUMAN, role: "member", isAgent: false, displayName: "Pat" },
+    ];
+    s.control.liveMembers = [PAT];
+    s.navigate("b");
+    await s.open();
+    await s.choose("Pat");
+    const text = s.text;
+    // Pat leaves the cached roster too, so the composer knows to ask.
+    s.control.cachedMembers = [];
+    s.control.liveMembers = [];
+    s.navigate("a");
+    s.navigate("b");
+    await act(async () => {});
+    s.control.onAdd = ({ pubkeys }) => {
+      s.control.liveMembers = pubkeys.includes(HUMAN) ? [PAT] : [];
+    };
+    await s.submit();
+    assert.equal(s.prompt.open, true);
+    assert.deepEqual([...s.prompt.names], ["Pat"]);
+    if (choice === "invite") await s.invite();
+    else await s.dismiss();
+    await act(async () => {});
+    const sends = s.calls.filter(([name]) => name === "send");
+    if (choice === "cancel") {
+      assert.equal(sends.length, 0);
+      assert.equal(s.text.trim(), text.trim(), "the draft is kept");
+      return;
+    }
+    assert.deepEqual(
+      s.calls
+        .filter(([name]) => name === "add")
+        .map(([, { channelId, pubkeys, role }]) => ({
+          channelId,
+          pubkeys: [...pubkeys],
+          role,
+        })),
+      [{ channelId: "forum", pubkeys: [HUMAN], role: "member" }],
+    );
+    assert.equal(sends.length, 1);
+    assert.ok(sends[0].flat(2).includes(HUMAN), "the invited person is tagged");
+  });
+}
