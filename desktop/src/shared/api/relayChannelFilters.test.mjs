@@ -7,7 +7,27 @@ import {
   buildChannelReactionAuxFilter,
   buildChannelStructuralAuxFilter,
   buildHuddleTtsLiveFilter,
+  buildLiveEphemeralChannelFilter,
+  LIVE_EPHEMERAL_LOOKBACK_SECONDS,
 } from "./relayChannelFilters.ts";
+
+test("live ephemeral filter scopes one kind to the channel with a short lookback", () => {
+  const nowMs = 1_725_100_000_500;
+  assert.deepEqual(buildLiveEphemeralChannelFilter(20003, CHANNEL, nowMs), {
+    kinds: [20003],
+    "#h": [CHANNEL],
+    limit: 10,
+    since: 1_725_100_000 - LIVE_EPHEMERAL_LOOKBACK_SECONDS,
+  });
+  assert.equal(LIVE_EPHEMERAL_LOOKBACK_SECONDS, 10);
+  // Typing indicators keep their pre-existing filter shape.
+  assert.deepEqual(buildLiveEphemeralChannelFilter(20002, CHANNEL, nowMs), {
+    kinds: [20002],
+    "#h": [CHANNEL],
+    limit: 10,
+    since: 1_725_099_990,
+  });
+});
 
 const CHANNEL = "36411e44-0e2d-4cfe-bd6e-567eb169db9f";
 const IDS = [

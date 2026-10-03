@@ -7,6 +7,7 @@ import {
 import type { PresenceStatus, RelayEvent } from "@/shared/api/types";
 import {
   KIND_STREAM_MESSAGE,
+  type KIND_STREAM_DRAFT,
   KIND_TYPING_INDICATOR,
   KIND_USER_STATUS,
   CHANNEL_EVENT_KINDS,
@@ -27,6 +28,7 @@ import {
   buildChannelFilter,
   buildChannelHistoryFilter,
   buildGlobalStreamFilter,
+  buildLiveEphemeralChannelFilter,
 } from "@/shared/api/relayChannelFilters";
 import {
   clearClosedRetry,
@@ -371,19 +373,14 @@ export class RelayClient {
     );
   }
 
-  async subscribeToTypingIndicators(
+  /** Live-only channel signal: typing (20002) or reply drafts (20003). */
+  async subscribeToChannelEphemeral(
+    kind: typeof KIND_TYPING_INDICATOR | typeof KIND_STREAM_DRAFT,
     channelId: string,
     onEvent: (event: RelayEvent) => void,
   ) {
-    return this.subscribe(
-      {
-        kinds: [KIND_TYPING_INDICATOR],
-        "#h": [channelId],
-        limit: 10,
-        since: Math.floor(Date.now() / 1_000) - 10,
-      },
-      onEvent,
-    );
+    const filter = buildLiveEphemeralChannelFilter(kind, channelId);
+    return this.subscribe(filter, onEvent);
   }
   async publishUserStatus(status: UserStatusInput): Promise<RelayEvent> {
     await this.ensureConnected();

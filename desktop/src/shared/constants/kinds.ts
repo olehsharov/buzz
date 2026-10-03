@@ -35,6 +35,13 @@ export const KIND_APPROVAL_REQUEST = 46010;
 export const KIND_MEMBER_ADDED_NOTIFICATION = 44100;
 export const KIND_MEMBER_REMOVED_NOTIFICATION = 44101;
 export const KIND_TYPING_INDICATOR = 20002;
+// Ephemeral live reply draft ("ghost" message): a cumulative markdown snapshot
+// of an agent's in-progress reply, tagged `stream`/`seq`/`status`. Never
+// stored, never a timeline row, never unread/notification/search/archive
+// content. Keep in sync with KIND_STREAM_DRAFT in
+// crates/buzz-core/src/kind.rs (and, when mobile adopts it,
+// mobile/lib/shared/relay/nostr_models.dart).
+export const KIND_STREAM_DRAFT = 20003;
 export const KIND_PRESENCE_UPDATE = 20001;
 export const KIND_HUDDLE_REACTION = 24810;
 export const KIND_HUDDLE_STARTED = 48100;
