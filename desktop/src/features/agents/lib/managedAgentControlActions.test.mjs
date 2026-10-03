@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  getManagedAgentPrimaryActionLabel,
+  getManagedAgentRestartLabel,
   startManagedAgentWithRules,
   respawnManagedAgentWithRules,
 } from "./managedAgentControlActions.ts";
@@ -200,4 +202,44 @@ test("removing an unrelated relay during a respawn's stop still restarts it", as
   );
   await result;
   assert.equal(started.length, 1);
+});
+
+test("a shut-down remote agent keeps a redeploy action", () => {
+  // After `!shutdown` the provider record stays "deployed", so the primary
+  // action stays "Shutdown"; redeploy must remain the way back.
+  const remote = agent({
+    backend: { type: "provider", id: "remote-host", config: {} },
+    backendAgentId: "buzz-agent@abc.service",
+    status: "deployed",
+  });
+  assert.equal(getManagedAgentPrimaryActionLabel(remote), "Shutdown");
+  assert.equal(getManagedAgentRestartLabel(remote), "Redeploy agent");
+  assert.equal(
+    getManagedAgentRestartLabel({ ...remote, status: "not_deployed" }),
+    null,
+    "a never-deployed remote agent already has Deploy as its primary action",
+  );
+});
+
+test("local agents offer restart only while running", () => {
+  assert.equal(
+    getManagedAgentRestartLabel(agent({ status: "running" })),
+    "Restart agent",
+  );
+  assert.equal(getManagedAgentRestartLabel(agent({ status: "stopped" })), null);
+});
+
+test("redeploying a remote agent deploys without a local stop", async () => {
+  const calls = [];
+  await respawnManagedAgentWithRules({
+    agent: agent({
+      backend: { type: "provider", id: "remote-host", config: {} },
+      backendAgentId: "buzz-agent@abc.service",
+      status: "deployed",
+    }),
+    relayUrl: "ws://localhost:3000",
+    startManagedAgent: async (pubkey) => calls.push(["start", pubkey]),
+    stopManagedAgent: async (pubkey) => calls.push(["stop", pubkey]),
+  });
+  assert.deepEqual(calls, [["start", "deadbeef".repeat(8)]]);
 });

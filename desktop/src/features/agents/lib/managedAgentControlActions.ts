@@ -45,6 +45,25 @@ export function getManagedAgentPrimaryActionLabel(agent: ManagedAgent) {
   return "Start agent";
 }
 
+/**
+ * Label for the secondary lifecycle action, or null when none applies.
+ *
+ * Local agents restart a live process. A provider agent with a deployment
+ * record can always be redeployed: its record stays "deployed" after
+ * `!shutdown` (so the primary action stays "Shutdown"), and configuration
+ * edits never reach a deployed remote agent on their own — redeploy is the
+ * only way back from either. Provider deploy is idempotent
+ * (docs/remote-agents.md), so it cannot create a second live instance.
+ */
+export function getManagedAgentRestartLabel(
+  agent: Pick<ManagedAgent, "backend" | "status">,
+): string | null {
+  if (agent.backend.type === "provider") {
+    return agent.status === "deployed" ? "Redeploy agent" : null;
+  }
+  return isManagedAgentActive(agent) ? "Restart agent" : null;
+}
+
 export function resolveManagedAgentChannelId(
   agent: Pick<ManagedAgent, "pubkey">,
   context: ManagedAgentChannelContext,
