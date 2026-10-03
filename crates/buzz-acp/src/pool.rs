@@ -3553,7 +3553,12 @@ pub async fn run_prompt_task(
             log_stop_reason(&source, &stop_reason);
             agent.acp.clear_stream_sink();
             if let Some(stream) = reply_stream.take() {
-                stream.finish(&stop_reason, &ctx.rest_client).await;
+                if let Some(outcome) = stream.finish(&stop_reason, &ctx.rest_client).await {
+                    // Never go dark: a lost autopost is visible in the feed.
+                    agent
+                        .acp
+                        .observe("reply_autopost", outcome.observer_payload());
+                }
             }
 
             if let PromptSource::Channel(scope) = &source {

@@ -550,6 +550,35 @@ impl StreamSink {
     }
 }
 
+/// What end-of-turn autopost did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AutopostOutcome {
+    /// The response text was posted as this kind:9 event id.
+    Posted(String),
+    /// The agent replied in scope itself; the draft was discarded.
+    AlreadyReplied,
+    /// Nothing was posted and the reply text is lost (logged and surfaced).
+    Failed(String),
+}
+
+impl AutopostOutcome {
+    fn terminal(&self) -> StreamDraftStatus {
+        match self {
+            Self::Posted(_) | Self::AlreadyReplied => StreamDraftStatus::Final,
+            Self::Failed(_) => StreamDraftStatus::Abandoned,
+        }
+    }
+
+    /// Observer payload for the turn's activity feed.
+    pub(crate) fn observer_payload(&self) -> serde_json::Value {
+        match self {
+            Self::Posted(event_id) => serde_json::json!({"outcome": "posted", "eventId": event_id}),
+            Self::AlreadyReplied => serde_json::json!({"outcome": "already_replied"}),
+            Self::Failed(error) => serde_json::json!({"outcome": "failed", "error": error}),
+        }
+    }
+}
+
 /// One reply stream, owned by the turn. Drop without [`finish`](Self::finish)
 /// abandons it.
 pub struct ReplyStream {
@@ -589,17 +618,24 @@ impl ReplyStream {
 
     /// End the stream for a turn that returned `stop`. In
     /// `draft+autopost` mode this may post the reply (kind:9 + `stream` tag).
-    pub(crate) async fn finish(mut self, stop: &StopReason, rest: &RestClient) {
+    /// Returns the autopost outcome, if one was attempted, for the turn's
+    /// observer feed.
+    pub(crate) async fn finish(
+        mut self,
+        stop: &StopReason,
+        rest: &RestClient,
+    ) -> Option<AutopostOutcome> {
         let text = lock(&self.sink.state).acc.final_text();
-        let terminal = match finalization(self.runtime.mode, stop, &text) {
-            Finalization::Abandon => StreamDraftStatus::Abandoned,
+        let (terminal, outcome) = match finalization(self.runtime.mode, stop, &text) {
+            Finalization::Abandon => (StreamDraftStatus::Abandoned, None),
             Finalization::Final => {
                 self.flush().await;
-                StreamDraftStatus::Final
+                (StreamDraftStatus::Final, None)
             }
             Finalization::AutopostUnlessReplied => {
                 self.flush().await;
-                self.autopost(rest, &text).await
+                let outcome = self.autopost(rest, &text).await;
+                (outcome.terminal(), Some(outcome))
             }
         };
         self.sink.terminate(terminal);
@@ -608,6 +644,7 @@ impl ReplyStream {
                 tracing::warn!(target: "stream_draft", "terminal draft frame timed out");
             }
         }
+        outcome
     }
 
     /// Ask the publisher to emit any unsent snapshot now; bounded wait.
@@ -618,10 +655,8 @@ impl ReplyStream {
         let _ = tokio::time::timeout(FLUSH_TIMEOUT, rx).await;
     }
 
-    /// Post `text` unless the agent already replied in scope. Returns the
-    /// terminal status: `final` when a reply exists (ours or the agent's),
-    /// `abandoned` when it could not be determined or posted.
-    async fn autopost(&self, rest: &RestClient, text: &str) -> StreamDraftStatus {
+    /// Post `text` unless the agent already replied in scope.
+    async fn autopost(&self, rest: &RestClient, text: &str) -> AutopostOutcome {
         match self.agent_replied(rest).await {
             Ok(true) => {
                 tracing::info!(
@@ -629,7 +664,7 @@ impl ReplyStream {
                     stream = %self.stream_id,
                     "agent replied via CLI during the turn — draft discarded, not autoposting"
                 );
-                return StreamDraftStatus::Final;
+                return AutopostOutcome::AlreadyReplied;
             }
             Ok(false) => {}
             Err(error) => {
@@ -640,7 +675,7 @@ impl ReplyStream {
                     stream = %self.stream_id,
                     "self-reply check failed, not autoposting: {error}"
                 );
-                return StreamDraftStatus::Abandoned;
+                return AutopostOutcome::Failed(format!("self-reply check failed: {error}"));
             }
         }
         match self.post_reply(rest, text).await {
@@ -651,7 +686,7 @@ impl ReplyStream {
                     event_id = %event_id,
                     "autoposted turn response as reply"
                 );
-                StreamDraftStatus::Final
+                AutopostOutcome::Posted(event_id)
             }
             Err(error) => {
                 tracing::error!(
@@ -659,7 +694,7 @@ impl ReplyStream {
                     stream = %self.stream_id,
                     "autopost failed, reply text not delivered: {error}"
                 );
-                StreamDraftStatus::Abandoned
+                AutopostOutcome::Failed(error)
             }
         }
     }
@@ -1673,7 +1708,7 @@ mod tests {
         relay: &FakeRelay,
         stop: StopReason,
         text: &str,
-    ) -> (Vec<Frame>, Keys, Uuid, String) {
+    ) -> (Vec<Frame>, Keys, Uuid, String, Option<AutopostOutcome>) {
         let keys = Keys::generate();
         let channel = Uuid::new_v4();
         let root = "f".repeat(64);
@@ -1683,17 +1718,22 @@ mod tests {
         stream.sink().on_text(text);
         // Let the live frames go out before the turn ends.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        stream.finish(&stop, &relay.rest(&keys)).await;
-        (drain(&mut rx).await, keys, channel, root)
+        let outcome = stream.finish(&stop, &relay.rest(&keys)).await;
+        (drain(&mut rx).await, keys, channel, root, outcome)
     }
 
     #[tokio::test]
     async fn autopost_posts_kind9_with_stream_tag_when_agent_did_not_reply() {
         let relay = FakeRelay::spawn().await;
-        let (frames, keys, channel, root) =
+        let (frames, keys, channel, root, outcome) =
             autopost_case(&relay, StopReason::EndTurn, "Here is the answer.").await;
         let stream = assert_stream_invariants(&frames, channel, &keys);
         assert_eq!(frames.last().unwrap().status, "final");
+        let posted_id = relay.posted_messages()[0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(outcome, Some(AutopostOutcome::Posted(posted_id)));
 
         let posted = relay.posted_messages();
         assert_eq!(posted.len(), 1, "exactly one autoposted reply");
@@ -1731,9 +1771,10 @@ mod tests {
         let (runtime, mut rx) = runtime(StreamMode::DraftAutopost, &keys);
         let stream = ReplyStream::start(&runtime, thread_target(channel, &root));
         stream.sink().on_text("Duplicate of what I already sent.");
-        stream
+        let outcome = stream
             .finish(&StopReason::EndTurn, &relay.rest(&keys))
             .await;
+        assert_eq!(outcome, Some(AutopostOutcome::AlreadyReplied));
 
         let frames = drain(&mut rx).await;
         assert_eq!(frames.last().unwrap().status, "final");
@@ -1763,9 +1804,13 @@ mod tests {
     async fn autopost_abandons_when_self_reply_check_fails() {
         let relay = FakeRelay::spawn().await;
         *relay.fail_self_query.lock().unwrap() = true;
-        let (frames, ..) = autopost_case(&relay, StopReason::EndTurn, "answer").await;
+        let (frames, .., outcome) = autopost_case(&relay, StopReason::EndTurn, "answer").await;
         assert_eq!(frames.last().unwrap().status, "abandoned");
         assert!(relay.posted_messages().is_empty(), "never risk a duplicate");
+        assert!(
+            matches!(outcome, Some(AutopostOutcome::Failed(_))),
+            "the lost reply is surfaced: {outcome:?}"
+        );
     }
 
     #[tokio::test]
@@ -1777,7 +1822,8 @@ mod tests {
             StopReason::Refusal,
         ] {
             let relay = FakeRelay::spawn().await;
-            let (frames, ..) = autopost_case(&relay, stop.clone(), "partial").await;
+            let (frames, .., outcome) = autopost_case(&relay, stop.clone(), "partial").await;
+            assert_eq!(outcome, None, "{stop:?}: no autopost attempted");
             assert_eq!(frames.last().unwrap().status, "abandoned", "{stop:?}");
             assert!(relay.posted_messages().is_empty(), "{stop:?}");
             assert!(
@@ -1790,7 +1836,8 @@ mod tests {
     #[tokio::test]
     async fn autopost_skips_whitespace_text() {
         let relay = FakeRelay::spawn().await;
-        let (frames, ..) = autopost_case(&relay, StopReason::EndTurn, " \n\t").await;
+        let (frames, .., outcome) = autopost_case(&relay, StopReason::EndTurn, " \n\t").await;
+        assert_eq!(outcome, None);
         assert_eq!(frames.last().unwrap().status, "final");
         assert!(relay.posted_messages().is_empty());
     }
