@@ -1,0 +1,434 @@
+#!/usr/bin/env python3
+"""List the main Claude Code sessions stored on this machine.
+
+Reads session METADATA only: cwd, git branch, titles, and the short
+last-prompt string Claude Code itself records for its resume picker. It never
+opens ``~/.claude/sessions/*.key`` and never prints message bodies.
+
+Data sources (all under the Claude config dir, default ``~/.claude``):
+
+* ``projects/<encoded cwd>/<sessionId>.jsonl`` -- one transcript per main
+  session. Only top-level ``*.jsonl`` files are main sessions; subagent and
+  tool-result transcripts live in subdirectories and are skipped.
+* ``sessions/<pid>.json`` -- registry of running Claude Code processes
+  (``sessionId``, ``name``, ``nameSource``, ``status``, ``procStart``).
+* ``history.jsonl`` -- prompt history, used only as a last title fallback.
+
+Title priority: custom title > user-set session name > AI title > last prompt
+> basename(cwd) + short id.
+
+Efficiency: the transcript head is streamed only until the first record that
+carries ``cwd`` (a few lines). Title records are "last occurrence wins", so they
+are located with ``mmap.rfind`` from the end of the file. That search runs at C
+speed, usually stops near the tail, and never JSON-parses unrelated lines; a
+file without the record costs one byte scan rather than a parse of every line.
+Inside a JSON string every ``"`` is escaped, so the raw byte sequence
+``"type":"ai-title"`` only occurs as JSON structure; each hit is still parsed
+and checked to be a top-level record before it is trusted.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import glob
+import json
+import mmap
+import os
+import re
+import sys
+import time
+from typing import Any, Callable, Iterator
+
+TITLE_MAX = 80
+HEAD_MAX_LINES = 2000
+USER_PROMPT_MAX_CANDIDATES = 200
+
+_WS = re.compile(r"\s+")
+
+
+def clean_title(value: Any) -> str | None:
+    """Collapse whitespace to one line and cap at TITLE_MAX characters."""
+    if not isinstance(value, str):
+        return None
+    text = _WS.sub(" ", value).strip()
+    if not text:
+        return None
+    if len(text) > TITLE_MAX:
+        text = text[: TITLE_MAX - 1].rstrip() + "…"
+    return text
+
+
+def default_claude_dir() -> str:
+    env = os.environ.get("CLAUDE_CONFIG_DIR")
+    if env:
+        return env
+    return os.path.join(os.path.expanduser("~"), ".claude")
+
+
+# --------------------------------------------------------------------------
+# Live session registry
+# --------------------------------------------------------------------------
+
+
+def proc_is_live(pid: Any, proc_start: Any, proc_root: str = "/proc") -> bool:
+    """True when ``pid`` runs and, if known, started at ``proc_start``.
+
+    ``procStart`` is the process start time in clock ticks (field 22 of
+    ``/proc/<pid>/stat``); comparing it guards against pid reuse.
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        with open(os.path.join(proc_root, str(pid), "stat"), encoding="utf-8", errors="replace") as fh:
+            stat = fh.read()
+    except OSError:
+        return os.path.isdir(os.path.join(proc_root, str(pid)))
+    if proc_start is None:
+        return True
+    try:
+        start = stat.rsplit(")", 1)[1].split()[19]
+    except IndexError:
+        return True
+    return start == str(proc_start)
+
+
+def load_registry(claude_dir: str, is_live: Callable[[Any, Any], bool]) -> dict[str, dict]:
+    """Map sessionId -> best registry entry (live first, then newest)."""
+    best: dict[str, dict] = {}
+    for path in glob.glob(os.path.join(claude_dir, "sessions", "*.json")):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict) or not isinstance(data.get("sessionId"), str):
+            continue
+        entry = {
+            "pid": data.get("pid"),
+            "status": data.get("status"),
+            "name": data.get("name"),
+            "name_source": data.get("nameSource"),
+            "updated_at": data.get("updatedAt") or 0,
+            "live": is_live(data.get("pid"), data.get("procStart")),
+        }
+        current = best.get(data["sessionId"])
+        rank = (entry["live"], entry["updated_at"])
+        if current is None or rank > (current["live"], current["updated_at"]):
+            best[data["sessionId"]] = entry
+    return best
+
+
+def load_history_titles(claude_dir: str) -> dict[str, str]:
+    """Map sessionId -> last prompt ``display`` from history.jsonl."""
+    titles: dict[str, str] = {}
+    path = os.path.join(claude_dir, "history.jsonl")
+    try:
+        fh = open(path, "rb")
+    except OSError:
+        return titles
+    with fh:
+        for line in fh:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and isinstance(rec.get("sessionId"), str):
+                title = clean_title(rec.get("display"))
+                if title:
+                    titles[rec["sessionId"]] = title
+    return titles
+
+
+# --------------------------------------------------------------------------
+# Transcript scanning
+# --------------------------------------------------------------------------
+
+
+def scan_head(path: str) -> dict:
+    """Stream the head until the first record carrying ``cwd``."""
+    with open(path, "rb") as fh:
+        for i, line in enumerate(fh):
+            if i >= HEAD_MAX_LINES:
+                break
+            if b'"cwd"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and isinstance(rec.get("cwd"), str):
+                return {
+                    "cwd": rec["cwd"],
+                    "git_branch": rec.get("gitBranch") or None,
+                    "sidechain": bool(rec.get("isSidechain")),
+                }
+    return {"cwd": None, "git_branch": None, "sidechain": False}
+
+
+def iter_records_reverse(mm: mmap.mmap, record_type: str) -> Iterator[dict]:
+    """Yield top-level records of ``record_type``, last occurrence first."""
+    needle = b'"type":"' + record_type.encode() + b'"'
+    end = len(mm)
+    while True:
+        pos = mm.rfind(needle, 0, end)
+        if pos < 0:
+            return
+        start = mm.rfind(b"\n", 0, pos) + 1
+        stop = mm.find(b"\n", pos)
+        if stop < 0:
+            stop = len(mm)
+        end = start
+        try:
+            rec = json.loads(mm[start:stop])
+        except ValueError:
+            rec = None
+        if isinstance(rec, dict) and rec.get("type") == record_type:
+            yield rec
+        if start == 0:
+            return
+
+
+def _prompt_text(rec: dict) -> str | None:
+    """Text of a human-typed user prompt, or None for meta/tool records."""
+    if rec.get("isMeta") or rec.get("isSidechain") or rec.get("isCompactSummary"):
+        return None
+    message = rec.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, list):
+        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+            return None
+        content = " ".join(
+            b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+        )
+    if not isinstance(content, str):
+        return None
+    text = content.strip()
+    # Slash-command wrappers and injected reminders are not prompts.
+    if not text or text.startswith("<"):
+        return None
+    return text
+
+
+def scan_tail(path: str) -> dict:
+    """Find the last title records and, if none, the last typed prompt."""
+    out: dict[str, str | None] = {
+        "custom_title": None,
+        "ai_title": None,
+        "last_prompt": None,
+        "user_prompt": None,
+    }
+    if os.path.getsize(path) == 0:
+        return out
+    with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+        for record_type, key, field in (
+            ("custom-title", "customTitle", "custom_title"),
+            ("ai-title", "aiTitle", "ai_title"),
+            ("last-prompt", "lastPrompt", "last_prompt"),
+        ):
+            for rec in iter_records_reverse(mm, record_type):
+                title = clean_title(rec.get(key))
+                if title:
+                    out[field] = title
+                    break
+            if field == "custom_title" and out[field]:
+                return out  # highest priority found; skip the rest
+        if not (out["ai_title"] or out["last_prompt"]):
+            for i, rec in enumerate(iter_records_reverse(mm, "user")):
+                if i >= USER_PROMPT_MAX_CANDIDATES:
+                    break
+                title = clean_title(_prompt_text(rec))
+                if title:
+                    out["user_prompt"] = title
+                    break
+    return out
+
+
+# --------------------------------------------------------------------------
+# Assembly
+# --------------------------------------------------------------------------
+
+
+def iso_local(ts: float) -> str:
+    return _dt.datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
+
+
+def collect(
+    claude_dir: str,
+    *,
+    is_live: Callable[[Any, Any], bool] | None = None,
+    since: float | None = None,
+    id_prefix: str | None = None,
+    cwd_prefix: str | None = None,
+    running: bool = False,
+) -> list[dict]:
+    """Return session rows sorted by last_modified, newest first."""
+    is_live = is_live or proc_is_live
+    registry = load_registry(claude_dir, is_live)
+    history: dict[str, str] | None = None
+    rows = []
+    for path in glob.glob(os.path.join(claude_dir, "projects", "*", "*.jsonl")):
+        sid = os.path.basename(path)[: -len(".jsonl")]
+        if id_prefix and not sid.startswith(id_prefix):
+            continue
+        reg = registry.get(sid)
+        live = bool(reg and reg["live"])
+        if running and not live:
+            continue
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        if since is not None and st.st_mtime < since:
+            continue
+        head = scan_head(path)
+        if head["sidechain"]:
+            continue
+        cwd = head["cwd"]
+        if cwd_prefix and not (cwd and _path_has_prefix(cwd, cwd_prefix)):
+            continue
+        tail = scan_tail(path)
+        user_name = None
+        if reg and reg.get("name_source") == "user":
+            user_name = clean_title(reg.get("name"))
+        title, source = None, None
+        for value, label in (
+            (tail["custom_title"], "custom-title"),
+            (user_name, "session-name"),
+            (tail["ai_title"], "ai-title"),
+            (tail["last_prompt"], "last-prompt"),
+            (tail["user_prompt"], "user-prompt"),
+        ):
+            if value:
+                title, source = value, label
+                break
+        if title is None:
+            if history is None:
+                history = load_history_titles(claude_dir)
+            if sid in history:
+                title, source = history[sid], "history"
+        if title is None:
+            base = os.path.basename(cwd.rstrip("/")) if cwd else "unknown"
+            title, source = clean_title(f"{base or '/'} {sid[:8]}"), "fallback"
+        row = {
+            "id": sid,
+            "title": title,
+            "title_source": source,
+            "cwd": cwd,
+            "git_branch": head["git_branch"],
+            "last_modified": iso_local(st.st_mtime),
+            "size_bytes": st.st_size,
+            "live": live,
+            "_mtime": st.st_mtime,
+        }
+        if live:
+            row["pid"] = reg["pid"]
+            row["status"] = reg["status"]
+        rows.append(row)
+    rows.sort(key=lambda r: r["_mtime"], reverse=True)
+    for row in rows:
+        del row["_mtime"]
+    return rows
+
+
+def _path_has_prefix(path: str, prefix: str) -> bool:
+    prefix = os.path.expanduser(prefix)
+    if prefix != "/":
+        prefix = prefix.rstrip("/")
+    return path == prefix or path.startswith(prefix if prefix.endswith("/") else prefix + "/")
+
+
+def parse_since(value: str, now: float | None = None) -> float:
+    """Accept ``Nd``/``Nh``/``Nm`` relative ages or an ISO-8601 date/time."""
+    now = time.time() if now is None else now
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([dhm])", value.strip())
+    if m:
+        unit = {"d": 86400, "h": 3600, "m": 60}[m.group(2)]
+        return now - float(m.group(1)) * unit
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = _dt.datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid --since {value!r}: use Nd/Nh/Nm or ISO-8601"
+        ) from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return parsed.timestamp()
+
+
+def format_table(rows: list[dict]) -> str:
+    headers = ("LAST_MODIFIED", "ID", "LIVE", "SOURCE", "TITLE", "CWD")
+    table = [
+        (
+            r["last_modified"][:16].replace("T", " "),
+            r["id"],
+            (r.get("status") or "yes") if r["live"] else "",
+            r["title_source"],
+            r["title"],
+            r["cwd"] or "-",
+        )
+        for r in rows
+    ]
+    widths = [max([len(h)] + [len(row[i]) for row in table]) for i, h in enumerate(headers)]
+    widths[-1] = 0  # last column is not padded
+    lines = ["  ".join(h.ljust(w) for h, w in zip(headers, widths)).rstrip()]
+    for row in table:
+        lines.append("  ".join(c.ljust(w) for c, w in zip(row, widths)).rstrip())
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None, is_live: Callable[[Any, Any], bool] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="claude-sessions-list",
+        description="List main Claude Code sessions on this machine (metadata only).",
+    )
+    parser.add_argument("--claude-dir", help="Claude config dir (default: $CLAUDE_CONFIG_DIR or ~/.claude)")
+    parser.add_argument("--json", action="store_true", help="emit a JSON array")
+    parser.add_argument("--cwd", metavar="PREFIX", help="only sessions whose cwd is PREFIX or below it")
+    parser.add_argument("--since", metavar="WHEN", type=parse_since, help="modified since ISO time or Nd/Nh/Nm ago")
+    parser.add_argument("--running", action="store_true", help="only sessions with a live Claude Code process")
+    parser.add_argument("--limit", type=int, metavar="N", help="show at most N sessions")
+    parser.add_argument("--id", metavar="PREFIX", help="show the one session whose id starts with PREFIX")
+    args = parser.parse_args(argv)
+
+    claude_dir = args.claude_dir or default_claude_dir()
+    if not os.path.isdir(os.path.join(claude_dir, "projects")):
+        print(f"claude-sessions-list: no projects dir under {claude_dir}", file=sys.stderr)
+        return 1
+    rows = collect(
+        claude_dir,
+        is_live=is_live,
+        since=args.since,
+        id_prefix=args.id,
+        cwd_prefix=args.cwd,
+        running=args.running,
+    )
+    if args.id is not None:
+        if not rows:
+            print(f"claude-sessions-list: no session matches id prefix {args.id!r}", file=sys.stderr)
+            return 1
+        if len(rows) > 1:
+            ids = ", ".join(r["id"] for r in rows[:10])
+            print(
+                f"claude-sessions-list: id prefix {args.id!r} is ambiguous ({len(rows)} matches: {ids})",
+                file=sys.stderr,
+            )
+            return 1
+    if args.limit is not None:
+        rows = rows[: max(args.limit, 0)]
+    if args.json:
+        json.dump(rows, sys.stdout, indent=2, ensure_ascii=False)
+        sys.stdout.write("\n")
+    else:
+        print(format_table(rows))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        sys.exit(0)
