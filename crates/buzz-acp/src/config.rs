@@ -2409,6 +2409,23 @@ channels = "ALL"
         );
     }
 
+    /// The startup log line must name the stream mode so a stale or
+    /// non-streaming harness is obvious from logs alone.
+    #[test]
+    fn test_summary_reports_stream_mode() {
+        use crate::stream_draft::StreamMode;
+        for (mode, expected) in [
+            (StreamMode::Off, " stream=off "),
+            (StreamMode::Draft, " stream=draft "),
+            (StreamMode::DraftAutopost, " stream=draft+autopost "),
+        ] {
+            let mut config = test_config(SubscribeMode::Mentions);
+            config.stream_mode = mode;
+            let s = config.summary();
+            assert!(s.contains(expected), "expected `{expected}` in: {s}");
+        }
+    }
+
     #[test]
     fn test_summary_reflects_custom_agents_and_heartbeat() {
         let mut config = test_config(SubscribeMode::Mentions);
