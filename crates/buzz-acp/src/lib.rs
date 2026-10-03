@@ -18,6 +18,7 @@ mod prompt_project;
 mod queue;
 mod recovery_wake;
 mod relay;
+mod resume_store;
 mod run_task;
 mod runtime;
 use runtime::{AgentRuntime, PoolStartup, SessionMode};

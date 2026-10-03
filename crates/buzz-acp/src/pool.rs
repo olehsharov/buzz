@@ -42,6 +42,7 @@ use crate::queue::{
     PromptProfile, PromptProfileLookup, ThreadTags,
 };
 use crate::relay::{ChannelInfo, RestClient};
+use crate::resume_store::ResumeForkStore;
 use crate::scope::SessionScope;
 
 /// Window within which agent activity before a hard-cap death qualifies
@@ -937,8 +938,9 @@ pub struct PromptContext {
     /// the desktop keys per (agent, relay) pair, e.g. `session_config_captured`,
     /// mirroring the `managed_agent_runtime_lifecycle` frames.
     pub relay_url: String,
-    /// Provider session the first channel/DM session forks and resumes.
-    /// Holds `None` when `BUZZ_ACP_RESUME_SESSION` is unset or consumed.
+    /// Provider session the first channel/DM session continues, with the
+    /// store recording its fork. `None` when `BUZZ_ACP_RESUME_SESSION` is
+    /// unset or already consumed by this process.
     pub resume_session: ResumeSessionSlot,
 }
 
@@ -1581,26 +1583,62 @@ struct NewSessionChannelContext<'a> {
     channel_type: Option<&'a str>,
 }
 
-/// One-shot provider session to continue from (`BUZZ_ACP_RESUME_SESSION`),
-/// shared by every worker so exactly one channel/DM session consumes it.
-pub type ResumeSessionSlot = Arc<Mutex<Option<String>>>;
+/// Provider session to continue from (`BUZZ_ACP_RESUME_SESSION`) and the
+/// durable store recording which fork continues it.
+#[derive(Debug, Clone)]
+pub struct PendingResume {
+    /// Validated source provider session ID.
+    pub source: String,
+    /// Where the source -> fork record for this agent lives.
+    pub store: ResumeForkStore,
+}
 
-fn take_resume_session(slot: &ResumeSessionSlot) -> Option<String> {
+/// One-shot pending resume shared by every worker so exactly one channel/DM
+/// session per process consumes it.
+pub type ResumeSessionSlot = Arc<Mutex<Option<PendingResume>>>;
+
+fn take_resume_session(slot: &ResumeSessionSlot) -> Option<PendingResume> {
     slot.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
-fn restore_resume_session(slot: &ResumeSessionSlot, source: String) {
-    let mut pending = slot.lock().unwrap_or_else(|e| e.into_inner());
-    if pending.is_none() {
-        *pending = Some(source);
+fn restore_resume_session(slot: &ResumeSessionSlot, pending: PendingResume) {
+    let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if slot.is_none() {
+        *slot = Some(pending);
     }
 }
 
-/// Fork `source` and resume the fork as a live session with the harness
-/// setup parameters. The source session is never written to.
-async fn fork_and_resume_session(
+/// ACP `RESOURCE_NOT_FOUND`: what `claude-agent-acp` returns when
+/// `session/resume` names a session with no transcript.
+const ACP_RESOURCE_NOT_FOUND: i64 = -32002;
+
+/// Whether `error` from `session/resume` of `session_id` says that session no
+/// longer exists (as opposed to a transient or configuration failure). Older
+/// adapters wrap the cause in a generic error whose detail names the session.
+fn is_resume_session_missing(error: &AcpError, session_id: &str) -> bool {
+    match error {
+        AcpError::AgentError { code, .. } if *code == ACP_RESOURCE_NOT_FOUND => true,
+        AcpError::AgentError { message, .. } => {
+            let lower = message.to_ascii_lowercase();
+            message.contains(session_id)
+                && (lower.contains("not found") || lower.contains("no conversation found"))
+        }
+        _ => false,
+    }
+}
+
+/// Continue the configured provider session as a live session with the
+/// harness setup parameters. The source session is never written to.
+///
+/// If a previous process already forked the source (recorded in the store),
+/// that fork is resumed so the agent keeps what it did in Buzz since. If the
+/// recorded fork no longer exists, the source is forked again with a warning
+/// and the record replaced. Otherwise the source is forked, the fork resumed,
+/// and the fork recorded — only after the resume succeeded, so a failed
+/// resume never leaves a record pointing at an unusable fork.
+async fn continue_provider_session(
     agent: &mut OwnedAgent,
-    source: &str,
+    pending: &PendingResume,
     cwd: &str,
     mcp_servers: Vec<McpServer>,
     system_prompt: Option<SystemPromptTransport<'_>>,
@@ -1613,11 +1651,46 @@ async fn fork_and_resume_session(
             agent.agent_name
         )));
     }
+    let source = pending.source.as_str();
+    if let Some(fork) = pending.store.load(source, cwd)? {
+        match agent
+            .acp
+            .session_resume_full(
+                &fork,
+                cwd,
+                mcp_servers.clone(),
+                system_prompt.clone(),
+                session_title,
+            )
+            .await
+        {
+            Ok(resp) => {
+                if resp.session_id != fork {
+                    pending.store.save(source, cwd, &resp.session_id)?;
+                }
+                tracing::info!(
+                    target: "pool::session",
+                    "continuing provider session {source} via its recorded fork {}",
+                    resp.session_id
+                );
+                return Ok(resp);
+            }
+            Err(error) if is_resume_session_missing(&error, &fork) => {
+                tracing::warn!(
+                    target: "pool::session",
+                    "recorded fork {fork} of provider session {source} no longer exists \
+                     ({error}); forking the source again — work done in that fork is lost"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
     let forked = agent.acp.session_fork(source, cwd).await?;
     let resp = agent
         .acp
         .session_resume_full(&forked, cwd, mcp_servers, system_prompt, session_title)
         .await?;
+    pending.store.save(source, cwd, &resp.session_id)?;
     tracing::info!(
         target: "pool::session",
         "continuing provider session {source} as fork {}",
@@ -1685,10 +1758,10 @@ async fn create_session_and_apply_model(
         None
     };
     let resp = match resume_source {
-        Some(source) => {
-            match fork_and_resume_session(
+        Some(pending) => {
+            match continue_provider_session(
                 agent,
-                &source,
+                &pending,
                 &ctx.cwd,
                 mcp_servers,
                 system_prompt,
@@ -1700,7 +1773,7 @@ async fn create_session_and_apply_model(
                 Err(error) => {
                     // Keep the source pending so the next new session retries
                     // instead of silently starting fresh.
-                    restore_resume_session(&ctx.resume_session, source);
+                    restore_resume_session(&ctx.resume_session, pending);
                     return Err(error);
                 }
             }
@@ -11873,7 +11946,8 @@ done"#
         let (mut agent, observer) = spawn_resume_agent(RESUME_CAPS, FORK_OK).await;
         let mut ctx = make_prompt_context_no_owner();
         ctx.session_title = Some("Fizz".into());
-        ctx.resume_session = Arc::new(Mutex::new(Some("src-1".into())));
+        let state = tempfile::tempdir().expect("state dir");
+        ctx.resume_session = pending_slot("src-1", state.path());
         let first = SessionScope::Conversation {
             channel_id: Uuid::new_v4(),
         };
@@ -11885,10 +11959,11 @@ done"#
             .await
             .expect("resumed session");
         assert_eq!(sid, "fork-1");
+        assert_eq!(pending_source(&ctx), None, "slot is consumed");
         assert_eq!(
-            *ctx.resume_session.lock().unwrap(),
-            None,
-            "slot is consumed"
+            recorded_fork(&ctx, state.path(), "src-1").as_deref(),
+            Some("fork-1"),
+            "the resumed fork is recorded"
         );
 
         let fork = acp_write(&observer, "session/fork").expect("session/fork sent");
@@ -11919,7 +11994,8 @@ done"#
     async fn resume_session_is_not_consumed_by_unscoped_sessions() {
         let (mut agent, observer) = spawn_resume_agent(RESUME_CAPS, FORK_OK).await;
         let mut ctx = make_prompt_context_no_owner();
-        ctx.resume_session = Arc::new(Mutex::new(Some("src-1".into())));
+        let state = tempfile::tempdir().expect("state dir");
+        ctx.resume_session = pending_slot("src-1", state.path());
 
         let sid = create_session_and_apply_model(&mut agent, &ctx, None, unscoped())
             .await
@@ -11927,8 +12003,8 @@ done"#
         assert!(sid.starts_with("new-"));
         assert!(acp_write(&observer, "session/fork").is_none());
         assert_eq!(
-            ctx.resume_session.lock().unwrap().as_deref(),
-            Some("src-1"),
+            pending_source(&ctx),
+            Some("src-1".to_string()),
             "heartbeat/isolated sessions leave the resume pending"
         );
     }
@@ -11938,7 +12014,8 @@ done"#
         let fork_error = r#""error":{"code":-32602,"message":"no such session"}"#;
         let (mut agent, observer) = spawn_resume_agent(RESUME_CAPS, fork_error).await;
         let mut ctx = make_prompt_context_no_owner();
-        ctx.resume_session = Arc::new(Mutex::new(Some("src-1".into())));
+        let state = tempfile::tempdir().expect("state dir");
+        ctx.resume_session = pending_slot("src-1", state.path());
         let scope = SessionScope::Conversation {
             channel_id: Uuid::new_v4(),
         };
@@ -11951,7 +12028,7 @@ done"#
             "{err:?}"
         );
         assert!(acp_write(&observer, "session/new").is_none());
-        assert_eq!(ctx.resume_session.lock().unwrap().as_deref(), Some("src-1"));
+        assert_eq!(pending_source(&ctx), Some("src-1".to_string()));
     }
 
     #[tokio::test]
@@ -11961,7 +12038,8 @@ done"#
         let fork_error = r#""error":{"code":-32603,"message":"Internal error","data":{"details":"Session src-1 not found in project directory for /home/u"}}"#;
         let (mut agent, _observer) = spawn_resume_agent(RESUME_CAPS, fork_error).await;
         let mut ctx = make_prompt_context_no_owner();
-        ctx.resume_session = Arc::new(Mutex::new(Some("src-1".into())));
+        let state = tempfile::tempdir().expect("state dir");
+        ctx.resume_session = pending_slot("src-1", state.path());
         let scope = SessionScope::Conversation {
             channel_id: Uuid::new_v4(),
         };
@@ -11985,7 +12063,8 @@ done"#
     async fn resume_session_requires_advertised_fork_and_resume() {
         let (mut agent, observer) = spawn_resume_agent(r#"{"fork":{}}"#, FORK_OK).await;
         let mut ctx = make_prompt_context_no_owner();
-        ctx.resume_session = Arc::new(Mutex::new(Some("src-1".into())));
+        let state = tempfile::tempdir().expect("state dir");
+        ctx.resume_session = pending_slot("src-1", state.path());
         let scope = SessionScope::Conversation {
             channel_id: Uuid::new_v4(),
         };
@@ -11996,27 +12075,277 @@ done"#
         assert!(matches!(err, AcpError::Protocol(_)), "{err:?}");
         assert!(acp_write(&observer, "session/fork").is_none());
         assert!(acp_write(&observer, "session/new").is_none());
-        assert_eq!(ctx.resume_session.lock().unwrap().as_deref(), Some("src-1"));
+        assert_eq!(pending_source(&ctx), Some("src-1".to_string()));
+    }
+
+    fn pending_slot(source: &str, state_root: &std::path::Path) -> ResumeSessionSlot {
+        Arc::new(Mutex::new(Some(PendingResume {
+            source: source.into(),
+            store: ResumeForkStore::new(state_root, "agent-hex"),
+        })))
+    }
+
+    fn pending_source(ctx: &PromptContext) -> Option<String> {
+        ctx.resume_session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|p| p.source.clone())
+    }
+
+    fn recorded_fork(
+        ctx: &PromptContext,
+        state_root: &std::path::Path,
+        source: &str,
+    ) -> Option<String> {
+        ResumeForkStore::new(state_root, "agent-hex")
+            .load(source, &ctx.cwd)
+            .expect("record readable")
+    }
+
+    fn conversation() -> SessionScope {
+        SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_session_second_process_resumes_recorded_fork_without_forking() {
+        let state = tempfile::tempdir().expect("state dir");
+        let scope = conversation();
+
+        // First process forks the source and records the fork.
+        let (mut agent, _observer) = spawn_resume_agent(RESUME_CAPS, FORK_OK).await;
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.resume_session = pending_slot("src-1", state.path());
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&scope))
+            .await
+            .expect("first process continues the source");
+        assert_eq!(sid, "fork-1");
+
+        // A restarted process (fresh adapter, context and slot; same state)
+        // resumes that fork instead of forking the source again.
+        let fork_would_be_new = r#""result":{"sessionId":"fork-2"}"#;
+        let (mut agent, observer) = spawn_resume_agent(RESUME_CAPS, fork_would_be_new).await;
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.resume_session = pending_slot("src-1", state.path());
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&scope))
+            .await
+            .expect("second process continues the recorded fork");
+        assert_eq!(sid, "fork-1");
+        assert!(
+            acp_write(&observer, "session/fork").is_none(),
+            "no new fork"
+        );
+        let resume = acp_write(&observer, "session/resume").expect("session/resume sent");
+        assert_eq!(resume["params"]["sessionId"], "fork-1");
+        assert_eq!(pending_source(&ctx), None, "slot is consumed");
+        assert_eq!(
+            recorded_fork(&ctx, state.path(), "src-1").as_deref(),
+            Some("fork-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_session_records_fork_only_after_resume_succeeds() {
+        let state = tempfile::tempdir().expect("state dir");
+        let (mut agent, observer) =
+            spawn_resume_agent_failing(RESUME_CAPS, FORK_OK, "fork-1", RESUME_BROKEN).await;
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.resume_session = pending_slot("src-1", state.path());
+
+        let err = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&conversation()))
+            .await
+            .expect_err("resume failure propagates");
+        assert!(
+            matches!(err, AcpError::AgentError { code: -32603, .. }),
+            "{err:?}"
+        );
+        assert_eq!(acp_writes(&observer, "session/fork"), 1);
+        assert_eq!(
+            recorded_fork(&ctx, state.path(), "src-1"),
+            None,
+            "an unresumed fork is never recorded"
+        );
+        assert_eq!(pending_source(&ctx).as_deref(), Some("src-1"));
+    }
+
+    #[tokio::test]
+    async fn resume_session_reforks_source_when_recorded_fork_is_gone() {
+        let state = tempfile::tempdir().expect("state dir");
+        let (mut agent, observer) =
+            spawn_resume_agent_failing(RESUME_CAPS, FORK_OK, "gone-fork", SESSION_MISSING).await;
+        let mut ctx = make_prompt_context_no_owner();
+        ResumeForkStore::new(state.path(), "agent-hex")
+            .save("src-1", &ctx.cwd, "gone-fork")
+            .expect("seed record");
+        ctx.resume_session = pending_slot("src-1", state.path());
+
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&conversation()))
+            .await
+            .expect("re-forks the source");
+        assert_eq!(sid, "fork-1");
+        let fork = acp_write(&observer, "session/fork").expect("source forked again");
+        assert_eq!(fork["params"]["sessionId"], "src-1");
+        assert_eq!(acp_writes(&observer, "session/resume"), 2);
+        assert_eq!(
+            recorded_fork(&ctx, state.path(), "src-1").as_deref(),
+            Some("fork-1"),
+            "the stale record is replaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_session_other_recorded_fork_failures_propagate_and_keep_record() {
+        let state = tempfile::tempdir().expect("state dir");
+        let (mut agent, observer) =
+            spawn_resume_agent_failing(RESUME_CAPS, FORK_OK, "kept-fork", RESUME_BROKEN).await;
+        let mut ctx = make_prompt_context_no_owner();
+        ResumeForkStore::new(state.path(), "agent-hex")
+            .save("src-1", &ctx.cwd, "kept-fork")
+            .expect("seed record");
+        ctx.resume_session = pending_slot("src-1", state.path());
+
+        let err = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&conversation()))
+            .await
+            .expect_err("a non-missing resume failure propagates");
+        assert!(
+            matches!(err, AcpError::AgentError { code: -32603, .. }),
+            "{err:?}"
+        );
+        assert!(acp_write(&observer, "session/fork").is_none(), "no re-fork");
+        assert!(acp_write(&observer, "session/new").is_none());
+        assert_eq!(
+            recorded_fork(&ctx, state.path(), "src-1").as_deref(),
+            Some("kept-fork")
+        );
+        assert_eq!(pending_source(&ctx).as_deref(), Some("src-1"));
+    }
+
+    #[tokio::test]
+    async fn resume_session_unreadable_record_propagates_without_forking() {
+        let state = tempfile::tempdir().expect("state dir");
+        let (mut agent, observer) = spawn_resume_agent(RESUME_CAPS, FORK_OK).await;
+        let mut ctx = make_prompt_context_no_owner();
+        let store = ResumeForkStore::new(state.path(), "agent-hex");
+        store
+            .save("src-1", &ctx.cwd, "fork-0")
+            .expect("seed record");
+        std::fs::write(store.record_path("src-1", &ctx.cwd), b"{torn").expect("corrupt");
+        ctx.resume_session = pending_slot("src-1", state.path());
+
+        let err = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&conversation()))
+            .await
+            .expect_err("a corrupt record is not treated as absent");
+        assert!(matches!(err, AcpError::Io(_)), "{err:?}");
+        assert!(acp_write(&observer, "session/fork").is_none());
+        assert_eq!(pending_source(&ctx).as_deref(), Some("src-1"));
+    }
+
+    #[tokio::test]
+    async fn resume_session_different_source_forks_fresh() {
+        let state = tempfile::tempdir().expect("state dir");
+        let (mut agent, observer) = spawn_resume_agent(RESUME_CAPS, FORK_OK).await;
+        let mut ctx = make_prompt_context_no_owner();
+        ResumeForkStore::new(state.path(), "agent-hex")
+            .save("src-old", &ctx.cwd, "old-fork")
+            .expect("seed record for the previous source");
+        ctx.resume_session = pending_slot("src-new", state.path());
+
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&conversation()))
+            .await
+            .expect("continues the new source");
+        assert_eq!(sid, "fork-1");
+        let fork = acp_write(&observer, "session/fork").expect("new source forked");
+        assert_eq!(fork["params"]["sessionId"], "src-new");
+        let resume = acp_write(&observer, "session/resume").expect("resume sent");
+        assert_eq!(resume["params"]["sessionId"], "fork-1");
+        assert_eq!(
+            recorded_fork(&ctx, state.path(), "src-new").as_deref(),
+            Some("fork-1")
+        );
+        assert_eq!(
+            recorded_fork(&ctx, state.path(), "src-old").as_deref(),
+            Some("old-fork"),
+            "the old source's record is untouched"
+        );
+    }
+
+    #[test]
+    fn resume_session_missing_classification() {
+        let agent_error = |code, message: &str| AcpError::AgentError {
+            code,
+            message: message.into(),
+        };
+        let cases = [
+            (agent_error(-32002, "Resource not found"), true),
+            (
+                agent_error(
+                    -32603,
+                    "Internal error: No conversation found with session ID: f1",
+                ),
+                true,
+            ),
+            (
+                agent_error(-32603, "Internal error: Session f1 not found"),
+                true,
+            ),
+            (
+                agent_error(-32603, "Internal error: Session other not found"),
+                false,
+            ),
+            (
+                agent_error(-32603, "Internal error: f1 rate limited"),
+                false,
+            ),
+            (agent_error(-32603, "Internal error"), false),
+            (AcpError::Protocol("f1 not found".into()), false),
+        ];
+        for (error, missing) in cases {
+            assert_eq!(
+                is_resume_session_missing(&error, "f1"),
+                missing,
+                "{error:?}"
+            );
+        }
     }
 
     const RESUME_CAPS: &str = r#"{"fork":{},"resume":{}}"#;
     const FORK_OK: &str = r#""result":{"sessionId":"fork-1"}"#;
+    const SESSION_MISSING: &str =
+        r#""error":{"code":-32002,"message":"Resource not found","data":{"uri":"gone"}}"#;
+    const RESUME_BROKEN: &str = r#""error":{"code":-32603,"message":"Internal error"}"#;
 
     /// Scripted ACP keyed on method: `initialize` advertises
     /// `sessionCapabilities` = `caps`, `session/fork` answers `fork_reply`,
-    /// `session/resume` echoes `fork-1`, `session/new` mints `new-<id>`.
+    /// `session/resume` echoes the requested session, `session/new` mints
+    /// `new-<id>`.
     async fn spawn_resume_agent(
         caps: &str,
         fork_reply: &str,
+    ) -> (OwnedAgent, observer::ObserverHandle) {
+        spawn_resume_agent_failing(caps, fork_reply, "none", "").await
+    }
+
+    /// Like [`spawn_resume_agent`], but `session/resume` of `failing_session`
+    /// answers `failing_reply`.
+    async fn spawn_resume_agent_failing(
+        caps: &str,
+        fork_reply: &str,
+        failing_session: &str,
+        failing_reply: &str,
     ) -> (OwnedAgent, observer::ObserverHandle) {
         let script = format!(
             r#"while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   [ -z "$id" ] && continue
+  sid=$(printf '%s' "$line" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
   case "$line" in
     *'"method":"initialize"'*) body='"result":{{"protocolVersion":2,"agentCapabilities":{{"sessionCapabilities":{caps}}}}}' ;;
     *'"method":"session/fork"'*) body='{fork_reply}' ;;
-    *'"method":"session/resume"'*) body='"result":{{"sessionId":"fork-1"}}' ;;
+    *'"method":"session/resume"'*)
+      if [ "$sid" = '{failing_session}' ]; then body='{failing_reply}'
+      else body='"result":{{"sessionId":"'"$sid"'"}}'; fi ;;
     *'"method":"session/new"'*) body='"result":{{"sessionId":"new-'"$id"'"}}' ;;
     *) body='"result":{{}}' ;;
   esac

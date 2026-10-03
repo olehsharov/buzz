@@ -121,6 +121,83 @@ fn make_prompt_context(
         memory_enabled: config.memory_enabled,
         harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
         relay_url: config.relay_url.clone(),
-        resume_session: std::sync::Arc::new(std::sync::Mutex::new(config.resume_session.clone())),
+        resume_session: std::sync::Arc::new(std::sync::Mutex::new(pending_resume(
+            config,
+            |key| std::env::var_os(key),
+        )?)),
     })
+}
+
+/// The pending `BUZZ_ACP_RESUME_SESSION` continuation with the store that
+/// records its fork for this agent. Errors when the session is configured
+/// but no state directory can be resolved: without the record, every restart
+/// would silently fork the source again.
+fn pending_resume(
+    config: &Config,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<Option<pool::PendingResume>> {
+    let Some(source) = config.resume_session.clone() else {
+        return Ok(None);
+    };
+    let state_root = crate::resume_store::state_root_from_env(env).ok_or_else(|| {
+        anyhow::anyhow!(
+            "BUZZ_ACP_RESUME_SESSION is set, but no state directory to record its fork \
+             (set an absolute XDG_STATE_HOME or HOME)"
+        )
+    })?;
+    let store =
+        crate::resume_store::ResumeForkStore::new(&state_root, &config.keys.public_key().to_hex());
+    tracing::info!(
+        "BUZZ_ACP_RESUME_SESSION={source}: fork record directory {}",
+        store.dir().display()
+    );
+    Ok(Some(pool::PendingResume { source, store }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser as _;
+    use std::ffi::OsString;
+
+    fn config(resume: Option<&str>) -> Config {
+        let mut argv = vec![
+            "buzz-acp".to_string(),
+            "--private-key".into(),
+            "0000000000000000000000000000000000000000000000000000000000000001".into(),
+        ];
+        if let Some(id) = resume {
+            argv.extend(["--resume-session".into(), id.into()]);
+        }
+        Config::from_args(crate::config::CliArgs::try_parse_from(argv).expect("args"))
+            .expect("config")
+    }
+
+    const SOURCE: &str = "0f7c1a52-3b9e-4d6a-9c1e-2a8b7d4e5f60";
+
+    #[test]
+    fn pending_resume_keys_store_by_agent_under_state_root() {
+        let config = config(Some(SOURCE));
+        let pending = pending_resume(&config, |key| {
+            (key == "XDG_STATE_HOME").then(|| OsString::from("/state"))
+        })
+        .expect("resolves")
+        .expect("pending");
+        assert_eq!(pending.source, SOURCE);
+        assert_eq!(
+            pending.store.dir(),
+            std::path::Path::new("/state/buzz-acp/resume-sessions")
+                .join(config.keys.public_key().to_hex())
+        );
+    }
+
+    #[test]
+    fn pending_resume_requires_a_state_dir_only_when_configured() {
+        let err = pending_resume(&config(Some(SOURCE)), |_| None)
+            .expect_err("no state dir while resuming must fail at startup");
+        assert!(err.to_string().contains("BUZZ_ACP_RESUME_SESSION"), "{err}");
+        assert!(pending_resume(&config(None), |_| None)
+            .expect("unset needs no state dir")
+            .is_none());
+    }
 }
