@@ -190,11 +190,8 @@ export function toInboxContextMessage(
   const event = context.eventById.get(message.id);
   const authorPubkey =
     message.pubkey ?? event?.pubkey ?? context.fallbackAuthorPubkey;
-  const { mentionNames, mentionPubkeysByName } = resolveMentionProps(
-    message.tags ?? [],
-    context.profiles,
-    message.body,
-  );
+  const { mentionAll, mentionNames, mentionPubkeysByName } =
+    resolveMentionProps(message.tags ?? [], context.profiles, message.body);
   return {
     id: message.id,
     authorLabel: message.author,
@@ -211,6 +208,7 @@ export function toInboxContextMessage(
     fullTimestampLabel: formatInboxFullTimestamp(message.createdAt),
     isSelected: message.id === context.selectedItemId,
     kind: message.kind,
+    mentionAll,
     mentionNames: mentionNames ?? [],
     mentionPubkeysByName,
     reactions: message.reactions,

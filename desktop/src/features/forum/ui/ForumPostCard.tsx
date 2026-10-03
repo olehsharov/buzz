@@ -46,11 +46,8 @@ export function ForumPostCard({
   });
   const avatarUrl = profiles?.[post.pubkey.toLowerCase()]?.avatarUrl ?? null;
   const authorIsAgent = profiles?.[post.pubkey.toLowerCase()]?.isAgent === true;
-  const { mentionNames, mentionPubkeysByName } = resolveMentionProps(
-    post.tags,
-    profiles,
-    post.content,
-  );
+  const { mentionAll, mentionNames, mentionPubkeysByName } =
+    resolveMentionProps(post.tags, profiles, post.content);
   // Memoize the imeta map: `parseImetaTags` builds a fresh object each render,
   // and the `Markdown` memo compares `imetaByUrl` by reference. Without this,
   // the post's Markdown (and the FileCard <button> it renders) is rebuilt on
@@ -133,6 +130,7 @@ export function ForumPostCard({
           linkPreviewsSuppressed={hasLinkPreviewSuppression(post.tags)}
           linkPreviewTags={post.tags}
           imetaByUrl={imetaByUrl}
+          mentionAll={mentionAll}
           mentionNames={mentionNames}
           mentionPubkeysByName={mentionPubkeysByName}
         />

@@ -26,6 +26,7 @@
  */
 
 import type { BlobDescriptor } from "@/shared/api/tauri";
+import { MENTION_GROUP_TAG } from "@/shared/lib/mentionGroup";
 import { parseImetaTags } from "@/shared/ui/markdown/parseImeta";
 
 export type ImetaMedia = BlobDescriptor & {
@@ -376,7 +377,8 @@ export function splitOutgoingTags(tags: string[][] | undefined): {
   for (const tag of tags ?? []) {
     if (tag[0] === "emoji") {
       emojiTags.push(tag);
-    } else if (tag[0] === "mention") {
+    } else if (tag[0] === "mention" || tag[0] === MENTION_GROUP_TAG) {
+      // The `@all` marker shares the reference-mention arg and validator.
       mentionTags.push(tag);
     } else if (tag[0] === "link-preview") {
       linkPreviewTags.push(tag);

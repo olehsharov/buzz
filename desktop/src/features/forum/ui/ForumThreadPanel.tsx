@@ -82,6 +82,7 @@ function ReplyRow({
     profiles?.[reply.pubkey.toLowerCase()]?.isAgent === true;
   const showDelete = onDelete && canDeleteReply(reply, currentPubkey);
   const {
+    mentionAll: replyMentionAll,
     mentionNames: replyMentionNames,
     mentionPubkeysByName: replyMentionPubkeysByName,
   } = resolveMentionProps(reply.tags, profiles, reply.content);
@@ -133,6 +134,7 @@ function ReplyRow({
           linkPreviewsSuppressed={hasLinkPreviewSuppression(reply.tags)}
           linkPreviewTags={reply.tags}
           imetaByUrl={parseImetaTags(reply.tags)}
+          mentionAll={replyMentionAll}
           mentionNames={replyMentionNames}
           mentionPubkeysByName={replyMentionPubkeysByName}
           searchQuery={searchQuery}
@@ -210,6 +212,7 @@ export function ForumThreadPanel({
 
   const { post, replies } = thread;
   const {
+    mentionAll: postMentionAll,
     mentionNames: postMentionNames,
     mentionPubkeysByName: postMentionPubkeysByName,
   } = resolveMentionProps(post.tags, profiles, post.content);
@@ -291,6 +294,7 @@ export function ForumThreadPanel({
               linkPreviewsSuppressed={hasLinkPreviewSuppression(post.tags)}
               linkPreviewTags={post.tags}
               imetaByUrl={parseImetaTags(post.tags)}
+              mentionAll={postMentionAll}
               mentionNames={postMentionNames}
               mentionPubkeysByName={postMentionPubkeysByName}
               searchQuery={
@@ -337,6 +341,7 @@ export function ForumThreadPanel({
           channelId={channelId}
           channelType="forum"
           draftKey={`thread:${postId}`}
+          mentionAll
           isSending={isSendingReply}
           onSubmit={onReply}
           placeholder="Reply to this post..."

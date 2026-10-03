@@ -23,7 +23,7 @@ export type MentionSuggestion = {
   personaId?: string;
   teamId?: string;
   teamMembers?: TeamMentionMember[];
-  kind?: "identity" | "persona" | "team";
+  kind?: "identity" | "persona" | "team" | "group";
   displayName: string;
   avatarUrl?: string | null;
   isAgent?: boolean;
@@ -31,7 +31,18 @@ export type MentionSuggestion = {
   notInChannel?: boolean;
   ownerLabel?: string | null;
   role?: string | null;
+  /** Shown but not selectable (e.g. `@all` in a channel over the cap). */
+  disabledReason?: string | null;
+  /** `@all` only: how many people selecting it would notify. */
+  groupRecipientCount?: number;
 };
+
+/** Whether a suggestion is listed for explanation only and cannot be picked. */
+export function isMentionSuggestionDisabled(
+  suggestion: MentionSuggestion | undefined,
+): boolean {
+  return Boolean(suggestion?.disabledReason);
+}
 
 type MentionAutocompleteProps = {
   suggestions: MentionSuggestion[];
@@ -49,6 +60,11 @@ type MentionAutocompleteProps = {
   onDismiss?: () => void;
   position?: "above" | "below";
 };
+
+/** Visible + accessible summary for an available `@all` entry. */
+export function formatGroupMentionSummary(count: number): string {
+  return `Notify ${count} ${count === 1 ? "person" : "people"} in this channel`;
+}
 
 export function showMentionAgentProvenanceMarker(
   suggestion: MentionSuggestion,
@@ -244,7 +260,14 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
           style={POPOVER_SHADOW_STYLE}
         >
           {suggestions.map((suggestion, index) => {
+            const isGroup = suggestion.kind === "group";
+            const isDisabled = isMentionSuggestionDisabled(suggestion);
+            const groupSummary = isGroup
+              ? (suggestion.disabledReason ??
+                formatGroupMentionSummary(suggestion.groupRecipientCount ?? 0))
+              : null;
             const suggestionKey =
+              (isGroup ? `group-${suggestion.displayName}` : null) ??
               suggestion.pubkey ??
               (suggestion.personaId
                 ? `persona-${suggestion.personaId}`
@@ -264,7 +287,8 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                 ? safeNpub(suggestion.pubkey)
                 : null;
             const hasMetadataBeforeNpub = Boolean(
-              suggestion.kind === "team" ||
+              isGroup ||
+                suggestion.kind === "team" ||
                 suggestion.isAgent ||
                 suggestion.role ||
                 ownerLabel ||
@@ -290,22 +314,31 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                 )}
                 data-testid={`mention-suggestion-${suggestionKey}`}
                 data-mention-suggestion-index={index}
+                data-disabled={isDisabled ? "" : undefined}
                 key={suggestionKey}
               >
                 <button
-                  aria-label={`Mention ${suggestion.displayName}`}
+                  aria-disabled={isDisabled ? true : undefined}
+                  aria-label={
+                    isGroup
+                      ? `${isDisabled ? "Can't mention" : "Mention"} @${suggestion.displayName}: ${groupSummary}`
+                      : `Mention ${suggestion.displayName}`
+                  }
                   className={cn(
                     "flex min-w-0 flex-1 items-center gap-2 rounded-lg px-3 py-1.5 text-left",
                     canAlwaysAddress && "pr-11",
+                    isDisabled && "cursor-not-allowed opacity-60",
                   )}
                   onMouseDown={(event) => {
                     event.preventDefault();
+                    // A disabled entry explains itself; it never inserts.
+                    if (isDisabled) return;
                     onSelect(suggestion);
                   }}
                   tabIndex={-1}
                   type="button"
                 >
-                  {suggestion.kind === "team" ? (
+                  {suggestion.kind === "team" || isGroup ? (
                     <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
                       <Users aria-hidden="true" className="h-4 w-4" />
                     </span>
@@ -327,7 +360,9 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                       className="min-w-0 break-words font-medium leading-snug"
                       title={suggestion.displayName}
                     >
-                      {suggestion.displayName}
+                      {isGroup
+                        ? `@${suggestion.displayName}`
+                        : suggestion.displayName}
                     </span>
                     {hasMetadataBeforeNpub || collisionNpub ? (
                       <span
@@ -338,7 +373,15 @@ export const MentionAutocomplete = React.memo(function MentionAutocomplete({
                             : "text-muted-foreground",
                         )}
                       >
-                        {suggestion.kind === "team" ? (
+                        {isGroup ? (
+                          <span
+                            className="min-w-0 truncate"
+                            data-testid="mention-group-summary"
+                            title={groupSummary ?? undefined}
+                          >
+                            {groupSummary}
+                          </span>
+                        ) : suggestion.kind === "team" ? (
                           <span className="inline-flex shrink-0 items-center gap-1">
                             <Users aria-hidden="true" className="h-3.5 w-3.5" />
                             team · {suggestion.teamMembers?.length ?? 0} agents

@@ -134,3 +134,38 @@ presentation marker. Readonly mention chips keep their own wrapping/accessibilit
 contract. Menu-based edit activation waits for Radix exit-focus cleanup before
 loading/focusing the editor; navigation tests must observe edit content and focus,
 not treat an already enabled reply input as an activated edit.
+
+## Group mention (`@all`)
+
+`@all` notifies every human member of the current stream or forum channel
+(project channels included: the project's channel roster), excluding the
+sender. Agents are excluded using the same roster-role, profile and
+agent-directory evidence as the picker, so a group mention never wakes one.
+It is offered only for new messages: DMs already notify every participant, and
+edits never notify.
+
+The group binds by its reserved literal token, not a key: the body carries the
+exact lowercase `@all` (picker selection inserts it with the usual separator),
+and a typed `@all` resolves the same way. Occurrence grammar, code masking and
+longest-literal ownership match member mentions. A member explicitly picked
+under the label "all" owns the literal; a typed `@all` that also names a member
+is rejected as ambiguous, like any other typed name with two meanings.
+
+On the wire: one `p` tag per recipient plus one `["buzz:mention-group", "all"]`
+marker (never a `mention` tag; other clients parse `mention` tag[1] as a key).
+The marker rides the validated reference-mention Tauri arg. Renderers show one
+group pill only when the marker is present and the body still owns an `@all`
+token; without the marker the text stays plain. Edits leave the original
+marker in place through the tag overlay and add no recipients; send-to-channel
+forwards the marker only with the original `p` audience, never from an edit
+snapshot.
+
+More than 50 people (buzz-sdk `MENTION_CAP`) is never truncated: the picker
+shows `@all` disabled with its reason on every modality, and send re-resolves
+the roster freshly before any side effect, blocking with a visible error that
+keeps the draft. The same holds when `@all` plus other mentions exceeds 50.
+
+Coverage: `mentionAll.test.mjs` (audience, grammar, candidate, rendering
+decision, wire routing, forwarding), `useMentionSendFlow.mentionAll.test.mjs`
+and `ForumComposer.lifecycle.test.mjs` (send seam), and `mention-all.spec.ts`
+(picker, typed token, disabled modalities, DM, edit, rendered pill).

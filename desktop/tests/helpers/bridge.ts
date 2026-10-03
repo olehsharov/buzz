@@ -270,6 +270,8 @@ type MockBridgeOptions = {
   /** Sequenced add-member failures. A string fails that call; null succeeds. */
   addChannelMembersErrors?: (string | null)[];
   channelMembersReadDelayMs?: number;
+  /** Extra human members appended to a mock channel's roster, by name. */
+  extraChannelMembers?: Record<string, string[]>;
   channelsReadError?: string;
   /** Reject successive mock `get_channels` calls, then resume. */
   channelsReadErrors?: (string | null)[];

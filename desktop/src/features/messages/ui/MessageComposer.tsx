@@ -145,6 +145,8 @@ function MessageComposerImpl({
   } | null>(null);
   const mentions = useMentions(channelId, undefined, profiles, {
     channelType,
+    // Edits never notify, so they never offer or resolve the group mention.
+    mentionAll: editTarget == null,
     recentMentionPubkeys,
   });
   const channelLinks = useChannelLinks();

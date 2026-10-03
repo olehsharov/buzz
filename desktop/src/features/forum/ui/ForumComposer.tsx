@@ -23,6 +23,10 @@ import { DropZoneOverlay } from "@/features/messages/ui/ComposerAttachments";
 import type { MentionSuggestion } from "@/features/messages/ui/MentionAutocomplete";
 import { MessageComposerToolbar } from "@/features/messages/ui/MessageComposerToolbar";
 import { NonMemberMentionDialog } from "@/features/messages/ui/NonMemberMentionDialog";
+import {
+  planMentionAllSend,
+  uniqueNormalizedPubkeys,
+} from "@/features/messages/ui/useMentionSendFlow.helpers";
 import { Button } from "@/shared/ui/button";
 import { cn } from "@/shared/lib/cn";
 import {
@@ -53,6 +57,7 @@ function ForumComposerVisit({
   draftKey,
   channelId = null,
   channelType,
+  mentionAll = false,
   members,
   className,
   placeholder,
@@ -95,7 +100,10 @@ function ForumComposerVisit({
     if (compact) setIsCompactExpanded(true);
   }, [compact]);
 
-  const mentions = useMentions(channelId, members, profiles, { channelType });
+  const mentions = useMentions(channelId, members, profiles, {
+    channelType,
+    mentionAll,
+  });
   const { prepareMentionPubkeys, nonMemberPromptProps } =
     useForumMentionPreparation(channelId, channelType, mentions);
   const channelLinks = useChannelLinks();
@@ -356,20 +364,46 @@ function ForumComposerVisit({
           draftLifecycle.getComposerRevision() !== composerRevision
         )
           return;
-        const pubkeys = await prepareMentionPubkeys(
+        // Re-resolve `@all` against a fresh roster before the invite prompt or
+        // the optimistic clear, so a blocked group mention keeps the draft.
+        const mentionAllResolution =
+          await mentions.resolveMentionAllForSend(trimmed);
+        if (
+          !mountedRef.current ||
+          draftLifecycle.getComposerRevision() !== composerRevision
+        )
+          return;
+        if (mentionAllResolution.status === "blocked") {
+          throw new Error(mentionAllResolution.message);
+        }
+        const preparedPubkeys = await prepareMentionPubkeys(
           mentions.extractMentionPubkeys(trimmed),
           trimmed,
         );
-        if (pubkeys === null || !mountedRef.current) return;
+        if (preparedPubkeys === null || !mountedRef.current) return;
+        const mentionAllPlan = planMentionAllSend({
+          otherRecipientPubkeys: preparedPubkeys,
+          pendingPersonaCount: 0,
+          resolution: mentionAllResolution,
+        });
+        if ("error" in mentionAllPlan) throw new Error(mentionAllPlan.error);
+        const pubkeys = uniqueNormalizedPubkeys([
+          ...preparedPubkeys,
+          ...mentionAllPlan.recipients,
+        ]);
 
         // Reuse the shared send-path builder so forum/notes posts emit the same
         // body + imeta as chat: generic files become `[filename](url)` links with a
         // `filename` imeta tag (FileCard renderer), images/video stay inline. Send
         // semantics use `undefined` for "no attachments" (no imeta tags emitted).
-        const { content: finalContent, mediaTags } = buildOutgoingMessage(
-          trimmed,
-          currentPendingImeta,
-        );
+        const { content: finalContent, mediaTags: imetaTags } =
+          buildOutgoingMessage(trimmed, currentPendingImeta);
+        // The group marker rides with the attachment tags; the forum send
+        // mutation splits them onto their own validated Tauri args.
+        const mediaTags =
+          mentionAllPlan.tags.length > 0
+            ? [...(imetaTags ?? []), ...mentionAllPlan.tags]
+            : imetaTags;
 
         // Publication has been authorized for this visit. Preserve the exact
         // snapshot before the existing optimistic clear, including selected refs.
@@ -420,6 +454,7 @@ function ForumComposerVisit({
       replacePendingImeta,
       mentions.cancelMentionAutocomplete,
       mentions.extractMentionPubkeys,
+      mentions.resolveMentionAllForSend,
       mentions.settlePendingMentionBindings,
       prepareMentionPubkeys,
       mentions.clearMentions,

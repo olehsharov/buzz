@@ -26,10 +26,12 @@ test("returns undefined without tags or profiles", () => {
   assert.deepEqual(resolveMentionProps(undefined, profiles), {
     mentionNames: undefined,
     mentionPubkeysByName: undefined,
+    mentionAll: false,
   });
   assert.deepEqual(resolveMentionProps([["p", PUBKEY]], undefined), {
     mentionNames: undefined,
     mentionPubkeysByName: undefined,
+    mentionAll: false,
   });
 });
 

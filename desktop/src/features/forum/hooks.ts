@@ -10,6 +10,7 @@ import type {
   ForumThreadResponse,
 } from "@/shared/api/types";
 import { KIND_FORUM_COMMENT, KIND_FORUM_POST } from "@/shared/constants/kinds";
+import { splitOutgoingTags } from "@/features/messages/lib/imetaMediaMarkdown";
 
 /** Keeps focused polling for forum posts at the established 15-second cadence. */
 export const FORUM_POSTS_REFETCH_INTERVAL_MS = 15_000;
@@ -98,13 +99,17 @@ export function useCreateForumPostMutation(channel: Channel | null) {
         throw new Error("No channel selected.");
       }
 
+      const { mediaTags: imetaTags, mentionTags } =
+        splitOutgoingTags(mediaTags);
       return sendChannelMessage(
         channel.id,
         content,
         null,
-        mediaTags,
+        imetaTags,
         mentionPubkeys,
         KIND_FORUM_POST,
+        undefined,
+        mentionTags,
       );
     },
     onSuccess: () => {
@@ -184,13 +189,17 @@ export function useCreateForumReplyMutation(channel: Channel | null) {
         throw new Error("No channel selected.");
       }
 
+      const { mediaTags: imetaTags, mentionTags } =
+        splitOutgoingTags(mediaTags);
       return sendChannelMessage(
         channel.id,
         content,
         parentEventId,
-        mediaTags,
+        imetaTags,
         mentionPubkeys,
         KIND_FORUM_COMMENT,
+        undefined,
+        mentionTags,
       );
     },
     onSuccess: (_data, variables) => {

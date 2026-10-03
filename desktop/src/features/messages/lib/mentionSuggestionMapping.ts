@@ -9,7 +9,7 @@ import { mentionCandidateLabel } from "./mentionCandidates";
 import { pickDefaultAgentCandidate } from "./mentionRanking";
 
 export type MentionSuggestionCandidate = {
-  kind: "identity" | "persona" | "team";
+  kind: "identity" | "persona" | "team" | "group";
   pubkey?: string;
   personaId?: string | null;
   teamId?: string;
@@ -20,6 +20,8 @@ export type MentionSuggestionCandidate = {
   isMember: boolean;
   role?: ChannelRole | null;
   ownerPubkey?: string | null;
+  disabledReason?: string | null;
+  groupRecipientCount?: number;
 };
 
 export function mapMentionCandidateToSuggestion(opts: {
@@ -73,10 +75,17 @@ export function mapMentionCandidateToSuggestion(opts: {
         : undefined,
     notInChannel:
       candidate.kind !== "team" &&
+      candidate.kind !== "group" &&
       channelType !== "dm" &&
       candidate.isMember === false,
     ownerLabel,
     role: !candidate.isAgent && candidate.role === "admin" ? "admin" : null,
+    ...(candidate.kind === "group"
+      ? {
+          disabledReason: candidate.disabledReason ?? null,
+          groupRecipientCount: candidate.groupRecipientCount ?? 0,
+        }
+      : {}),
   };
 }
 

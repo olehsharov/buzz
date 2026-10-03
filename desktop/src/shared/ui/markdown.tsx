@@ -4,14 +4,12 @@ import type { Components } from "react-markdown";
 import { ChevronLeft, ChevronRight, Download } from "lucide-react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 
-import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { requestOpenSnapshotImport } from "@/features/agents/openSnapshotImportFromUrlEvent";
 import { parseChannelLink } from "@/features/messages/lib/channelLink";
 import { isAudioAttachment } from "@/features/messages/lib/audioAttachment";
 import {
   parseMessageLink,
   resolveMessageLinkRenderTarget,
-  type ParsedMessageLink,
 } from "@/features/messages/lib/messageLink";
 import { renderAudioMessageAttachment } from "@/features/messages/ui/AudioMessageAttachment";
 import { useChannelNavigation } from "@/shared/context/ChannelNavigationContext";
@@ -23,6 +21,7 @@ import { useRelayOrigin } from "@/shared/lib/useRelayOrigin";
 import { AttachmentGroup } from "@/shared/ui/attachment";
 import { ConfigNudgeCard } from "@/shared/ui/config-nudge-attachment";
 import { createMarkdownMention } from "./markdown/MarkdownMention";
+import { useMarkdownNavigation } from "./markdown/useMarkdownNavigation";
 import { LinkPreviewList } from "@/shared/ui/link-preview-list";
 import { useSmoothCorners } from "@/shared/ui/smoothCorners";
 import {
@@ -1690,6 +1689,7 @@ function MarkdownInner({
   linkPreviewsSuppressed = false,
   linkPreviewTags,
   onRemoveLinkPreviewsForEveryone,
+  mentionAll = false,
   mentionNames,
   mentionPubkeysByName,
   searchQuery,
@@ -1698,26 +1698,9 @@ function MarkdownInner({
 }: MarkdownProps) {
   const { channels: rawChannels } = useChannelNavigation();
   const channels = useStableArray(rawChannels);
-  const { goChannel, goAgents } = useAppNavigation();
-  const onOpenChannel = React.useCallback(
-    (channelId: string) => {
-      void goChannel(channelId);
-    },
-    [goChannel],
-  );
+  const { goAgents, onOpenChannel, onOpenMessageLink } =
+    useMarkdownNavigation();
   const onOpenEntityLink = useOpenEntityLink();
-  const onOpenMessageLink = React.useCallback(
-    (link: ParsedMessageLink) => {
-      // Always route through `goChannel` with `messageId` set: the navigation
-      // boundary guards every message-targeting caller before URL mutation.
-      // `useAnchoredScroll` + `getEventById` backfill, and works for
-      void goChannel(link.channelId, {
-        messageId: link.messageId,
-        threadRootId: link.threadRootId,
-      });
-    },
-    [goChannel],
-  );
   const relayOrigin = useRelayOrigin();
   const resolvedLinkPreviews = useMessageLinkPreviews({
     content,
@@ -1736,6 +1719,7 @@ function MarkdownInner({
       channels,
       imetaByUrl,
       leadingInlineContent,
+      mentionAll,
       mentionPubkeysByName,
       onOpenChannel,
       onOpenEntityLink,
@@ -1757,6 +1741,7 @@ function MarkdownInner({
       channels,
       imetaByUrl,
       leadingInlineContent,
+      mentionAll,
       mentionPubkeysByName,
       onOpenChannel,
       onOpenEntityLink,

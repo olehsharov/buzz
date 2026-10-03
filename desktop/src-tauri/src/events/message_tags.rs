@@ -5,12 +5,34 @@ use super::check_pubkey;
 const MAX_THREAD_ROOT_EXCERPT_CHARS: usize = 64;
 const SENT_FROM_THREAD_TAG: &str = "buzz:sent-from-thread";
 const AGENT_ADDRESS_MENTION_MARKER: &str = "agent-address";
+/// `@all` group-mention marker: `["buzz:mention-group", "all"]`. It rides the
+/// reference-mention arg so it shares that arg's strict validation; the
+/// recipients themselves are ordinary `p` tags.
+const MENTION_GROUP_TAG: &str = "buzz:mention-group";
+const MENTION_GROUP_ALL: &str = "all";
 
+/// Validate and append reference-only `mention` tags plus at most one `@all`
+/// group marker. Any other prefix or shape is rejected.
 pub(super) fn mention_reference_tags(
     mentions: &[Vec<String>],
     tags: &mut Vec<Tag>,
 ) -> Result<(), String> {
+    let mut has_group_marker = false;
     for mention in mentions {
+        if mention.first().map(String::as_str) == Some(MENTION_GROUP_TAG) {
+            if mention.len() != 2 || mention[1] != MENTION_GROUP_ALL {
+                return Err(r#"mention group tag must be ["buzz:mention-group", "all"]"#.into());
+            }
+            if has_group_marker {
+                return Err("duplicate mention group tag".into());
+            }
+            has_group_marker = true;
+            tags.push(
+                Tag::parse([MENTION_GROUP_TAG, MENTION_GROUP_ALL])
+                    .map_err(|error| format!("invalid mention group tag: {error}"))?,
+            );
+            continue;
+        }
         if mention.first().map(String::as_str) != Some("mention") {
             return Err(format!(
                 "mention reference tags must use 'mention' prefix (got {:?})",
@@ -157,6 +179,31 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn mention_reference_accepts_one_exact_group_marker() {
+        let marker = vec![MENTION_GROUP_TAG.to_string(), MENTION_GROUP_ALL.to_string()];
+        let mut tags = Vec::new();
+        mention_reference_tags(
+            &[vec!["mention".into(), PUBKEY.into()], marker.clone()],
+            &mut tags,
+        )
+        .unwrap();
+        assert_eq!(tags[1].as_slice(), &[MENTION_GROUP_TAG, MENTION_GROUP_ALL]);
+
+        for invalid in [
+            vec![MENTION_GROUP_TAG.to_string(), "here".to_string()],
+            vec![MENTION_GROUP_TAG.to_string()],
+            vec![
+                MENTION_GROUP_TAG.to_string(),
+                MENTION_GROUP_ALL.to_string(),
+                "extra".to_string(),
+            ],
+        ] {
+            assert!(mention_reference_tags(&[invalid], &mut Vec::new()).is_err());
+        }
+        assert!(mention_reference_tags(&[marker.clone(), marker], &mut Vec::new()).is_err());
     }
 
     #[test]

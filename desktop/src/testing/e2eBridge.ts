@@ -358,6 +358,8 @@ type E2eConfig = {
     /** Sequenced add-member failures. A string fails that call; null succeeds. */
     addChannelMembersErrors?: (string | null)[];
     channelMembersReadDelayMs?: number;
+    /** Extra human members appended to a mock channel's roster, by name. */
+    extraChannelMembers?: Record<string, string[]>;
     createManagedAgentDelayMs?: number;
     channelTemplates?: ChannelTemplate[];
     channelsReadError?: string;
@@ -7574,8 +7576,11 @@ async function handleGetChannelMembers(
   const identity = getIdentity(config);
   if (!identity) {
     const channel = getMockChannel(args.channelId);
+    const extra = (config?.mock?.extraChannelMembers?.[channel.name] ?? []).map(
+      (pubkey) => createMockMember(pubkey, "member", 60),
+    );
     return {
-      members: cloneMembers(channel.members),
+      members: [...cloneMembers(channel.members), ...extra],
       next_cursor: null,
     };
   }

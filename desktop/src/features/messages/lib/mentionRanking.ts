@@ -5,7 +5,7 @@ export type MentionCandidateForRanking = {
   isAgent: boolean;
   isActiveAgent?: boolean;
   isMember: boolean;
-  kind: "identity" | "persona" | "team";
+  kind: "identity" | "persona" | "team" | "group";
   personaId?: string | null;
   personaName?: string | null;
   pubkey?: string;
@@ -25,6 +25,9 @@ function getMentionCandidateGroupRank(
   activePersonaIds: ReadonlySet<string>,
 ) {
   if (candidate.isMember) return 0;
+  // `@all` sits right after the roster: discoverable on a bare `@`, but never
+  // the default selection ahead of a person.
+  if (candidate.kind === "group") return 1;
 
   const isRunnablePersona =
     candidate.kind === "team" ||

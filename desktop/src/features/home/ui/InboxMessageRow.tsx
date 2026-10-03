@@ -283,6 +283,7 @@ export function InboxMessageRow({
               )}
               customEmoji={customEmoji}
               imetaByUrl={imetaByUrl}
+              mentionAll={message.mentionAll}
               mentionNames={message.mentionNames}
               mentionPubkeysByName={message.mentionPubkeysByName}
               videoReviewCommentRootId={videoReviewCommentRootId}

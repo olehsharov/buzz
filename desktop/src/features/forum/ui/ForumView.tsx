@@ -179,6 +179,7 @@ export function ForumView({
             channelId={channel.id}
             channelType="forum"
             draftKey={`forum:${channel.id}`}
+            mentionAll
             isSending={createPostMutation.isPending}
             onCancel={() => setIsComposerOpen(false)}
             onSubmit={async (content, mentionPubkeys, mediaTags) => {

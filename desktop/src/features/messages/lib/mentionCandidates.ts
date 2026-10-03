@@ -5,7 +5,12 @@ import type {
   ChannelRole,
   UserSearchResult,
 } from "@/shared/api/types";
+import { MENTION_GROUP_ALL } from "@/shared/lib/mentionGroup";
 import { truncateNpub } from "@/shared/lib/pubkey";
+import {
+  type MentionAllAudience,
+  mentionAllDisabledReason,
+} from "./mentionAllAudience";
 
 export function formatSearchUserDisplayName(user: UserSearchResult) {
   return user.displayName?.trim() || user.nip05Handle?.trim() || null;
@@ -33,7 +38,7 @@ export type TeamMentionMember = {
 };
 
 export type MentionCandidate = {
-  kind: "identity" | "persona" | "team";
+  kind: "identity" | "persona" | "team" | "group";
   pubkey?: string;
   personaId?: string;
   teamId?: string;
@@ -49,6 +54,10 @@ export type MentionCandidate = {
   isActiveAgent?: boolean;
   isManagedAgent?: boolean;
   isGlobalSearchResult?: boolean;
+  /** Group mentions only: why the entry is shown but cannot be picked. */
+  disabledReason?: string | null;
+  /** Group mentions only: how many people selecting it would notify. */
+  groupRecipientCount?: number;
 };
 
 export function mentionCandidateLabel(candidate: MentionCandidate) {
@@ -81,7 +90,9 @@ function findTeamMemberTarget(
   const linked = candidates
     .filter(
       (candidate) =>
-        candidate.kind !== "team" && candidate.personaId === persona.id,
+        candidate.kind !== "team" &&
+        candidate.kind !== "group" &&
+        candidate.personaId === persona.id,
     )
     .sort((left, right) => {
       const rank = (candidate: MentionCandidate) => {
@@ -156,4 +167,27 @@ export function formatTeamMention(
   members: readonly TeamMentionMember[],
 ) {
   return `${teamName}(${members.map((member) => `@${member.displayName}`).join(" ")}) `;
+}
+
+/**
+ * The `@all` autocomplete entry. It is always listed in a channel composer so
+ * an unavailable state (too many people, nobody to notify, roster loading) is
+ * explained rather than silently missing.
+ */
+export function buildMentionAllCandidate(
+  audience: MentionAllAudience,
+): MentionCandidate {
+  return {
+    kind: "group",
+    displayName: MENTION_GROUP_ALL,
+    isMember: false,
+    isAgent: false,
+    disabledReason: mentionAllDisabledReason(audience),
+    groupRecipientCount:
+      audience.status === "available"
+        ? audience.recipients.length
+        : audience.status === "over-cap"
+          ? audience.count
+          : 0,
+  };
 }

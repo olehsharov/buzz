@@ -50,6 +50,7 @@ export const WRAPPING_INLINE_CHIP_CLASSES = "wrapping-inline-chip";
 export type InlineChipIconKind =
   | "agent"
   | "human"
+  | "group"
   | "channel"
   | "message"
   | "repo"
@@ -60,6 +61,7 @@ export type InlineChipIconKind =
 const INLINE_CHIP_ICON_KIND_CLASSES: Record<InlineChipIconKind, string> = {
   agent: "inline-chip-icon-agent agent-mention-highlight",
   human: "inline-chip-icon-human human-mention-highlight",
+  group: "inline-chip-icon-group human-mention-highlight",
   channel: "inline-chip-icon-channel",
   message: "inline-chip-icon-message",
   repo: "inline-chip-icon-repo",

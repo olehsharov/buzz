@@ -4,6 +4,10 @@ import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
 import { cn } from "@/shared/lib/cn";
 import { formatMentionDisplayLabel } from "@/shared/lib/mentionDisplay";
 import {
+  MENTION_ALL_TOKEN,
+  MENTION_GROUP_ALL,
+} from "@/shared/lib/mentionGroup";
+import {
   inlineChipIconClasses,
   inlineChipLeadingEnd,
   WRAPPING_INLINE_CHIP_CLASSES,
@@ -22,9 +26,12 @@ export function createMarkdownMention(interactive: boolean) {
   }: {
     children?: React.ReactNode;
   }) {
-    const { agentMentionPubkeysByName, mentionPubkeysByName } =
+    const { agentMentionPubkeysByName, mentionAll, mentionPubkeysByName } =
       useMarkdownRuntime();
     const mentionText = String(children ?? "");
+    if (mentionAll && mentionText === MENTION_ALL_TOKEN) {
+      return <MarkdownGroupMention label={MENTION_GROUP_ALL} />;
+    }
     const mentionName = mentionText.replace(/^@/, "").trim().toLowerCase();
     const pubkey = mentionPubkeysByName?.[mentionName];
     // Unbound literal competitors consume their full range, without a chip.
@@ -85,4 +92,33 @@ export function createMarkdownMention(interactive: boolean) {
       mentionNode
     );
   };
+}
+
+/**
+ * The `@all` group pill: one chip for the whole channel audience, never the
+ * expanded recipient list. Not a profile target, so it is not interactive.
+ */
+function MarkdownGroupMention({ label }: { label: string }) {
+  const leadingEnd = inlineChipLeadingEnd(label);
+  return (
+    <InlineChip
+      data-mention=""
+      data-mention-kind="group"
+      data-mention-label={label}
+      className={WRAPPING_INLINE_CHIP_CLASSES}
+      title="Everyone in this channel"
+      aria-label={`@${label}, everyone in this channel`}
+      icon="group"
+    >
+      <span
+        className={cn(
+          "inline-chip-leading-fragment",
+          inlineChipIconClasses("group"),
+        )}
+      >
+        {label.slice(0, leadingEnd)}
+      </span>
+      {label.slice(leadingEnd)}
+    </InlineChip>
+  );
 }
