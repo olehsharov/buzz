@@ -142,7 +142,10 @@ not treat an already enabled reply input as an activated edit.
 sender. Agents are excluded using the same roster-role, profile and
 agent-directory evidence as the picker, so a group mention never wakes one.
 It is offered only for new messages: DMs already notify every participant, and
-edits never notify.
+edits never notify. A typed prefix of its label (`@a`, `@al`, `@all`) ranks it
+first, ahead of the roster, so a large channel cannot push it past the
+suggestion cap; on a bare `@` it stays after the roster and is never the
+default selection.
 
 The group binds by its reserved literal token, not a key: the body carries the
 exact lowercase `@all` (picker selection inserts it with the usual separator),

@@ -215,7 +215,7 @@ test("@all candidate carries count, or a disabled reason over the cap", () => {
   );
 });
 
-test("@all ranks after roster members and before other groups", () => {
+test("a typed prefix of all ranks @all first; a bare @ keeps it after the roster", () => {
   const group = buildMentionAllCandidate({ status: "empty" });
   const member = {
     kind: "identity",
@@ -231,12 +231,32 @@ test("@all ranks after roster members and before other groups", () => {
     isAgent: false,
     isMember: false,
   };
-  assert.deepEqual(
-    rankMentionCandidates([outsider, group, member], "al").map(
+  const labels = (query) =>
+    rankMentionCandidates([outsider, member, group], query).map(
       ({ label }) => label,
-    ),
-    ["Allison", "all", "Alfred"],
-  );
+    );
+  for (const query of ["a", "al", "all", "AL"]) {
+    assert.equal(labels(query)[0], "all", `query ${query}`);
+  }
+  assert.deepEqual(labels("al"), ["all", "Allison", "Alfred"]);
+  assert.deepEqual(labels(""), ["Allison", "all", "Alfred"]);
+  assert.deepEqual(labels("alli"), ["Allison"]);
+});
+
+test("@all survives the suggestion cap in a large channel on @a", () => {
+  // Real rosters: nearly every hex key contains "a", so on `@a` every member
+  // matches by key and, ranked ahead of the group, pushed it past the cap.
+  const roster = Array.from({ length: 60 }, (_, index) => ({
+    kind: "identity",
+    pubkey: (index + 1).toString(16).padStart(64, "a"),
+    displayName: null,
+    isAgent: false,
+    isMember: true,
+  }));
+  const group = buildMentionAllCandidate({ status: "over-cap", count: 60 });
+  const shown = rankMentionCandidates([...roster, group], "a").slice(0, 50);
+  assert.equal(shown[0].candidate.kind, "group");
+  assert.equal(shown[0].candidate.disabledReason, MENTION_ALL_OVER_CAP_REASON);
 });
 
 // ── Wire routing ───────────────────────────────────────────────────────

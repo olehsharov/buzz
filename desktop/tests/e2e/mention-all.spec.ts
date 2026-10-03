@@ -198,6 +198,28 @@ test("@all over the cap is disabled with a reason and blocks typed sends", async
   expect(await sent(page, "@all over the cap")).toEqual([]);
 });
 
+test("a large roster still lists @all first on @a, @al and @all", async ({
+  page,
+}) => {
+  // Real channels: nearly every hex key contains "a", so every member matches
+  // `@a`. Behind 50+ such members the group fell past the suggestion cap.
+  const extra = Array.from({ length: 60 }, (_, index) =>
+    (index + 1).toString(16).padStart(64, "a"),
+  );
+  await open(page, "general", extra);
+  const input = page.getByTestId("message-input");
+  await input.click();
+  const option = page.getByTestId("mention-suggestion-group-all");
+  for (const key of ["@a", "l", "l"]) {
+    await page.keyboard.type(key);
+    await expect(option).toBeInViewport();
+    await expect(option).toHaveAttribute("data-mention-suggestion-index", "0");
+  }
+  await expect(option).toContainText(
+    "@all is limited to channels with up to 50 people",
+  );
+});
+
 test("DMs never offer @all", async ({ page }) => {
   await open(page, "alice-tyler");
   const input = page.getByTestId("message-input");
