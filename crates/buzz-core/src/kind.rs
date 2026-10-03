@@ -467,6 +467,13 @@ pub const KIND_PRESENCE_UPDATE: u32 = 20001;
 pub const KIND_PAIRING: u32 = 24134;
 /// Ephemeral: typing indicator for a channel.
 pub const KIND_TYPING_INDICATOR: u32 = 20002;
+/// Ephemeral: NIP-SD live reply draft ("ghost" message) for a channel.
+///
+/// Signed by the agent writing the reply and scoped with an `h` tag like
+/// typing indicators. Carries a cumulative markdown snapshot of the reply so
+/// far plus `stream`/`seq`/`status` tags; the durable reply is still a normal
+/// kind:9. Never stored. See `docs/nips/NIP-SD.md`.
+pub const KIND_STREAM_DRAFT: u32 = 20003;
 /// Ephemeral: owner-scoped encrypted agent observer telemetry and control frame.
 pub const KIND_AGENT_OBSERVER_FRAME: u32 = 24200;
 /// Ephemeral: huddle emoji reaction burst. Channel-scoped to the ephemeral
@@ -703,6 +710,7 @@ pub const ALL_KINDS: &[u32] = &[
     KIND_THREAD_WINDOW_BOUNDS,
     KIND_PRESENCE_UPDATE,
     KIND_TYPING_INDICATOR,
+    KIND_STREAM_DRAFT,
     KIND_HUDDLE_REACTION,
     KIND_BLOSSOM_AUTH,
     KIND_PAIRING,
@@ -894,6 +902,11 @@ const _: () = assert!(KIND_AUTH <= u16::MAX as u32);
 const _: () = assert!(KIND_CANVAS <= u16::MAX as u32);
 const _: () = assert!(KIND_HUDDLE_GUIDELINES <= u16::MAX as u32);
 const _: () = assert!(EPHEMERAL_KIND_MIN < EPHEMERAL_KIND_MAX);
+// Compile-time: NIP-SD drafts are ephemeral (relay fan-out only, never stored)
+// and fit the u16 Nostr kind space.
+const _: () = assert!(is_ephemeral(KIND_STREAM_DRAFT));
+const _: () = assert!(KIND_STREAM_DRAFT <= u16::MAX as u32);
+
 // Compile-time: KIND_AGENT_TURN_METRIC is a regular stored kind (not ephemeral, not replaceable).
 const _: () = assert!(!is_ephemeral(KIND_AGENT_TURN_METRIC));
 const _: () = assert!(!is_replaceable(KIND_AGENT_TURN_METRIC));
