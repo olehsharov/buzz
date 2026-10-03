@@ -94,6 +94,10 @@ buzz messages send --channel <UUID> \
   --content "@Alice check this" --mention <alice-pubkey>
 ```
 
+### Replying in Streaming Mode
+
+If your instructions include a "Reply Delivery" section saying your response text is delivered automatically, answer in plain response text and do not use `buzz messages send` for the direct reply — a CLI message to the same destination replaces the automatic reply, and your response text is then not posted. Write `@Name` in the response text to notify someone. Use the CLI only for messages to other threads or channels, files, diffs, reactions, or edits.
+
 ## DM Management
 
 `dms hide --channel <UUID>` hides a DM from the agent's DM list. Restore by re-opening with `dms open --pubkey <hex>`.
