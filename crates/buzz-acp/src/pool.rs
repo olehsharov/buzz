@@ -3287,6 +3287,10 @@ pub async fn run_prompt_task(
                 team_instructions: standing.team_instructions,
                 agent_canvas: standing.agent_canvas,
                 standing_context_sent,
+                reply_autopost: ctx
+                    .stream
+                    .as_ref()
+                    .is_some_and(crate::stream_draft::StreamRuntime::autoposts),
             },
         )
     } else {

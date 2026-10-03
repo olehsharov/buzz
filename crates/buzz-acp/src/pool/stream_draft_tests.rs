@@ -17,15 +17,21 @@ fn update(update: serde_json::Value) -> String {
 
 /// A bash ACP agent that answers its first request (the prompt) with the
 /// given session updates, pausing `pause` seconds between them, then
-/// `stop_reason`.
-fn scripted_agent(updates: &[String], pause: &str, stop_reason: &str) -> String {
+/// `stop_reason`. Every request line it receives is appended to `capture`.
+fn scripted_agent(
+    updates: &[String],
+    pause: &str,
+    stop_reason: &str,
+    capture: &std::path::Path,
+) -> String {
     let mut body = String::new();
     for line in updates {
         // JSON lines contain no single quotes, so single-quoting is exact.
         body.push_str(&format!("  printf '%s\\n' '{line}'\n  sleep {pause}\n"));
     }
+    let capture = capture.display();
     format!(
-        "count=0\nwhile IFS= read -r line; do\n{body}  printf '%s\\n' \"{{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":$count,\\\"result\\\":{{\\\"stopReason\\\":\\\"{stop_reason}\\\"}}}}\"\n  count=$((count + 1))\ndone"
+        "count=0\nwhile IFS= read -r line; do\n  printf '%s\\n' \"$line\" >> '{capture}'\n{body}  printf '%s\\n' \"{{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":$count,\\\"result\\\":{{\\\"stopReason\\\":\\\"{stop_reason}\\\"}}}}\"\n  count=$((count + 1))\ndone"
     )
 }
 
@@ -34,7 +40,7 @@ async fn run_streamed_turn(
     stop_reason: &str,
     relay: &FakeRelay,
     agent_keys: &Keys,
-) -> (PromptResult, Vec<nostr::Event>, Uuid, String) {
+) -> (PromptResult, Vec<nostr::Event>, Uuid, String, String) {
     let channel_id = Uuid::new_v4();
     let human = Keys::generate();
     let trigger = EventBuilder::new(Kind::Custom(9), "@agent what is the answer?")
@@ -43,6 +49,8 @@ async fn run_streamed_turn(
         .unwrap();
     let trigger_id = trigger.id.to_hex();
 
+    let capture_dir = tempfile::tempdir().expect("capture dir");
+    let capture = capture_dir.path().join("requests.jsonl");
     let script = scripted_agent(
         &[
             update(json!({"sessionUpdate": "agent_thought_chunk",
@@ -62,6 +70,7 @@ async fn run_streamed_turn(
         ],
         "0.3",
         stop_reason,
+        &capture,
     );
     let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
         .await
@@ -137,7 +146,8 @@ async fn run_streamed_turn(
     {
         frames.push(event);
     }
-    (result, frames, channel_id, trigger_id)
+    let requests = std::fs::read_to_string(&capture).expect("captured requests");
+    (result, frames, channel_id, trigger_id, requests)
 }
 
 fn tag(event: &nostr::Event, name: &str) -> Option<String> {
@@ -153,8 +163,18 @@ fn tag(event: &nostr::Event, name: &str) -> Option<String> {
 async fn autopost_turn_streams_drafts_then_posts_the_answer() {
     let relay = FakeRelay::spawn().await;
     let agent_keys = Keys::generate();
-    let (mut result, frames, channel_id, trigger_id) =
+    let (mut result, frames, channel_id, trigger_id, requests) =
         run_streamed_turn(StreamMode::DraftAutopost, "end_turn", &relay, &agent_keys).await;
+    assert!(
+        requests.contains(&format!(
+            "IMPORTANT: Your response text is delivered automatically as your reply to `{trigger_id}`."
+        )),
+        "the prompt names the autopost destination: {requests}"
+    );
+    assert!(
+        !requests.contains("on `buzz messages send`"),
+        "no CLI reply instruction while autoposting: {requests}"
+    );
     assert!(matches!(
         result.outcome,
         PromptOutcome::Ok(StopReason::EndTurn)
@@ -217,8 +237,15 @@ async fn autopost_turn_streams_drafts_then_posts_the_answer() {
 async fn draft_turn_streams_without_posting() {
     let relay = FakeRelay::spawn().await;
     let agent_keys = Keys::generate();
-    let (mut result, frames, ..) =
+    let (mut result, frames, _, trigger_id, requests) =
         run_streamed_turn(StreamMode::Draft, "end_turn", &relay, &agent_keys).await;
+    assert!(
+        requests.contains(&format!(
+            "use `--reply-to {trigger_id}` on `buzz messages send`"
+        )),
+        "draft mode keeps the CLI reply instruction: {requests}"
+    );
+    assert!(!requests.contains("delivered automatically"), "{requests}");
     assert!(matches!(
         result.outcome,
         PromptOutcome::Ok(StopReason::EndTurn)

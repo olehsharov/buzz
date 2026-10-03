@@ -475,6 +475,11 @@ impl StreamRuntime {
         })
     }
 
+    /// Whether finished turns autopost their response text as the reply.
+    pub(crate) fn autoposts(&self) -> bool {
+        self.mode == StreamMode::DraftAutopost
+    }
+
     async fn take_budget(&self) {
         loop {
             let wait = match lock(&self.budget).try_take(Instant::now()) {

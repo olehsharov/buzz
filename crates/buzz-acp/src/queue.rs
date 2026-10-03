@@ -1587,6 +1587,37 @@ fn append_new_thread_reply_instruction(s: &mut String, event_id: &str) {
     ));
 }
 
+/// Append the reply instruction for a turn whose response text the harness
+/// autoposts (`--stream draft+autopost`). `parent` is the event the autopost
+/// replies to ([`turn_reply_thread`]); `None` is a top-level DM reply. No CLI
+/// reply is named: a `buzz messages send` to the same destination replaces
+/// the autoposted reply, so the CLI is reserved for posts elsewhere.
+fn append_autopost_reply_instruction(s: &mut String, parent: Option<&str>) {
+    let destination = match parent {
+        Some(parent) => format!("as your reply to `{parent}`"),
+        None => "as your reply in this DM".to_string(),
+    };
+    s.push_str(&format!(
+        "\nIMPORTANT: Your response text is delivered automatically {destination}. \
+         Do not send that reply with `buzz messages send`; a message you send to \
+         the same destination during the turn replaces it. Use `--reply-to` only \
+         for additional messages to another thread. If the human explicitly asks \
+         for a channel-root, top-level, or broadcast post, send that message \
+         without `--reply-to`."
+    ));
+}
+
+/// How the `<context>` block tells the agent to deliver its ordinary reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplyDelivery<'a> {
+    /// The agent replies with `buzz messages send`, threaded under the
+    /// human-aware anchor when there is one ([`resolve_reply_anchor`]).
+    Cli { anchor: Option<&'a str> },
+    /// The harness autoposts the response text under `parent`
+    /// ([`turn_reply_thread`]; `None` is a top-level DM reply).
+    Autopost { parent: Option<&'a str> },
+}
+
 /// Decide whether a turn is human-facing for reply-anchor purposes.
 ///
 /// A turn is human-facing when the triggering sender is a human, OR a human
@@ -1853,7 +1884,7 @@ fn format_context_hints(
     thread_tags: &ThreadTags,
     is_dm: bool,
     conversation_context_status: ConversationContextStatus,
-    reply_anchor: Option<&str>,
+    reply: ReplyDelivery<'_>,
 ) -> String {
     let channel_id = scope.channel_id();
     let channel_display = match channel_info {
@@ -1906,9 +1937,15 @@ fn format_context_hints(
                     s.push_str(&format!("\nParent: {parent}"));
                 }
             }
-            if let Some(event_id) = reply_anchor {
+            if let ReplyDelivery::Cli {
+                anchor: Some(event_id),
+            } = reply
+            {
                 append_reply_instruction(&mut s, event_id);
             }
+        }
+        if let ReplyDelivery::Autopost { parent } = reply {
+            append_autopost_reply_instruction(&mut s, parent);
         }
         crate::prompt_framing::semantic_section("context", &s)
     } else if let Some(root) = scope
@@ -1943,12 +1980,17 @@ fn format_context_hints(
             }
         }
         s.push_str(&format!("\n{ctx_hint}"));
-        if let Some(event_id) = reply_anchor {
-            if thread_tags.root_event_id.is_some() {
+        match reply {
+            ReplyDelivery::Cli {
+                anchor: Some(event_id),
+            } if thread_tags.root_event_id.is_some() => {
                 append_reply_instruction(&mut s, event_id);
-            } else {
-                append_new_thread_reply_instruction(&mut s, event_id);
             }
+            ReplyDelivery::Cli {
+                anchor: Some(event_id),
+            } => append_new_thread_reply_instruction(&mut s, event_id),
+            ReplyDelivery::Cli { anchor: None } => {}
+            ReplyDelivery::Autopost { parent } => append_autopost_reply_instruction(&mut s, parent),
         }
         crate::prompt_framing::semantic_section("context", &s)
     } else {
@@ -1962,8 +2004,12 @@ fn format_context_hints(
         s.push_str(
             "\nHint: Use `buzz messages get --channel <UUID>` for recent messages if needed.",
         );
-        if let Some(event_id) = reply_anchor {
-            append_new_thread_reply_instruction(&mut s, event_id);
+        match reply {
+            ReplyDelivery::Cli {
+                anchor: Some(event_id),
+            } => append_new_thread_reply_instruction(&mut s, event_id),
+            ReplyDelivery::Cli { anchor: None } => {}
+            ReplyDelivery::Autopost { parent } => append_autopost_reply_instruction(&mut s, parent),
         }
         crate::prompt_framing::semantic_section("context", &s)
     }
@@ -2130,6 +2176,11 @@ pub struct FormatPromptArgs<'a> {
     /// Defaults to `false` so a caller that never sets it behaves as if this
     /// were the session's first message.
     pub standing_context_sent: bool,
+    /// The harness autoposts this turn's response text as the reply
+    /// (`--stream draft+autopost`), so `<context>` names that delivery instead
+    /// of a `buzz messages send --reply-to` instruction. Defaults to `false`
+    /// (the agent replies with the CLI).
+    pub reply_autopost: bool,
 }
 
 /// The prompt sections that do not change for the life of a session: base
@@ -2277,6 +2328,19 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     // 2. Context hints (with a human-aware reply anchor; see
     //    [`turn_reply_anchor`]).
     let reply_anchor = turn_reply_anchor(last_event, is_dm, args.profile_lookup);
+    // An autoposted reply lands where the live reply stream targets: the same
+    // `turn_reply_thread` the pool hands `ReplyStream::start`.
+    let autopost_thread = args
+        .reply_autopost
+        .then(|| turn_reply_thread(batch, is_dm, args.profile_lookup));
+    let reply = match &autopost_thread {
+        Some(thread) => ReplyDelivery::Autopost {
+            parent: thread.as_ref().map(|(_, parent)| parent.as_str()),
+        },
+        None => ReplyDelivery::Cli {
+            anchor: reply_anchor.as_deref(),
+        },
+    };
     sections.push(format_context_hints(
         &batch.scope,
         args.channel_info,
@@ -2287,7 +2351,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
             args.conversation_context,
             args.conversation_context_had_session_events,
         ),
-        reply_anchor.as_deref(),
+        reply,
     ));
 
     // 3. Conversation context (thread or DM).
@@ -7262,5 +7326,94 @@ mod tests {
             turn_reply_thread(&batch_of(event), true, None),
             Some((root.clone(), trigger))
         );
+    }
+
+    #[test]
+    fn autopost_context_names_automatic_delivery_instead_of_a_cli_reply() {
+        let root = "a".repeat(64);
+        let ch = Uuid::new_v4();
+        let batch_of = |event: Event| FlushBatch {
+            channel_id: ch,
+            scope: conv(ch),
+            events: vec![BatchEvent {
+                edit: None,
+                event,
+                prompt_tag: "@mention".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let in_thread = || {
+            make_event_with_tags(
+                "in thread",
+                vec![
+                    vec!["e".into(), root.clone(), "".into(), "root".into()],
+                    vec!["e".into(), "b".repeat(64), "".into(), "reply".into()],
+                ],
+            )
+        };
+        let dm = PromptChannelInfo {
+            name: "dm".into(),
+            channel_type: "dm".into(),
+            description: None,
+            project: None,
+        };
+        let render = |batch: &FlushBatch, channel_info, reply_autopost| {
+            format_prompt(
+                batch,
+                &FormatPromptArgs {
+                    channel_info,
+                    reply_autopost,
+                    ..Default::default()
+                },
+            )
+            .join("\n")
+        };
+        let autopost_line = |destination: &str| {
+            format!(
+                "IMPORTANT: Your response text is delivered automatically {destination}. \
+                 Do not send that reply with `buzz messages send`; a message you send to \
+                 the same destination during the turn replaces it. Use `--reply-to` only \
+                 for additional messages to another thread. If the human explicitly asks \
+                 for a channel-root, top-level, or broadcast post, send that message \
+                 without `--reply-to`."
+            )
+        };
+        const CLI_REPLY: &str = "on `buzz messages send`";
+
+        // Human in a thread: the CLI anchor and the autopost target agree.
+        let b = batch_of(in_thread());
+        let cli = render(&b, None, false);
+        assert!(
+            cli.contains(&format!("use `--reply-to {root}` {CLI_REPLY}")),
+            "{cli}"
+        );
+        let autopost = render(&b, None, true);
+        assert!(!autopost.contains(CLI_REPLY), "{autopost}");
+        assert!(autopost.contains(&autopost_line(&format!("as your reply to `{root}`"))));
+
+        // Human top-level channel mention: the reply opens a thread on the trigger.
+        let event = make_event_with_tags("top", vec![]);
+        let trigger = event.id.to_hex();
+        let b = batch_of(event);
+        assert!(render(&b, None, false).contains(&format!("`--reply-to {trigger}` {CLI_REPLY}")));
+        let autopost = render(&b, None, true);
+        assert!(!autopost.contains(CLI_REPLY), "{autopost}");
+        assert!(autopost.contains(&autopost_line(&format!("as your reply to `{trigger}`"))));
+
+        // Top-level DM: no CLI anchor, but the autopost still has a destination.
+        let b = batch_of(make_event_with_tags("dm", vec![]));
+        assert!(!render(&b, Some(&dm), false).contains("IMPORTANT:"));
+        assert!(render(&b, Some(&dm), true).contains(&autopost_line("as your reply in this DM")));
+
+        // DM thread reply: the trigger itself is the parent.
+        let event = in_thread();
+        let trigger = event.id.to_hex();
+        let b = batch_of(event);
+        assert!(render(&b, Some(&dm), false).contains(&format!("--reply-to {trigger}")));
+        let autopost = render(&b, Some(&dm), true);
+        assert!(!autopost.contains(CLI_REPLY), "{autopost}");
+        assert!(autopost.contains(&autopost_line(&format!("as your reply to `{trigger}`"))));
     }
 }

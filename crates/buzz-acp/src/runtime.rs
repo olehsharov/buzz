@@ -104,7 +104,7 @@ fn make_prompt_context(
             Some(if matches!(mode, SessionMode::Task) {
                 format!("{base}\n\n{}", include_str!("session_model_task.md"))
             } else {
-                append_stream_mode(
+                apply_stream_mode(
                     config.stream_mode,
                     config.session_policy.append_session_model(base),
                 )
@@ -134,15 +134,59 @@ fn make_prompt_context(
     })
 }
 
-/// Append the reply-delivery contract when the harness autoposts the turn's
-/// response text. `draft` mode changes nothing the agent must do.
-fn append_stream_mode(mode: crate::stream_draft::StreamMode, base: String) -> String {
+/// Standing-prompt lines that tell the agent to publish with the CLI, and the
+/// text that replaces each one when the harness autoposts the response text.
+/// Left in place, they contradict Reply Delivery: an agent that follows them
+/// answers with `buzz messages send` and its streamed draft is discarded.
+///
+/// Each original is a whole line of `base_prompt.md` (a test pins that every
+/// one occurs exactly once). A custom base prompt without a line keeps its
+/// own text; the appended Reply Delivery section still applies.
+const AUTOPOST_BASE_SUBSTITUTIONS: &[(&str, &str)] = &[
+    (
+        "- **If your turn produced anything worth knowing, you MUST publish it.** Use `buzz messages send`. \
+         Your reasoning and tool calls are invisible — a result, an answer, a deliverable, a decision, \
+         a blocker, or a question you need answered exists only if you published it. Work or an answer \
+         that someone asked you for always counts. Ending that kind of turn without a message is a silent failure.",
+        "- **If your turn produced anything worth knowing, you MUST publish it**, as described in Reply \
+         Delivery. A result, an answer, a deliverable, a decision, a blocker, or a question you need \
+         answered exists only if you published it. Work or an answer that someone asked you for always \
+         counts. Ending that kind of turn without a reply is a silent failure.",
+    ),
+    (
+        "- After publishing a pickup message, keep working until you publish the result, handoff, \
+         blocker, or key decision or information that needs to be surfaced.",
+        "- Do not post pickup or progress messages to the conversation you are answering — people \
+         watch your work live, and such a message replaces your reply. Keep working until your reply \
+         holds the result, handoff, blocker, or key decision or information that needs to be surfaced.",
+    ),
+    (
+        "- **Work in the open.** Your tool calls and reasoning are invisible to humans — narrate as you \
+         go in brief messages, and never go dark between \"picked up\" and \"done.\" If you didn't post \
+         it, it didn't happen.",
+        "- **Work in the open.** People watch your reply being written and your tool activity live; \
+         what gets posted is your final response text. If it isn't in your reply, it didn't happen.",
+    ),
+];
+
+/// Apply the reply-delivery contract when the harness autoposts the turn's
+/// response text: swap out the standing CLI-reply lines, then append Reply
+/// Delivery. `off` and `draft` change nothing the agent must do, so their
+/// prompt is returned untouched.
+fn apply_stream_mode(mode: crate::stream_draft::StreamMode, base: String) -> String {
     match mode {
-        crate::stream_draft::StreamMode::DraftAutopost => format!(
-            "{}\n\n{}",
-            base.trim_end(),
-            include_str!("session_stream_mode.md").trim_end()
-        ),
+        crate::stream_draft::StreamMode::DraftAutopost => {
+            let base = AUTOPOST_BASE_SUBSTITUTIONS
+                .iter()
+                .fold(base, |base, (cli, autopost)| {
+                    base.replacen(cli, autopost, 1)
+                });
+            format!(
+                "{}\n\n{}",
+                base.trim_end(),
+                include_str!("session_stream_mode.md").trim_end()
+            )
+        }
         crate::stream_draft::StreamMode::Off | crate::stream_draft::StreamMode::Draft => base,
     }
 }
@@ -270,22 +314,87 @@ mod tests {
         .is_err());
     }
 
+    const BASE: &str = include_str!("base_prompt.md");
+    const REPLY_DELIVERY: &str = include_str!("session_stream_mode.md");
+
     #[test]
-    fn reply_delivery_section_only_for_autopost_conversations() {
-        const HEADING: &str = "## Reply Delivery";
-        let autopost = config_with_stream(Some("draft+autopost"));
-        let prompt = base_prompt_for(&autopost, SessionMode::Conversation);
-        assert!(prompt.contains(HEADING));
+    fn autopost_substitutions_each_replace_one_whole_base_prompt_line() {
+        for (cli, autopost) in AUTOPOST_BASE_SUBSTITUTIONS {
+            assert_eq!(
+                BASE.lines().filter(|line| line == cli).count(),
+                1,
+                "base_prompt.md must contain this line exactly once: {cli}"
+            );
+            assert!(!autopost.contains("buzz messages send"), "{autopost}");
+        }
+    }
+
+    #[test]
+    fn autopost_conversation_prompt_replaces_the_cli_reply_contract() {
+        let config = config_with_stream(Some("draft+autopost"));
+        let prompt = base_prompt_for(&config, SessionMode::Conversation);
         assert!(
-            prompt
-                .trim_end()
-                .ends_with(include_str!("session_stream_mode.md").trim_end()),
-            "appended after the session model"
+            !prompt.contains("Use `buzz messages send`."),
+            "the base CLI-reply instruction contradicts Reply Delivery"
         );
-        assert!(!base_prompt_for(&autopost, SessionMode::Task).contains(HEADING));
+        for (cli, autopost) in AUTOPOST_BASE_SUBSTITUTIONS {
+            assert!(!prompt.contains(cli), "left in place: {cli}");
+            assert_eq!(prompt.matches(autopost).count(), 1, "{autopost}");
+        }
+        assert!(prompt.contains("Your reply is your response text."));
+        assert!(prompt
+            .contains("Do not use `buzz messages send` to answer the message you were given."));
+        let expected_head = AUTOPOST_BASE_SUBSTITUTIONS.iter().fold(
+            config.session_policy.append_session_model(BASE),
+            |base, (cli, autopost)| base.replace(cli, autopost),
+        );
+        assert_eq!(
+            prompt,
+            format!(
+                "{}\n\n{}",
+                expected_head.trim_end(),
+                REPLY_DELIVERY.trim_end()
+            ),
+            "only the substituted lines change; Reply Delivery follows the session model"
+        );
+    }
+
+    #[test]
+    fn off_and_draft_prompts_are_the_unmodified_base() {
         for mode in [None, Some("draft")] {
             let config = config_with_stream(mode);
-            assert!(!base_prompt_for(&config, SessionMode::Conversation).contains(HEADING));
+            assert_eq!(
+                base_prompt_for(&config, SessionMode::Conversation),
+                config.session_policy.append_session_model(BASE),
+                "{mode:?}"
+            );
         }
+    }
+
+    #[test]
+    fn isolated_tasks_never_get_the_streaming_contract() {
+        for mode in [None, Some("draft"), Some("draft+autopost")] {
+            assert_eq!(
+                base_prompt_for(&config_with_stream(mode), SessionMode::Task),
+                format!("{BASE}\n\n{}", include_str!("session_model_task.md")),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_base_prompt_keeps_its_text_and_gains_reply_delivery() {
+        let mut config = config_with_stream(Some("draft+autopost"));
+        config.base_prompt_content = Some("Use `buzz messages send`.".into());
+        assert_eq!(
+            base_prompt_for(&config, SessionMode::Conversation),
+            format!(
+                "{}\n\n{}",
+                config
+                    .session_policy
+                    .append_session_model("Use `buzz messages send`."),
+                REPLY_DELIVERY.trim_end()
+            )
+        );
     }
 }
