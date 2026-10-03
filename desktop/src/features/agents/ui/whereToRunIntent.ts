@@ -21,26 +21,35 @@ export const emptyWhereToRunDraft: WhereToRunDraft = {
  * the user has not touched: anything already in `providerConfig` (typed while
  * the probe was in flight) wins over the default. Overwriting instead of
  * merging is the "Typewriter Eraser" bug — every probe resolution silently
- * erased in-flight keystrokes.
+ * erased in-flight keystrokes. The same precedence keeps values an agent
+ * draft prefilled (e.g. a working directory) over schema defaults.
+ *
+ * When the schema declares its properties, keys it does not declare are
+ * dropped: the dialog renders only declared fields, so an undeclared
+ * prefilled key would otherwise reach the provider without the owner ever
+ * seeing it.
  */
 export function applyProbeResult(
   current: WhereToRunDraft,
   result: BackendProviderProbeResult,
 ): WhereToRunDraft {
   const defaults: Record<string, string> = {};
-  const properties =
-    (result.config_schema as Record<string, unknown> | undefined)?.properties ??
-    {};
-  for (const [key, property] of Object.entries(properties) as [
-    string,
-    Record<string, unknown>,
-  ][]) {
+  const declared = (result.config_schema as Record<string, unknown> | undefined)
+    ?.properties as Record<string, Record<string, unknown>> | undefined;
+  for (const [key, property] of Object.entries(declared ?? {})) {
     if (property.default != null) defaults[key] = String(property.default);
   }
+  const visibleConfig = declared
+    ? Object.fromEntries(
+        Object.entries(current.providerConfig).filter(([key]) =>
+          Object.hasOwn(declared, key),
+        ),
+      )
+    : current.providerConfig;
   return {
     ...current,
     probedProvider: result,
-    providerConfig: { ...defaults, ...current.providerConfig },
+    providerConfig: { ...defaults, ...visibleConfig },
   };
 }
 

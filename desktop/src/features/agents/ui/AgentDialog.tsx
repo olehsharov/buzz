@@ -25,6 +25,7 @@ import {
   canSubmitWhereToRun,
   emptyWhereToRunDraft,
   resolveBackendIntent,
+  type WhereToRunDraft,
 } from "./whereToRunIntent";
 
 type AgentDialogCreateProps = {
@@ -32,6 +33,13 @@ type AgentDialogCreateProps = {
   embedded?: boolean;
   submitLabel?: string;
   initialValues?: CreatePersonaInput | null;
+  /**
+   * Seeds the "Run on" draft once, at mount (agent drafts that name a
+   * provider). Absent or null starts on this computer.
+   */
+  initialRunDraft?: WhereToRunDraft | null;
+  /** Owner-facing notes shown above the form (agent-draft adjustments). */
+  reviewNotices?: readonly string[];
   onDirtyChange?: (dirty: boolean) => void;
   onOpenChange: (open: boolean) => void;
   definitionError: Error | null;
@@ -164,6 +172,8 @@ export function DefinitionCreateDialogRouter({
 function AgentCreateDialogRouter({
   embedded,
   initialValues: providedInitialValues,
+  initialRunDraft,
+  reviewNotices,
   onOpenChange,
   definitionError,
   isDefinitionPending,
@@ -173,7 +183,9 @@ function AgentCreateDialogRouter({
   onDirtyChange,
   onSubmitDefinition,
 }: AgentDialogCreateProps) {
-  const [runDraft, setRunDraft] = React.useState(emptyWhereToRunDraft);
+  const [runDraft, setRunDraft] = React.useState(
+    () => initialRunDraft ?? emptyWhereToRunDraft,
+  );
   const initialValues = React.useMemo(
     () => providedInitialValues ?? createPersonaDialogState().initialValues,
     [providedInitialValues],
@@ -196,6 +208,7 @@ function AgentCreateDialogRouter({
             }}
           />
         }
+        createNotices={reviewNotices}
         createSubmitBlocked={!canSubmitWhereToRun(runDraft)}
         description={copy.description}
         embedded={embedded}

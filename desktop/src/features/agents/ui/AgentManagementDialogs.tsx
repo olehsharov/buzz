@@ -9,12 +9,18 @@ export function AgentManagementDialogs() {
 
   return (
     <>
-      {management.request?.action === "create" ? (
+      {management.request?.action === "create" &&
+      management.createInitialRunDraft ? (
         <AgentDialog
           definitionError={
             management.error ? new Error(management.error) : null
           }
+          initialRunDraft={management.createInitialRunDraft}
           initialValues={management.createInitialValues}
+          // The router seeds its run draft at mount, so each request gets a
+          // fresh instance.
+          key={management.request.requestId}
+          reviewNotices={management.createNotices}
           isDefinitionPending={management.isPending}
           mode="definition"
           onOpenChange={(open) => {
