@@ -309,9 +309,35 @@ pub enum AgentsCmd {
         /// Proposed agent name
         #[arg(long)]
         display_name: String,
-        /// Proposed instructions; use '-' to read from stdin
-        #[arg(long)]
+        /// Proposed instructions; use '-' to read from stdin. Omit to let the owner write them
+        #[arg(long, default_value = "")]
         system_prompt: String,
+        /// Agent runtime id, e.g. claude
+        #[arg(long)]
+        runtime: Option<String>,
+        /// Model id for the runtime
+        #[arg(long)]
+        model: Option<String>,
+        /// Who the agent responds to
+        #[arg(long, value_parser = ["owner-only", "allowlist", "anyone", "nobody"])]
+        respond_to: Option<String>,
+        /// Environment variable KEY=VALUE (repeatable); only ANTHROPIC_AUTH_TOKEN,
+        /// ANTHROPIC_BASE_URL and BUZZ_ACP_RESUME_SESSION are allowed. Never pass secrets.
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// Avatar emoji (one emoji); requires --avatar-color
+        #[arg(long)]
+        avatar_emoji: Option<String>,
+        /// Avatar background color as #RRGGBB; requires --avatar-emoji
+        #[arg(long)]
+        avatar_color: Option<String>,
+        /// Compute provider id to run the agent on, e.g. remote-host
+        #[arg(long)]
+        run_on: Option<String>,
+        /// Provider setting key=value (repeatable, max 20), e.g. host=... or workdir=...;
+        /// requires --run-on
+        #[arg(long, value_name = "KEY=VALUE")]
+        provider_config: Vec<String>,
     },
     /// Open a prefilled edit-agent form in the owner's Buzz Desktop
     DraftUpdate {
