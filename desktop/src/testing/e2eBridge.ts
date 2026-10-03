@@ -1333,6 +1333,19 @@ declare global {
       pubkey?: string;
       threadHeadId?: string;
     }) => RelayEvent;
+    /** Emit one live reply-draft frame (ephemeral kind 20003). */
+    __BUZZ_E2E_EMIT_MOCK_STREAM_DRAFT__?: (input: {
+      channelName: string;
+      stream: string;
+      seq: number;
+      status: string;
+      content?: string;
+      label?: string;
+      pubkey?: string;
+      threadRootId?: string;
+      threadParentId?: string;
+      createdAt?: number;
+    }) => RelayEvent;
     __BUZZ_E2E_INVOKE_MOCK_COMMAND__?: (
       command: string,
       payload?: Record<string, unknown>,
@@ -11701,6 +11714,35 @@ export function maybeInstallE2eTauriMocks() {
       threadHeadId,
       createdAt,
     );
+  };
+  window.__BUZZ_E2E_EMIT_MOCK_STREAM_DRAFT__ = (input) => {
+    const channel = mockChannels.find(
+      (candidate) => candidate.name === input.channelName,
+    );
+    if (!channel) {
+      throw new Error(`Mock channel ${input.channelName} not found.`);
+    }
+    const tags: string[][] = [
+      ["h", channel.id],
+      ["stream", input.stream],
+      ["seq", String(input.seq)],
+    ];
+    if (input.threadRootId) tags.push(["e", input.threadRootId, "", "root"]);
+    if (input.threadParentId) {
+      tags.push(["e", input.threadParentId, "", "reply"]);
+    }
+    tags.push(["status", input.status]);
+    if (input.label) tags.push(["label", input.label]);
+    const event = createMockEvent(
+      20003,
+      input.content ?? "",
+      tags,
+      input.pubkey ?? CHARLIE_PUBKEY,
+      input.createdAt,
+    );
+    // Ephemeral: delivered to live subscriptions only, never recorded.
+    emitMockLiveEvent(channel.id, event);
+    return event;
   };
   window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__ = ({
     channelName,

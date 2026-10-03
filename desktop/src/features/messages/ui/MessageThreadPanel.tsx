@@ -49,6 +49,8 @@ import { UnreadDivider } from "./UnreadDivider";
 import { useComposerHeightPadding } from "./useComposerHeightPadding";
 import { useStableSendToChannel } from "./useStableSendToChannel";
 import { useAnchoredScroll } from "./useAnchoredScroll";
+import { StreamDraftRows } from "./StreamDraftRows";
+import type { StreamDraft } from "@/features/messages/lib/streamDrafts";
 import { selectDeferredListRenderState } from "@/features/messages/lib/timelineSnapshot";
 import { selectThreadRowHighlight } from "@/features/messages/lib/threadReplyHighlight";
 
@@ -120,6 +122,8 @@ type MessageThreadPanelProps = ThreadPanelLayoutProps & {
   threadUnreadCount?: number;
   threadReplyUnreadCounts?: ReadonlyMap<string, number>;
   threadTypingPubkeys: string[];
+  /** Live reply ghosts already scoped to this thread. */
+  streamDrafts?: readonly StreamDraft[];
   videoReviewPresentation?: VideoReviewPresentation;
   activityAccessoryContent?: React.ReactNode;
   activityAccessoryVisible: boolean;
@@ -201,6 +205,7 @@ export function MessageThreadPanel({
   threadUnreadCount,
   threadReplyUnreadCounts,
   threadTypingPubkeys,
+  streamDrafts,
   activityAccessoryContent,
   activityAccessoryVisible,
   canResetWidth,
@@ -296,6 +301,10 @@ export function MessageThreadPanel({
     EMPTY_THREAD_REPLIES,
   );
   const isRepliesPending = deferredThreadReplies !== threadReplies;
+  const renderedReplyMessages = React.useMemo(
+    () => deferredThreadReplies.map((entry) => entry.message),
+    [deferredThreadReplies],
+  );
   const scrollTargetIsVisibleReply = React.useMemo(
     () =>
       scrollTargetId !== null &&
@@ -788,6 +797,14 @@ export function MessageThreadPanel({
               )
             }
           />
+          {streamDrafts ? (
+            <StreamDraftRows
+              currentPubkey={currentPubkey}
+              drafts={streamDrafts}
+              profiles={profiles}
+              renderedMessages={renderedReplyMessages}
+            />
+          ) : null}
         </div>
       </div>
     </AuxiliaryPanelBody>
