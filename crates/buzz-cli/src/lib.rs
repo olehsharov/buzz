@@ -436,7 +436,7 @@ buzz agents archived"
 pub enum MessagesCmd {
     /// Send a message to a channel
     #[command(
-        after_help = "Examples:\n  buzz messages send --channel <UUID> --content \"hello\"\n  buzz messages send --channel <UUID> --content \"@alice check this\"\n  buzz messages send --channel <UUID> --content \"@all standup in 5\"\n  echo \"hello from stdin\" | buzz messages send --channel <UUID> --content -\n\n@all is reserved: it always means every human channel member except you (never a member named \"all\" — use --mention <pubkey> for them), and is ignored inside code blocks or inline code. --mention-all does the same without the token."
+        after_help = "Examples:\n  buzz messages send --channel <UUID> --content \"hello\"\n  buzz messages send --channel <UUID> --content \"@alice check this\"\n  buzz messages send --channel <UUID> --content \"@all standup in 5\"\n  echo \"hello from stdin\" | buzz messages send --channel <UUID> --content -\n\n@all is reserved: it always means every human channel member except you (never a member named \"all\" — use --mention <pubkey> for them), and is ignored inside code blocks or inline code. --mention-all does the same and prepends \"@all \" when the content lacks the token."
     )]
     Send {
         /// Channel UUID (from 'buzz channels list')
@@ -460,7 +460,7 @@ pub enum MessagesCmd {
         /// Pubkey to mention (hex or npub; repeatable). Supplying any explicit identity permits unresolved or ambiguous @Name text as presentation-only; uniquely resolved member names still notify.
         #[arg(long = "mention")]
         mentions: Vec<String>,
-        /// Mention every human channel member, like an `@all` token in --content: one p-tag per human member (excluding you, `bot`-role members, and NIP-OA-attested agent profiles) plus a `buzz:mention-group` marker. Content is left unchanged. Fails if more than 50 humans qualify or the channel is a DM.
+        /// Mention every human channel member, like an `@all` token in --content: one p-tag per human member (excluding you, `bot`-role members, and NIP-OA-attested agent profiles) plus a `buzz:mention-group` marker. Prepends "@all " to --content unless it already has an @all token outside code. Fails if more than 50 humans qualify or the channel is a DM.
         #[arg(long = "mention-all", default_value_t = false)]
         mention_all: bool,
     },

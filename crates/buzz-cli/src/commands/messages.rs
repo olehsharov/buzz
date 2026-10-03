@@ -163,6 +163,8 @@ struct ContentMentions {
     resolved: Vec<String>,
     /// Whether `@all` (token or `--mention-all`) was requested.
     mention_all: bool,
+    /// Whether content already carries an `@all` token outside code.
+    has_all_token: bool,
     /// Human recipients of `@all` (empty unless `mention_all`).
     all_recipients: Vec<String>,
 }
@@ -279,6 +281,7 @@ async fn resolve_content_mentions(
         members: member_pubkeys,
         resolved,
         mention_all,
+        has_all_token,
         all_recipients,
     })
 }
@@ -712,6 +715,13 @@ pub async fn cmd_send_message(
         .cloned()
         .collect();
     let mention_pubkeys = merge_message_mentions(&explicit_mentions, &uri_pubkeys, &auto_resolved)?;
+
+    // Contract: content carries the literal `@all` whenever the marker is
+    // emitted, so `--mention-all` without the token prepends it.
+    if content_mentions.mention_all && !content_mentions.has_all_token {
+        p.content = mention_all::prepend_all_token(&p.content);
+        validate_content_size(&p.content)?;
+    }
 
     let missing = missing_members(&mention_pubkeys, &content_mentions.members);
     if !missing.is_empty() {

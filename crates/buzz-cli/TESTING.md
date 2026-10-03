@@ -206,12 +206,15 @@ buzz messages send --channel "$CHANNEL_ID" --content "Hey @someone" | jq .
 # messages send with @all — one p-tag per HUMAN channel member (excluding you,
 # `bot`-role members, and NIP-OA-attested agent profiles) plus a
 # ["buzz:mention-group","all"] marker tag. @all is reserved (a member named
-# "all" needs --mention <pubkey>) and ignored inside code. Content is unchanged.
+# "all" needs --mention <pubkey>) and ignored inside code.
 buzz messages send --channel "$CHANNEL_ID" --content "@all standup in 5" | jq .
 # Expected: mention_pubkeys = human members only; verify the marker:
 #   buzz messages get --channel "$CHANNEL_ID" --limit 1 | jq '.[0].tags'
-# --mention-all does the same without the token (content stays as typed)
+# --mention-all does the same; content lacking an @all token (outside code)
+# gets "@all " prepended — the marker is never emitted without the literal text
 buzz messages send --channel "$CHANNEL_ID" --content "standup in 5" --mention-all | jq .
+# Expected: published content is "@all standup in 5"; with --content "@all hi"
+# plus --mention-all the content is unchanged (no duplicate token)
 # Expected failures (exit 1, nothing published):
 #   - in a DM channel: "@all is not supported in DMs ..."
 #   - more than 50 qualifying humans: "@all would mention N human members,

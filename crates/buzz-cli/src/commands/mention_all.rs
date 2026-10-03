@@ -213,6 +213,23 @@ pub(crate) fn dm_rejection() -> CliError {
     )
 }
 
+/// Prepend the literal `@all` token for `--mention-all` sends whose content
+/// lacks it.
+///
+/// Uses `"@all "` normally; a leading code fence gets `"@all\n"` so the fence
+/// still opens at the start of a line. Empty content becomes `"@all"`.
+pub(crate) fn prepend_all_token(content: &str) -> String {
+    if content.is_empty() {
+        return format!("@{MENTION_GROUP_ALL}");
+    }
+    let separator = if content.starts_with("```") || content.starts_with("~~~") {
+        '\n'
+    } else {
+        ' '
+    };
+    format!("@{MENTION_GROUP_ALL}{separator}{content}")
+}
+
 /// The `["buzz:mention-group", "all"]` marker tag.
 pub(crate) fn mention_all_marker_tag() -> Result<Tag, CliError> {
     Tag::parse([MENTION_GROUP_TAG, MENTION_GROUP_ALL])
@@ -371,6 +388,14 @@ mod tests {
         let mut raw = profile(&agent, vec![auth_tag_for(&agent)], 100);
         raw["content"] = json!(r#"{"name":"tampered"}"#);
         assert!(agent_pubkeys_from_profiles(&[raw]).is_empty());
+    }
+
+    #[test]
+    fn prepend_all_token_keeps_leading_fences_intact() {
+        assert_eq!(prepend_all_token("standup"), "@all standup");
+        assert_eq!(prepend_all_token(""), "@all");
+        assert_eq!(prepend_all_token("```\nx\n```"), "@all\n```\nx\n```");
+        assert_eq!(prepend_all_token("~~~\nx\n~~~"), "@all\n~~~\nx\n~~~");
     }
 
     #[test]

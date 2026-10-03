@@ -224,7 +224,7 @@ async fn at_all_dedupes_with_explicit_mentions_and_named_mentions() {
 }
 
 #[tokio::test]
-async fn mention_all_flag_works_without_token_and_keeps_content() {
+async fn mention_all_flag_prepends_token_when_content_lacks_it() {
     let (fx, relay) = fixture("stream");
     let mut p = params("standup in 5");
     p.mention_all = true;
@@ -233,7 +233,32 @@ async fn mention_all_flag_works_without_token_and_keeps_content() {
     let event = shared.lock().unwrap().submitted.clone().unwrap();
     assert_eq!(p_tags(&event), vec![fx.alice.clone(), fx.bob.clone()]);
     assert!(has_marker(&event));
-    assert_eq!(event["content"], "standup in 5");
+    assert_eq!(event["content"], "@all standup in 5");
+}
+
+#[tokio::test]
+async fn mention_all_flag_with_existing_token_keeps_content() {
+    let (fx, relay) = fixture("stream");
+    let mut p = params("standup, @All.");
+    p.mention_all = true;
+    let (res, shared) = send(&fx, relay, p).await;
+    res.unwrap();
+    let event = shared.lock().unwrap().submitted.clone().unwrap();
+    assert_eq!(event["content"], "standup, @All.");
+    assert_eq!(p_tags(&event), vec![fx.alice.clone(), fx.bob.clone()]);
+    assert!(has_marker(&event));
+}
+
+#[tokio::test]
+async fn mention_all_flag_prepends_when_token_only_in_code() {
+    let (fx, relay) = fixture("stream");
+    let mut p = params("see `@all` docs");
+    p.mention_all = true;
+    let (res, shared) = send(&fx, relay, p).await;
+    res.unwrap();
+    let event = shared.lock().unwrap().submitted.clone().unwrap();
+    assert_eq!(event["content"], "@all see `@all` docs");
+    assert!(has_marker(&event));
 }
 
 #[tokio::test]
