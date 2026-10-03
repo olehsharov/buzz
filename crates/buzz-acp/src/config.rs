@@ -405,6 +405,15 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_NO_TYPING")]
     pub no_typing: bool,
 
+    /// Live reply streaming (NIP-SD kind:20003 ghost drafts).
+    /// off (default): no drafts.
+    /// draft: stream the agent's response text, thinking and tool status as
+    /// ephemeral drafts into the trigger's reply destination.
+    /// draft+autopost: draft, and post the response text as the reply at end
+    /// of turn unless the agent already replied there via the CLI.
+    #[arg(long, env = "BUZZ_ACP_STREAM", default_value = "off", value_enum)]
+    pub stream: crate::stream_draft::StreamMode,
+
     /// Enable NIP-AE agent core memory injection.
     ///
     /// Memory injection is on by default. When enabled, the harness
@@ -588,6 +597,8 @@ pub struct Config {
     pub max_turns_per_session: u32,
     pub presence_enabled: bool,
     pub typing_enabled: bool,
+    /// Live reply streaming mode (`--stream` / `BUZZ_ACP_STREAM`).
+    pub stream_mode: crate::stream_draft::StreamMode,
     /// Whether NIP-AE agent core memory injection is enabled. When false,
     /// the harness skips the per-session core engram fetch and renders no
     /// `<core-memory>` section. On by default; disabled via the
@@ -1222,6 +1233,7 @@ impl Config {
             max_turns_per_session: args.max_turns_per_session,
             presence_enabled: !args.no_presence,
             typing_enabled: !args.no_typing,
+            stream_mode: args.stream,
             memory_enabled: args.memory && !args.no_memory,
             model,
             effort_level: args.effort_level,
@@ -1265,7 +1277,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} stream={} memory={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1284,6 +1296,7 @@ impl Config {
             self.max_turns_per_session,
             self.presence_enabled,
             self.typing_enabled,
+            self.stream_mode,
             self.memory_enabled,
             self.model.as_deref().unwrap_or("(agent default)"),
             self.permission_mode,
@@ -1604,6 +1617,7 @@ mod tests {
             max_turns_per_session: 0,
             presence_enabled: true,
             typing_enabled: true,
+            stream_mode: crate::stream_draft::StreamMode::Off,
             memory_enabled: true,
             model: None,
             effort_level: None,

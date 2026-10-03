@@ -104,7 +104,10 @@ fn make_prompt_context(
             Some(if matches!(mode, SessionMode::Task) {
                 format!("{base}\n\n{}", include_str!("session_model_task.md"))
             } else {
-                config.session_policy.append_session_model(base)
+                append_stream_mode(
+                    config.stream_mode,
+                    config.session_policy.append_session_model(base),
+                )
             })
         },
         heartbeat_prompt: config.heartbeat_prompt.clone(),
@@ -125,7 +128,23 @@ fn make_prompt_context(
             config,
             |key| std::env::var_os(key),
         )?)),
+        // Needs the live relay publisher; conversation startup attaches it.
+        // Isolated tasks never stream.
+        stream: None,
     })
+}
+
+/// Append the reply-delivery contract when the harness autoposts the turn's
+/// response text. `draft` mode changes nothing the agent must do.
+fn append_stream_mode(mode: crate::stream_draft::StreamMode, base: String) -> String {
+    match mode {
+        crate::stream_draft::StreamMode::DraftAutopost => format!(
+            "{}\n\n{}",
+            base.trim_end(),
+            include_str!("session_stream_mode.md").trim_end()
+        ),
+        crate::stream_draft::StreamMode::Off | crate::stream_draft::StreamMode::Draft => base,
+    }
 }
 
 /// The pending `BUZZ_ACP_RESUME_SESSION` continuation with the store that
@@ -199,5 +218,74 @@ mod tests {
         assert!(pending_resume(&config(None), |_| None)
             .expect("unset needs no state dir")
             .is_none());
+    }
+
+    fn config_with_stream(stream: Option<&str>) -> Config {
+        let mut argv = vec![
+            "buzz-acp".to_string(),
+            "--private-key".into(),
+            "0000000000000000000000000000000000000000000000000000000000000001".into(),
+        ];
+        if let Some(mode) = stream {
+            argv.extend(["--stream".into(), mode.into()]);
+        }
+        Config::from_args(crate::config::CliArgs::try_parse_from(argv).expect("args"))
+            .expect("config")
+    }
+
+    fn base_prompt_for(config: &Config, mode: SessionMode) -> String {
+        let rest = relay::RestClient {
+            http: reqwest::Client::new(),
+            base_url: "http://127.0.0.1:0".into(),
+            keys: config.keys.clone(),
+            auth_tag_json: None,
+        };
+        let ctx = make_prompt_context(config, rest, HashMap::new(), mode).expect("context");
+        assert!(
+            ctx.stream.is_none(),
+            "the relay publisher is attached by startup"
+        );
+        ctx.base_prompt.expect("base prompt")
+    }
+
+    #[test]
+    fn stream_flag_parses_into_config() {
+        use crate::stream_draft::StreamMode;
+        assert_eq!(config_with_stream(None).stream_mode, StreamMode::Off);
+        assert_eq!(
+            config_with_stream(Some("draft")).stream_mode,
+            StreamMode::Draft
+        );
+        assert_eq!(
+            config_with_stream(Some("draft+autopost")).stream_mode,
+            StreamMode::DraftAutopost
+        );
+        assert!(crate::config::CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            "0000000000000000000000000000000000000000000000000000000000000001",
+            "--stream",
+            "on",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn reply_delivery_section_only_for_autopost_conversations() {
+        const HEADING: &str = "## Reply Delivery";
+        let autopost = config_with_stream(Some("draft+autopost"));
+        let prompt = base_prompt_for(&autopost, SessionMode::Conversation);
+        assert!(prompt.contains(HEADING));
+        assert!(
+            prompt
+                .trim_end()
+                .ends_with(include_str!("session_stream_mode.md").trim_end()),
+            "appended after the session model"
+        );
+        assert!(!base_prompt_for(&autopost, SessionMode::Task).contains(HEADING));
+        for mode in [None, Some("draft")] {
+            let config = config_with_stream(mode);
+            assert!(!base_prompt_for(&config, SessionMode::Conversation).contains(HEADING));
+        }
     }
 }

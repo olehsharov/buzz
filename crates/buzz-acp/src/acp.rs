@@ -259,6 +259,9 @@ pub struct AcpClient {
     /// outside of a goose-native turn — the read loop's steer arm is
     /// disabled in that case.
     steer_rx: Option<tokio::sync::mpsc::Receiver<crate::pool::SteerRequest>>,
+    /// Live reply draft sink for the current turn (NIP-SD). Fed synchronously
+    /// from `session/update` notifications; `None` when streaming is off.
+    stream_sink: Option<std::sync::Arc<crate::stream_draft::StreamSink>>,
     /// Usage tracker for goose/buzz-agent's cumulative notification format.
     goose_usage: UsageTracker,
     /// Per-turn prompt-response usage and Claude's optional cumulative cost.
@@ -675,6 +678,7 @@ impl AcpClient {
             steering_supported: false,
             fork_resume_supported: false,
             steer_rx: None,
+            stream_sink: None,
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
             standard_adapter,
@@ -1131,6 +1135,25 @@ impl AcpClient {
     /// Idempotent — safe to call when `steer_rx` is already `None`.
     pub fn clear_steer_rx(&mut self) {
         self.steer_rx = None;
+    }
+
+    /// Route this turn's `session/update` text, thought, and tool events to a
+    /// reply draft sink. Replaces any previous sink.
+    pub fn install_stream_sink(&mut self, sink: std::sync::Arc<crate::stream_draft::StreamSink>) {
+        self.stream_sink = Some(sink);
+    }
+
+    /// Detach the turn's draft sink. Called with [`clear_steer_rx`](Self::clear_steer_rx)
+    /// on every `run_prompt_task` exit path so a later turn (or heartbeat)
+    /// never feeds an ended stream. Idempotent.
+    pub fn clear_stream_sink(&mut self) {
+        self.stream_sink = None;
+    }
+
+    /// Test-only: whether no draft sink is attached.
+    #[cfg(test)]
+    pub fn stream_sink_is_none(&self) -> bool {
+        self.stream_sink.is_none()
     }
 
     /// Returns `true` if no steer receiver is currently installed.
@@ -1954,28 +1977,39 @@ impl AcpClient {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
                     tracing::info!(target: "acp::stream", "{text}");
+                    if let Some(sink) = &self.stream_sink {
+                        sink.on_text(text);
+                    }
                 }
                 false
             }
             "tool_call" => {
-                let title = update
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
+                let title = update.get("title").and_then(|v| v.as_str());
                 let kind = update
                     .get("kind")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
-                tracing::info!(target: "acp::tool", "tool_call: {title} ({kind})");
+                tracing::info!(
+                    target: "acp::tool",
+                    "tool_call: {} ({kind})",
+                    title.unwrap_or("unknown")
+                );
+                if let Some(sink) = &self.stream_sink {
+                    sink.on_tool_call(update.get("toolCallId").and_then(|v| v.as_str()), title);
+                }
                 true
             }
             "tool_call_update" => {
-                let tool_id = update
-                    .get("toolCallId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?");
+                let tool_id = update.get("toolCallId").and_then(|v| v.as_str());
                 let status = update.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-                tracing::info!(target: "acp::tool", "tool_call_update: {tool_id} → {status}");
+                tracing::info!(
+                    target: "acp::tool",
+                    "tool_call_update: {} → {status}",
+                    tool_id.unwrap_or("?")
+                );
+                if let Some(sink) = &self.stream_sink {
+                    sink.on_tool_title(tool_id, update.get("title").and_then(|v| v.as_str()));
+                }
                 false
             }
             "plan" => {
@@ -1985,6 +2019,10 @@ impl AcpClient {
             "agent_thought_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
                     tracing::debug!(target: "acp::thought", "{text}");
+                }
+                // Status only: reasoning text never reaches a draft.
+                if let Some(sink) = &self.stream_sink {
+                    sink.on_thought();
                 }
                 false
             }

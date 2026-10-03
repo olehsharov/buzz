@@ -942,6 +942,9 @@ pub struct PromptContext {
     /// store recording its fork. `None` when `BUZZ_ACP_RESUME_SESSION` is
     /// unset or already consumed by this process.
     pub resume_session: ResumeSessionSlot,
+    /// Live reply streaming (NIP-SD drafts). `None` when `--stream off` or
+    /// for isolated tasks.
+    pub stream: Option<crate::stream_draft::StreamRuntime>,
 }
 
 impl AgentPool {
@@ -2543,6 +2546,7 @@ fn send_prompt_result(
     batch: Option<FlushBatch>,
 ) {
     agent.acp.clear_steer_rx();
+    agent.acp.clear_stream_sink();
     let _ = result_tx.send(PromptResult {
         agent,
         source,
@@ -3152,6 +3156,9 @@ pub async fn run_prompt_task(
     // failed or cancelled first turn must not make its retry assume that the
     // provider retained any of that thread's context.
     let mut pending_hydrated_thread_roots = HashSet::new();
+    // Live reply draft for channel turns (NIP-SD). Dropping it on any exit
+    // path below abandons the stream; only a returned prompt finishes it.
+    let mut reply_stream: Option<crate::stream_draft::ReplyStream> = None;
     let prompt_sections: Vec<String> = if let Some(text) = prompt_text {
         // Heartbeats create their session before this point, so a Goose method-not-found
         // probe has already selected the correct framing for this process.
@@ -3241,6 +3248,13 @@ pub async fn run_prompt_task(
 
         let profile_lookup =
             fetch_prompt_profile_lookup(b, conversation_context.as_ref(), &ctx.rest_client).await;
+        if let Some(runtime) = ctx.stream.as_ref() {
+            let target = crate::stream_draft::ReplyTarget {
+                channel_id: b.channel_id,
+                thread: crate::queue::turn_reply_thread(b, is_dm, profile_lookup.as_ref()),
+            };
+            reply_stream = Some(crate::stream_draft::ReplyStream::start(runtime, target));
+        }
 
         let known_names: Vec<&str> = profile_lookup
             .iter()
@@ -3346,6 +3360,9 @@ pub async fn run_prompt_task(
         "turn starting for {}",
         prompt_label(&source)
     );
+    if let Some(stream) = &reply_stream {
+        agent.acp.install_stream_sink(stream.sink());
+    }
 
     // When control_rx is Some (channel tasks), wrap the prompt in select! so
     // the main loop can cancel, interrupt, or rotate it. Heartbeats
@@ -3534,6 +3551,10 @@ pub async fn run_prompt_task(
     match prompt_result {
         Ok(stop_reason) => {
             log_stop_reason(&source, &stop_reason);
+            agent.acp.clear_stream_sink();
+            if let Some(stream) = reply_stream.take() {
+                stream.finish(&stop_reason, &ctx.rest_client).await;
+            }
 
             if let PromptSource::Channel(scope) = &source {
                 let standing_sent = !agent.has_system_prompt_support();
@@ -10609,6 +10630,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
             resume_session: Arc::new(Mutex::new(None)),
+            stream: None,
         }
     }
 
@@ -13040,3 +13062,7 @@ done"#
 #[cfg(all(test, unix))]
 #[path = "pool/pi_prompt_tests.rs"]
 mod pi_prompt_tests;
+
+#[cfg(all(test, unix))]
+#[path = "pool/stream_draft_tests.rs"]
+mod stream_draft_tests;

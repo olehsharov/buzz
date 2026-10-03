@@ -24,6 +24,7 @@ mod runtime;
 use runtime::{AgentRuntime, PoolStartup, SessionMode};
 mod scope;
 mod setup_mode;
+mod stream_draft;
 mod usage;
 
 pub use usage::TurnUsage;
@@ -2842,11 +2843,17 @@ async fn run_harness(
         );
     }
 
-    let ctx = Arc::new(runtime.prompt_context(
+    let mut prompt_context = runtime.prompt_context(
         relay.rest_client(),
         channel_info_map,
         SessionMode::Conversation,
-    )?);
+    )?;
+    prompt_context.stream = stream_draft::StreamRuntime::new(
+        config.stream_mode,
+        relay.event_publisher(),
+        config.keys.clone(),
+    );
+    let ctx = Arc::new(prompt_context);
 
     if !config.memory_enabled {
         tracing::info!(
@@ -9519,6 +9526,7 @@ mod build_mcp_servers_tests {
             max_turns_per_session: 0,
             presence_enabled: true,
             typing_enabled: true,
+            stream_mode: crate::stream_draft::StreamMode::Off,
             memory_enabled: false,
             model: None,
             effort_level: None,
@@ -10212,6 +10220,7 @@ mod error_outcome_emission_tests {
             max_turns_per_session: 0,
             presence_enabled: true,
             typing_enabled: true,
+            stream_mode: crate::stream_draft::StreamMode::Off,
             memory_enabled: false,
             model: None,
             effort_level: None,

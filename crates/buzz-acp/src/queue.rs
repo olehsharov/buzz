@@ -1639,6 +1639,68 @@ fn resolve_reply_anchor(
     )
 }
 
+/// The `--reply-to` anchor the prompt names for a turn routed by `last_event`.
+///
+/// Human-facing turns are anchored so replies stay readable at layer 1:
+///   - in a thread  → anchor to the thread ROOT (no depth-2 nesting)
+///   - top-level     → anchor to the triggering event (it becomes the root)
+///
+/// Agent↔agent turns get no forced anchor — deep nesting is intentional
+/// there. DMs are always 1:1 with a human, so a DM thread reply anchors to
+/// the triggering event and a top-level DM message gets no anchor.
+fn turn_reply_anchor(
+    last_event: &BatchEvent,
+    is_dm: bool,
+    profile_lookup: Option<&PromptProfileLookup>,
+) -> Option<String> {
+    let thread_tags = last_event.routing_thread_tags();
+    let routing_event_id = last_event.routing_event_id();
+    if is_dm {
+        thread_tags
+            .root_event_id
+            .is_some()
+            .then_some(routing_event_id)
+    } else {
+        resolve_reply_anchor(
+            &last_event.event.pubkey.to_hex(),
+            &thread_tags,
+            &routing_event_id,
+            profile_lookup,
+        )
+    }
+}
+
+/// Where the turn's ordinary reply lands, as `(root, parent)` NIP-10 ids, or
+/// `None` for a top-level post. This is the destination the prompt's reply
+/// instruction names (`--reply-to` resolved the way the CLI resolves it), so
+/// live drafts and autoposted replies land exactly where a CLI reply would.
+///
+/// Without an anchor (agent↔agent), a channel reply targets the triggering
+/// event itself; a top-level DM message is answered top-level.
+pub(crate) fn turn_reply_thread(
+    batch: &FlushBatch,
+    is_dm: bool,
+    profile_lookup: Option<&PromptProfileLookup>,
+) -> Option<(String, String)> {
+    let last_event = batch.events.last()?;
+    let thread_tags = last_event.routing_thread_tags();
+    let routing_event_id = last_event.routing_event_id();
+    let parent = match turn_reply_anchor(last_event, is_dm, profile_lookup) {
+        Some(anchor) => anchor,
+        None if is_dm => return None,
+        None => routing_event_id.clone(),
+    };
+    // `--reply-to <parent>` derives the root from the parent's own tags: the
+    // trigger's thread root when the parent is the trigger, else the parent
+    // (the anchor is the thread root itself).
+    let root = if parent == routing_event_id {
+        thread_tags.root_event_id.unwrap_or_else(|| parent.clone())
+    } else {
+        parent.clone()
+    };
+    Some((root, parent))
+}
+
 /// Maximum length (in characters) of a channel description rendered into `<context>`.
 ///
 /// Limits prompt bloat from unusually long descriptions. Multi-line
@@ -2186,7 +2248,6 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     // An edit routes through its original message: the edit's own bare `e`
     // tag is not a thread link, and the edit event is not a visible row.
     let thread_tags = last_event.routing_thread_tags();
-    let routing_event_id = last_event.routing_event_id();
     let is_dm = args
         .channel_info
         .map(|ci| ci.channel_type == "dm")
@@ -2213,27 +2274,9 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
         );
     }
 
-    // 2. Context hints (with a human-aware reply anchor).
-    //
-    // Human-facing turns are anchored so replies stay readable at layer 1:
-    //   - in a thread  → anchor to the thread ROOT (no depth-2 nesting)
-    //   - top-level     → anchor to the triggering event (it becomes the root)
-    // Agent↔agent turns get no forced anchor — deep nesting is intentional
-    // there. DMs are always 1:1 with a human, so they always anchor.
-    let sender_pubkey = last_event.event.pubkey.to_hex();
-    let reply_anchor = if is_dm {
-        thread_tags
-            .root_event_id
-            .is_some()
-            .then(|| routing_event_id.clone())
-    } else {
-        resolve_reply_anchor(
-            &sender_pubkey,
-            &thread_tags,
-            &routing_event_id,
-            args.profile_lookup,
-        )
-    };
+    // 2. Context hints (with a human-aware reply anchor; see
+    //    [`turn_reply_anchor`]).
+    let reply_anchor = turn_reply_anchor(last_event, is_dm, args.profile_lookup);
     sections.push(format_context_hints(
         &batch.scope,
         args.channel_info,
@@ -7132,6 +7175,92 @@ mod tests {
         assert!(
             !prompt.contains("Description:"),
             "unresolved metadata must not render a Description field; got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn turn_reply_thread_matches_the_reply_instruction_destination() {
+        let root = "a".repeat(64);
+        let parent = "b".repeat(64);
+        let ch = Uuid::new_v4();
+        let batch_of = |event: Event| FlushBatch {
+            channel_id: ch,
+            scope: conv(ch),
+            events: vec![BatchEvent {
+                edit: None,
+                event,
+                prompt_tag: "@mention".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let nested = || {
+            make_event_with_tags(
+                "nested",
+                vec![
+                    vec!["e".into(), root.clone(), "".into(), "root".into()],
+                    vec!["e".into(), parent.clone(), "".into(), "reply".into()],
+                ],
+            )
+        };
+        let top = || make_event_with_tags("top", vec![]);
+        let agent_lookup = |event: &Event| -> PromptProfileLookup {
+            HashMap::from([(
+                event.pubkey.to_hex(),
+                PromptProfile {
+                    display_name: Some("Peer Agent".into()),
+                    nip05_handle: None,
+                    is_agent: true,
+                },
+            )])
+        };
+
+        // Human in a thread → flat reply to the thread root (`--reply-to root`).
+        let b = batch_of(nested());
+        assert_eq!(
+            turn_reply_thread(&b, false, None),
+            Some((root.clone(), root.clone()))
+        );
+        let prompt = format_prompt(&b, &FormatPromptArgs::default()).join("\n");
+        assert!(prompt.contains(&format!("--reply-to {root}")));
+
+        // Human top-level mention → new thread rooted at the trigger.
+        let event = top();
+        let trigger = event.id.to_hex();
+        let b = batch_of(event);
+        assert_eq!(
+            turn_reply_thread(&b, false, None),
+            Some((trigger.clone(), trigger.clone()))
+        );
+
+        // Agent↔agent in a thread → nested reply to the trigger itself.
+        let event = nested();
+        let trigger = event.id.to_hex();
+        let lookup = agent_lookup(&event);
+        let b = batch_of(event);
+        assert_eq!(
+            turn_reply_thread(&b, false, Some(&lookup)),
+            Some((root.clone(), trigger))
+        );
+
+        // Agent↔agent top-level → thread on the trigger.
+        let event = top();
+        let trigger = event.id.to_hex();
+        let lookup = agent_lookup(&event);
+        let b = batch_of(event);
+        assert_eq!(
+            turn_reply_thread(&b, false, Some(&lookup)),
+            Some((trigger.clone(), trigger))
+        );
+
+        // DM top-level → top-level DM reply; DM thread → reply to the trigger.
+        assert_eq!(turn_reply_thread(&batch_of(top()), true, None), None);
+        let event = nested();
+        let trigger = event.id.to_hex();
+        assert_eq!(
+            turn_reply_thread(&batch_of(event), true, None),
+            Some((root.clone(), trigger))
         );
     }
 }
