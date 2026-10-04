@@ -85,7 +85,7 @@ fn metadata(channel_type: &str) -> Value {
 
 /// Channel with: sender (owner), alice + bob (humans), a `bot`-role member
 /// whose profile is literally named "all", and an attested agent with the
-/// plain `member` role.
+/// plain `member` role. `@all` reaches all four non-sender members.
 struct Fixture {
     sender: Keys,
     alice: String,
@@ -132,6 +132,18 @@ fn fixture(channel_type: &str) -> (Fixture, Relay) {
         },
         relay,
     )
+}
+
+impl Fixture {
+    /// Every member but the sender, in roster order.
+    fn everyone(&self) -> Vec<String> {
+        vec![
+            self.alice.clone(),
+            self.bob.clone(),
+            self.bot_named_all.clone(),
+            self.agent.clone(),
+        ]
+    }
 }
 
 fn params(content: &str) -> SendMessageParams {
@@ -181,17 +193,57 @@ async fn send(fx: &Fixture, relay: Relay, p: SendMessageParams) -> (Result<(), C
 }
 
 #[tokio::test]
-async fn at_all_token_mentions_humans_only_with_marker() {
+async fn at_all_token_mentions_every_member_including_agents_with_marker() {
     let (fx, relay) = fixture("stream");
     let (res, shared) = send(&fx, relay, params("@all standup in 5")).await;
     res.unwrap();
     let event = shared.lock().unwrap().submitted.clone().unwrap();
-    assert_eq!(p_tags(&event), vec![fx.alice.clone(), fx.bob.clone()]);
+    // The `bot`-role member (even one named "all") and the attested agent are
+    // tagged like the humans; only the sender is left out.
+    assert_eq!(p_tags(&event), fx.everyone());
     assert!(has_marker(&event));
     assert_eq!(event["content"], "@all standup in 5");
-    // Neither the bot literally named "all" nor the attested agent is tagged.
-    assert!(!p_tags(&event).contains(&fx.bot_named_all));
-    assert!(!p_tags(&event).contains(&fx.agent));
+}
+
+#[tokio::test]
+async fn at_all_in_a_channel_of_only_agents_mentions_every_agent() {
+    // The motivating case: a project channel of its owner plus five agents.
+    let sender = Keys::generate();
+    let agents: Vec<Keys> = (0..5).map(|_| Keys::generate()).collect();
+    let mut tags = vec![
+        json!(["d", CHANNEL]),
+        json!(["p", sender.public_key().to_hex(), "", "owner"]),
+    ];
+    let mut profiles = vec![profile(&sender, "me", vec![])];
+    for (index, agent) in agents.iter().enumerate() {
+        let role = if index % 2 == 0 { "bot" } else { "member" };
+        tags.push(json!(["p", agent.public_key().to_hex(), "", role]));
+        profiles.push(profile(agent, "agent", vec![auth_tag_for(agent)]));
+    }
+    let relay = Relay {
+        roster: json!({ "kind": 39002, "tags": tags }),
+        profiles,
+        metadata: metadata("stream"),
+        ..Relay::default()
+    };
+    let fx = Fixture {
+        sender,
+        alice: String::new(),
+        bob: String::new(),
+        bot_named_all: String::new(),
+        agent: String::new(),
+    };
+    let (res, shared) = send(&fx, relay, params("@all sync up")).await;
+    res.unwrap();
+    let event = shared.lock().unwrap().submitted.clone().unwrap();
+    assert_eq!(
+        p_tags(&event),
+        agents
+            .iter()
+            .map(|agent| agent.public_key().to_hex())
+            .collect::<Vec<_>>()
+    );
+    assert!(has_marker(&event));
 }
 
 #[tokio::test]
@@ -203,7 +255,7 @@ async fn at_all_tokenizes_with_trailing_punctuation_and_case() {
     let (res, shared) = send(&fx, relay, params("Heads up, please read @ALL.")).await;
     res.unwrap();
     let event = shared.lock().unwrap().submitted.clone().unwrap();
-    assert_eq!(p_tags(&event), vec![fx.alice.clone(), fx.bob.clone()]);
+    assert_eq!(p_tags(&event), fx.everyone());
     assert!(has_marker(&event));
 }
 
@@ -215,10 +267,15 @@ async fn at_all_dedupes_with_explicit_mentions_and_named_mentions() {
     let (res, shared) = send(&fx, relay, p).await;
     res.unwrap();
     let event = shared.lock().unwrap().submitted.clone().unwrap();
-    // Explicit first (an explicit agent stays), then name-resolved, then @all.
+    // Explicit first, then name-resolved, then the rest of @all, each once.
     assert_eq!(
         p_tags(&event),
-        vec![fx.alice.clone(), fx.agent.clone(), fx.bob.clone()]
+        vec![
+            fx.alice.clone(),
+            fx.agent.clone(),
+            fx.bob.clone(),
+            fx.bot_named_all.clone(),
+        ]
     );
     assert!(has_marker(&event));
 }
@@ -231,7 +288,7 @@ async fn mention_all_flag_prepends_token_when_content_lacks_it() {
     let (res, shared) = send(&fx, relay, p).await;
     res.unwrap();
     let event = shared.lock().unwrap().submitted.clone().unwrap();
-    assert_eq!(p_tags(&event), vec![fx.alice.clone(), fx.bob.clone()]);
+    assert_eq!(p_tags(&event), fx.everyone());
     assert!(has_marker(&event));
     assert_eq!(event["content"], "@all standup in 5");
 }
@@ -245,7 +302,7 @@ async fn mention_all_flag_with_existing_token_keeps_content() {
     res.unwrap();
     let event = shared.lock().unwrap().submitted.clone().unwrap();
     assert_eq!(event["content"], "standup, @All.");
-    assert_eq!(p_tags(&event), vec![fx.alice.clone(), fx.bob.clone()]);
+    assert_eq!(p_tags(&event), fx.everyone());
     assert!(has_marker(&event));
 }
 
@@ -313,7 +370,7 @@ async fn at_all_prefix_is_an_ordinary_unknown_name() {
 }
 
 #[tokio::test]
-async fn more_than_cap_humans_fails_with_count() {
+async fn more_than_cap_members_fails_with_count() {
     let sender = Keys::generate();
     let mut tags = vec![
         json!(["d", CHANNEL]),
@@ -337,7 +394,7 @@ async fn more_than_cap_humans_fails_with_count() {
     let (res, shared) = send(&fx, relay, params("@all hello")).await;
     let err = res.unwrap_err();
     assert_eq!(exit_code(&err), 1);
-    assert!(err.to_string().contains("51 human members"), "{err}");
+    assert!(err.to_string().contains("51 members"), "{err}");
     assert!(err.to_string().contains("limit of 50"), "{err}");
     assert!(shared.lock().unwrap().submitted.is_none());
 }
@@ -351,6 +408,6 @@ async fn at_all_applies_to_forum_posts() {
     res.unwrap();
     let event = shared.lock().unwrap().submitted.clone().unwrap();
     assert_eq!(event["kind"], 45001);
-    assert_eq!(p_tags(&event), vec![fx.alice.clone(), fx.bob.clone()]);
+    assert_eq!(p_tags(&event), fx.everyone());
     assert!(has_marker(&event));
 }

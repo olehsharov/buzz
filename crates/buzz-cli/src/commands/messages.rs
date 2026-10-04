@@ -165,7 +165,7 @@ struct ContentMentions {
     mention_all: bool,
     /// Whether content already carries an `@all` token outside code.
     has_all_token: bool,
-    /// Human recipients of `@all` (empty unless `mention_all`).
+    /// Recipients of `@all` (empty unless `mention_all`).
     all_recipients: Vec<String>,
 }
 
@@ -208,7 +208,8 @@ async fn resolve_content_mentions(
         });
     }
 
-    let profile_events = if member_pubkeys.is_empty() {
+    // Profiles only resolve `@Name` text; `@all` needs the roster alone.
+    let profile_events = if member_pubkeys.is_empty() || !has_at {
         vec![]
     } else {
         let profiles_filter = serde_json::json!({
@@ -266,13 +267,8 @@ async fn resolve_content_mentions(
     let mention_all = has_all_token || mention_all_flag;
     let all_recipients = if mention_all {
         ensure_not_dm(client, channel_id).await?;
-        let agents = mention_all::agent_pubkeys_from_profiles(&profile_events);
         let sender = client.keys().public_key().to_hex();
-        mention_all::expand_mention_all(
-            &mention_all::parse_member_roster(&roster_event),
-            &agents,
-            &sender,
-        )?
+        mention_all::expand_mention_all(&member_pubkeys, &sender)?
     } else {
         vec![]
     };
@@ -673,7 +669,7 @@ pub struct SendMessageParams {
     pub broadcast: bool,
     pub files: Vec<String>,
     pub mentions: Vec<String>,
-    /// Mention every human channel member (`@all`) without the content token.
+    /// Mention every channel member (`@all`) without the content token.
     pub mention_all: bool,
 }
 
