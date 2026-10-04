@@ -237,9 +237,17 @@ class ComposeBar extends HookConsumerWidget {
               .cachedMembersForChannel(channelId);
     final currentPubkey = ref.watch(currentPubkeyProvider);
     final userCache = ref.watch(userCacheProvider);
-    final isDmChannel =
-        channelsAsync.asData?.value.any((c) => c.id == channelId && c.isDm) ??
-        false;
+    final currentChannel = channelsAsync.asData?.value
+        .where((c) => c.id == channelId)
+        .firstOrNull;
+    final isDmChannel = currentChannel?.isDm ?? false;
+    final mentionAllAudience = _pickerMentionAllAudience(
+      channel: currentChannel,
+      membersAsync: membersAsync,
+      sessionStatus: sessionStatus,
+      cachedMembers: cachedMembers,
+      currentPubkey: currentPubkey,
+    );
 
     // Preload profiles for channel members, mentionable agents, and their
     // owners so @mention suggestions show names ("managed by …" included).
@@ -360,20 +368,26 @@ class ComposeBar extends HookConsumerWidget {
 
     // Ranked mention candidates (desktop-parity ordering + eligibility).
     final suggestions = mentionQuery.value == null
-        ? const <MentionCandidate>[]
-        : ref
-              .watch(
-                mentionCandidatesProvider((
-                  channelId: channelId,
-                  query: mentionQuery.value!,
-                )),
-              )
-              .take(_mentionSuggestionLimit)
-              .toList();
+        ? const <MentionSuggestionEntry>[]
+        : mentionSuggestionEntries(
+            candidates: ref.watch(
+              mentionCandidatesProvider((
+                channelId: channelId,
+                query: mentionQuery.value!,
+              )),
+            ),
+            query: mentionQuery.value!,
+            audience: mentionAllAudience,
+            limit: _mentionSuggestionLimit,
+          );
 
     // Resolve owner names for the visible "managed by …" subtitles.
     useEffect(() {
-      final ownerPubkeys = [for (final s in suggestions) ?s.ownerPubkey];
+      final ownerPubkeys = [
+        for (final s in suggestions)
+          if (s case IdentityMentionSuggestion(:final candidate))
+            ?candidate.ownerPubkey,
+      ];
       if (ownerPubkeys.isNotEmpty) {
         ref.read(userCacheProvider.notifier).preload(ownerPubkeys);
       }
@@ -402,6 +416,24 @@ class ComposeBar extends HookConsumerWidget {
           focusNode,
           start: start,
           replacement: '@$name ',
+        );
+      } finally {
+        isModifyingText.value = false;
+      }
+      mentionQuery.value = null;
+    }
+
+    // The group binds by its reserved literal token, not a key, so it adds no
+    // mentionMap entry; send re-resolves the live roster.
+    void insertMentionAll() {
+      final start = mentionStartIdx.value.clamp(0, controller.text.length);
+      isModifyingText.value = true;
+      try {
+        spliceAndMoveCursor(
+          controller,
+          focusNode,
+          start: start,
+          replacement: '$mentionAllToken ',
         );
       } finally {
         isModifyingText.value = false;
@@ -476,23 +508,24 @@ class ComposeBar extends HookConsumerWidget {
       // `_reportSendCancelledByCommunitySwitch`.
       final messenger = ScaffoldMessenger.maybeOf(context);
 
+      final rosterCandidates = buildMentionCandidates(
+        members: channelMembersForAutocomplete(
+          membersAsync: membersAsync,
+          sessionStatus: sessionStatus,
+          cachedMembers: cachedMembers,
+        ),
+        relayAgents: const [],
+        sharedChannelIds: const {},
+        userCache: userCache,
+        ownerByAgentPubkey: agentOwners ?? const {},
+      );
       // Extract pubkeys for mentions present in the final text.
       List<MentionCandidate> selectedMentions;
       try {
         selectedMentions = _resolveComposerMentions(
           text,
           mentionMap.value,
-          buildMentionCandidates(
-            members: channelMembersForAutocomplete(
-              membersAsync: membersAsync,
-              sessionStatus: sessionStatus,
-              cachedMembers: cachedMembers,
-            ),
-            relayAgents: const [],
-            sharedChannelIds: const {},
-            userCache: userCache,
-            ownerByAgentPubkey: agentOwners ?? const {},
-          ),
+          rosterCandidates,
           buildMentionCandidates(
             members: membersAsync.asData?.value ?? const [],
             relayAgents: relayAgents ?? const [],
@@ -517,6 +550,29 @@ class ComposeBar extends HookConsumerWidget {
         return;
       }
       final outgoing = _OutgoingMentions(selectedMentions);
+      // Re-resolve `@all` from a fresh roster before any side effect; an
+      // unavailable audience blocks the send and keeps the draft. Sending
+      // stays latched across the roster fetch so a second tap cannot race it.
+      isSending.value = true;
+      final mentionAll = await _resolveMentionAllForSend(
+        ref,
+        channelId: channelId,
+        offered: mentionAllAudience != null,
+        text: text,
+        selected: mentionMap.value,
+        members: rosterCandidates,
+        currentPubkey: currentPubkey,
+      );
+      if (!context.mounted) return;
+      isSending.value = false;
+      if (mentionAll != null) {
+        final error =
+            mentionAll.error ?? outgoing.addMentionAll(mentionAll.recipients!);
+        if (error != null) {
+          messenger?.showSnackBar(SnackBar(content: Text(error)));
+          return;
+        }
+      }
       final scan = await _scanNonMemberMentions(
         ref,
         channelId: channelId,
@@ -915,6 +971,7 @@ class ComposeBar extends HookConsumerWidget {
       isDmChannel: isDmChannel,
       onChannelSelect: insertChannel,
       onMentionSelect: insertMention,
+      onMentionAllSelect: insertMentionAll,
     );
     Widget buildOverlayPanel(_AttachmentSurface surface) {
       return _composerAttachmentPanel(

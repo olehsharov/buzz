@@ -25,6 +25,8 @@ import 'package:buzz/features/channels/voice_note_waveform.dart';
 import 'package:buzz/shared/custom_emoji/custom_emoji.dart';
 import 'package:buzz/shared/custom_emoji/custom_emoji_provider.dart';
 import 'package:buzz/shared/mentions/agent_identity_provider.dart';
+import 'package:buzz/shared/mentions/mention_group.dart';
+import 'package:buzz/features/channels/mentions/mention_all_audience.dart';
 import 'package:buzz/shared/relay/relay.dart';
 import 'package:buzz/shared/profile/user_cache_provider.dart';
 import 'package:buzz/shared/profile/user_profile.dart';
@@ -37,6 +39,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 part 'compose_bar_test/exact_mention_tests.dart';
 part 'compose_bar_test/durable_mention_tests.dart';
+part 'compose_bar_test/mention_all_tests.dart';
 
 final _pngBytes = Uint8List.fromList([
   0x89,
@@ -182,6 +185,8 @@ Widget _buildComposeBar({
   required ComposeBarOnSend onSend,
   List<ChannelMember> members = const <ChannelMember>[],
   Future<List<ChannelMember>>? membersFuture,
+  // Called on every roster (re)load, so a test can change what a refresh sees.
+  List<ChannelMember> Function()? loadMembers,
   List<AgentDirectoryEntry> relayAgents = const <AgentDirectoryEntry>[],
   List<Channel> channels = const <Channel>[],
   List<ChannelMember> cachedMembers = const <ChannelMember>[],
@@ -216,9 +221,11 @@ Widget _buildComposeBar({
         ),
       photoLibraryProvider.overrideWithValue(photoLibrary),
       currentPubkeyProvider.overrideWith((ref) => currentPubkey),
-      channelMembersProvider(
-        'channel-1',
-      ).overrideWith((ref) => membersFuture ?? Future.value(members)),
+      channelMembersProvider('channel-1').overrideWith(
+        (ref) =>
+            membersFuture ??
+            Future.value(loadMembers == null ? members : loadMembers()),
+      ),
       agentDirectoryProvider.overrideWith((ref) async => relayAgents),
       agentOwnersProvider.overrideWith((ref) async => const <String, String>{}),
       relayClientProvider.overrideWithValue(
@@ -653,6 +660,7 @@ class _FakeChannelsNotifier extends ChannelsNotifier {
 void main() {
   exactMentionTests();
   durableMentionTests();
+  mentionAllTests();
   TestWidgetsFlutterBinding.ensureInitialized();
 
   setUp(() async {

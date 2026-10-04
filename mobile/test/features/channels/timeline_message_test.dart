@@ -446,6 +446,33 @@ void main() {
       expect(result[0].edited, true);
     });
 
+    test('an edit keeps the original @all marker but adds no audience', () {
+      final marker = ['buzz:mention-group', 'all'];
+      final events = [
+        _textMsg(
+          id: 'a',
+          content: '@all ship',
+          extraTags: [
+            ['p', 'bob'],
+            marker,
+          ],
+        ),
+        _edit(id: 'e1', targetId: 'a', content: '@all shipped'),
+      ];
+
+      final edited = formatTimeline(events).single;
+      expect(edited.tags.where((t) => t[0] == 'buzz:mention-group').toList(), [
+        marker,
+      ]);
+      expect(edited.mentionPubkeys, isEmpty);
+
+      final plain = formatTimeline([
+        _textMsg(id: 'b', content: '@all ship'),
+        _edit(id: 'e2', targetId: 'b', content: '@all shipped'),
+      ]).single;
+      expect(plain.tags.where((t) => t[0] == 'buzz:mention-group'), isEmpty);
+    });
+
     test('applies edit tags for custom emoji rendering', () {
       final events = [
         _textMsg(

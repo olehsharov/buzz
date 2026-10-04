@@ -157,12 +157,13 @@ void _expandComposer({
 
 Widget _composerSuggestionPanel({
   required List<Channel> channelSuggestions,
-  required List<MentionCandidate> mentionSuggestions,
+  required List<MentionSuggestionEntry> mentionSuggestions,
   required Map<String, UserProfile> userCache,
   required String? currentPubkey,
   required bool isDmChannel,
   required ValueChanged<Channel> onChannelSelect,
   required ValueChanged<MentionCandidate> onMentionSelect,
+  required VoidCallback onMentionAllSelect,
 }) => channelSuggestions.isNotEmpty
     ? KeyedSubtree(
         key: const ValueKey('channel-suggestions'),
@@ -180,6 +181,7 @@ Widget _composerSuggestionPanel({
           currentPubkey: currentPubkey,
           isDmChannel: isDmChannel,
           onSelect: onMentionSelect,
+          onSelectGroup: onMentionAllSelect,
         ),
       )
     : const SizedBox.shrink(key: ValueKey('no-suggestions'));
@@ -559,7 +561,8 @@ Future<_NonMemberMentionScan> _scanNonMemberMentions(
   );
 }
 
-/// The p-tags and `mention` reference tags an outgoing message should carry.
+/// The p-tags and extra non-notifying tags (`mention` references and the
+/// `@all` marker) an outgoing message should carry.
 ///
 /// Anyone who ends up *not* added is demoted from a p-tag to a reference tag so
 /// their name still renders without notifying a non-member — mirrors desktop's
@@ -573,6 +576,20 @@ class _OutgoingMentions {
     : pubkeys = LinkedHashSet<String>.from(
         selectedMentions.map((candidate) => candidate.pubkey.toLowerCase()),
       ).toList();
+
+  /// Adds the `@all` [recipients] and its marker tag. Returns the visible
+  /// error, adding nothing, when the merged audience exceeds the cap.
+  String? addMentionAll(List<String> recipients) {
+    final merged = <String>{
+      ...pubkeys,
+      for (final pubkey in recipients) pubkey.toLowerCase(),
+    }.toList();
+    final error = mentionAllCombinedCapError(merged.length);
+    if (error != null) return error;
+    pubkeys = merged;
+    referenceTags.add(mentionAllMarkerTag());
+    return null;
+  }
 
   void demote(Iterable<String> demoted) {
     final excluded = {for (final pubkey in demoted) pubkey.toLowerCase()};

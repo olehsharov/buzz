@@ -16,6 +16,7 @@ import 'package:video_player/video_player.dart';
 
 import '../../shared/clipboard_utils.dart';
 import '../../shared/mentions/mention_bindings.dart';
+import '../../shared/mentions/mention_group.dart';
 import '../../shared/mentions/mention_tags.dart';
 import '../../shared/deeplink/deep_link.dart';
 import '../../shared/deeplink/pending_deep_link_provider.dart';
@@ -170,11 +171,19 @@ class MessageContent extends HookConsumerWidget {
         context.textTheme.bodyMedium?.copyWith(color: context.colors.onSurface);
     final resolvedMentionNames = mentionNames;
     final signedMentionPubkeys = mentionedPubkeysFromTags(tags);
-    final mentionBindings = renderedMentionBindings(
+    final memberMentionBindings = renderedMentionBindings(
       content,
       mentionNames,
       signedMentionPubkeys,
     );
+    // The marker records that the sender resolved `@all` as the group, so it
+    // outranks a member alias "all". Without it the text is never promoted.
+    final mentionAll =
+        hasMentionAllMarker(tags) &&
+        containsMentionAllToken(content, memberMentionBindings.keys);
+    final mentionBindings = mentionAll
+        ? ({...memberMentionBindings}..remove(mentionGroupAll))
+        : memberMentionBindings;
     final resolvedAgentMentionPubkeys = {
       ...agentMentionPubkeys.map((pubkey) => pubkey.toLowerCase()),
     };
@@ -234,6 +243,7 @@ class MessageContent extends HookConsumerWidget {
         '${entry.key}\u0000${entry.value}',
       ...(resolvedAgentMentionPubkeys.toList()..sort()),
       ...(signedMentionPubkeys.toList()..sort()),
+      if (mentionAll) mentionGroupTag,
     ].join('\u0001');
 
     // Decided here rather than by the caller: this is where the event's own
@@ -302,6 +312,7 @@ class MessageContent extends HookConsumerWidget {
       mentionNames: resolvedMentionNames,
       mentionLabels: mentionLabels,
       bindings: mentionBindings,
+      mentionAll: mentionAll,
       agentPubkeys: resolvedAgentMentionPubkeys,
       channelNames: resolvedChannelNames,
       customEmoji: customEmoji,
@@ -863,6 +874,7 @@ class _MentionMd extends InlineMd {
   final Map<String, String> mentionNames;
   final Map<String, String> mentionLabels;
   final Set<String> agentMentionPubkeys;
+  final bool mentionAll;
   final void Function(String pubkey)? onMentionTap;
   late final RegExp _exp = _buildPrefixPattern(
     prefix: '@',
@@ -876,6 +888,7 @@ class _MentionMd extends InlineMd {
     required this.mentionNames,
     required this.mentionLabels,
     required this.agentMentionPubkeys,
+    this.mentionAll = false,
     this.onMentionTap,
   });
 
@@ -891,6 +904,22 @@ class _MentionMd extends InlineMd {
     final raw = exp.firstMatch(text.trim())?.group(0);
     if (raw == null) {
       return TextSpan(text: text, style: config.style);
+    }
+
+    if (mentionAll && raw == mentionAllToken) {
+      // One pill for the whole channel audience, never the expanded
+      // recipients. Not a profile target, so it is not tappable.
+      return WidgetSpan(
+        alignment: PlaceholderAlignment.baseline,
+        baseline: TextBaseline.alphabetic,
+        child: _MentionPill(
+          label: mentionGroupAll,
+          semanticsLabel: '$mentionAllToken, everyone in this channel',
+          isAgent: false,
+          isGroup: true,
+          textStyle: config.style,
+        ),
+      );
     }
 
     final name = raw.substring(1).replaceAll('\u00A0', ' ').toLowerCase();
@@ -931,12 +960,17 @@ class _MentionPill extends StatelessWidget {
   final String label;
   final String? semanticsLabel;
   final bool isAgent;
+
+  /// The `@all` group pill: a group icon, and one semantics label that owns
+  /// the whole chip.
+  final bool isGroup;
   final TextStyle? textStyle;
 
   const _MentionPill({
     required this.label,
     this.semanticsLabel,
     required this.isAgent,
+    this.isGroup = false,
     this.textStyle,
   });
 
@@ -955,7 +989,8 @@ class _MentionPill extends StatelessWidget {
         );
     final fontSize = style.fontSize ?? 16;
 
-    return Container(
+    final pill = Container(
+      key: isGroup ? const ValueKey('mention-group-pill') : null,
       padding: const EdgeInsets.fromLTRB(
         Grid.half,
         Grid.quarter + 1,
@@ -970,9 +1005,9 @@ class _MentionPill extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.center,
         children: [
-          if (isAgent) ...[
+          if (isAgent || isGroup) ...[
             Icon(
-              LucideIcons.bot,
+              isGroup ? LucideIcons.users : LucideIcons.bot,
               size: fontSize * 0.95,
               color: context.colors.primary,
             ),
@@ -987,6 +1022,13 @@ class _MentionPill extends StatelessWidget {
           ),
         ],
       ),
+    );
+    if (!isGroup) return pill;
+    return Semantics(
+      container: true,
+      label: semanticsLabel,
+      excludeSemantics: true,
+      child: pill,
     );
   }
 }
