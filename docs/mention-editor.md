@@ -188,6 +188,17 @@ shows `@all` disabled with its reason on every modality, and send re-resolves
 the roster freshly before any side effect, blocking with a visible error that
 keeps the draft. The same holds when `@all` plus other mentions exceeds 50.
 
+Mobile (`mobile/lib/shared/mentions/mention_group.dart`,
+`mobile/lib/features/channels/mentions/mention_all_audience.dart`) follows the
+same picker, wire, cap, send-time roster refresh, ambiguity and rendering
+rules in every `ComposeBar` (channel, thread, forum post and reply). Its
+recipients match the CLI rather than desktop: mobile has no per-member agent
+mention eligibility (every channel member, agents included, is already a
+first-class mention candidate there), so `@all` tags every member except the
+sender. Mobile edits use a plain edit sheet with no picker, so they never offer
+or resolve `@all`; the timeline keeps the original send's marker for an edited
+body.
+
 Coverage: `mentionAll.test.mjs` (audience and agent eligibility, grammar,
 candidate, rendering decision, wire routing, forwarding),
 `agentMentionRevalidation.test.mjs` (send-time skip mode),
