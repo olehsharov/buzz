@@ -77,6 +77,7 @@ import {
   MENTION_GROUP_ALL,
 } from "@/shared/lib/mentionGroup";
 import {
+  MENTION_ALL_AGENT_DIRECTORY_ERROR,
   MENTION_ALL_AMBIGUOUS_ERROR,
   type MentionAllSendResolution,
   mentionAllSendResolution,
@@ -327,11 +328,12 @@ export function useMentions(
   const mentionAllAudience = React.useMemo(
     () =>
       resolveMentionAllAudience({
+        admittedAgentPubkeys: mentionableAgentPubkeys,
         agentPubkeys: agentIdentityPubkeys,
         currentPubkey,
         members,
       }),
-    [agentIdentityPubkeys, currentPubkey, members],
+    [agentIdentityPubkeys, currentPubkey, members, mentionableAgentPubkeys],
   );
   const mentionCandidatesWithTeams = React.useMemo(
     () => [
@@ -901,28 +903,61 @@ export function useMentions(
           freshMembers = undefined;
         }
       }
+      if (!freshMembers || !currentPubkey) {
+        return mentionAllSendResolution({ status: "loading" });
+      }
+      // Recompute agent identity and mention eligibility from fresh evidence:
+      // the roster and the agent directories can both have changed.
+      const agentPubkeys = new Set([
+        ...agentIdentityPubkeys,
+        ...getAgentIdentityPubkeys({
+          managedAgentPubkeys,
+          relayAgents: relayAgentsQuery.data ?? [],
+          members: freshMembers,
+          profileIsAgent: (pubkey) => profiles?.[pubkey]?.isAgent === true,
+        }),
+      ]);
+      let eligiblePubkeys: Set<string>;
+      try {
+        const eligible = await revalidateMentionPubkeys(
+          freshMembers.map((member) => member.pubkey),
+          mentionChannelId,
+          {
+            phase: "publish",
+            intendedAgentPubkeys: [...agentPubkeys],
+            skipIneligibleAgents: true,
+          },
+        );
+        eligiblePubkeys = new Set(eligible.map(normalizePubkey));
+      } catch {
+        return {
+          status: "blocked",
+          message: MENTION_ALL_AGENT_DIRECTORY_ERROR,
+        };
+      }
       return mentionAllSendResolution(
         resolveMentionAllAudience({
-          agentPubkeys: getAgentIdentityPubkeys({
-            managedAgentPubkeys,
-            relayAgents: relayAgentsQuery.data ?? [],
-            members: freshMembers ?? [],
-            profileIsAgent: (pubkey) => profiles?.[pubkey]?.isAgent === true,
-          }),
+          admittedAgentPubkeys: new Set(
+            [...agentPubkeys].filter((pubkey) => eligiblePubkeys.has(pubkey)),
+          ),
+          agentPubkeys,
           currentPubkey,
           members: freshMembers,
         }),
       );
     },
     [
+      agentIdentityPubkeys,
       currentPubkey,
       externalMembers,
       managedAgentPubkeys,
       mentionAllEnabled,
       mentionCandidates,
+      mentionChannelId,
       profiles,
       refetchMembers,
       relayAgentsQuery.data,
+      revalidateMentionPubkeys,
     ],
   );
   const cancelMentionAutocomplete = React.useCallback(() => {

@@ -2,10 +2,21 @@ import { expect, test, type Page } from "@playwright/test";
 import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
 
-// `general` roster: the viewer (owner), Alice (an agent in the mock
-// directory), Bob, and a member whose profile alone marks it as an agent.
-// `@all` must reach exactly the one human besides the sender.
-const HUMANS = [TEST_IDENTITIES.bob.pubkey];
+// `general` roster: the viewer (owner), Alice (a relay agent that answers
+// anyone in `general`), Bob, and "mira", a member whose profile alone marks it
+// as an agent and that no agent directory lets the viewer mention. `@all`
+// reaches every person plus every agent the sender may mention: Alice and Bob.
+const GENERAL_RECIPIENTS = [
+  TEST_IDENTITIES.alice.pubkey,
+  TEST_IDENTITIES.bob.pubkey,
+];
+// `agents` roster: the viewer (owner), Charlie (`bot` role, a relay agent
+// registered only in `general`, so it cannot answer here) and "nadia", seeded
+// below as a relay agent the viewer owns in `agents`. Only nadia is tagged.
+const OWNED_RELAY_AGENT =
+  "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00";
+const VIEWER = "deadbeef".repeat(8);
+const AGENTS_RECIPIENTS = [OWNED_RELAY_AGENT];
 const MARKER = ["buzz:mention-group", "all"];
 const OUT = "test-results/mention-all";
 
@@ -44,17 +55,22 @@ async function sent(page: Page, content: string): Promise<SentEvent[]> {
   }, content);
 }
 
-async function open(page: Page, channel: string, extra?: string[]) {
-  await installMockBridge(
-    page,
-    extra ? { extraChannelMembers: { [channel]: extra } } : undefined,
-  );
+async function open(
+  page: Page,
+  channel: string,
+  extra?: string[],
+  bridge?: Parameters<typeof installMockBridge>[1],
+) {
+  await installMockBridge(page, {
+    ...bridge,
+    ...(extra ? { extraChannelMembers: { [channel]: extra } } : {}),
+  });
   await page.goto("/");
   await page.getByTestId(`channel-${channel}`).click();
   await expect(page.getByTestId("chat-title")).toHaveText(channel);
 }
 
-test("picking @all notifies every human member and renders one pill", async ({
+test("picking @all notifies every person and eligible agent, and renders one pill", async ({
   page,
 }) => {
   await open(page, "general");
@@ -64,9 +80,9 @@ test("picking @all notifies every human member and renders one pill", async ({
   const option = page.getByTestId("mention-suggestion-group-all");
   await expect(option).toBeVisible();
   await expect(option).toContainText("@all");
-  await expect(option).toContainText("Notify 1 person in this channel");
+  await expect(option).toContainText("Notify 2 members in this channel");
   await expect(option.getByRole("button")).toHaveAccessibleName(
-    "Mention @all: Notify 1 person in this channel",
+    "Mention @all: Notify 2 members in this channel",
   );
   await waitForAnimations(page);
   await page
@@ -81,7 +97,9 @@ test("picking @all notifies every human member and renders one pill", async ({
 
   await expect
     .poll(() => sent(page, content))
-    .toEqual([expect.objectContaining({ pubkeys: [...HUMANS].sort() })]);
+    .toEqual([
+      expect.objectContaining({ pubkeys: [...GENERAL_RECIPIENTS].sort() }),
+    ]);
   const [event] = await sent(page, content);
   expect(event.tags.filter((tag) => tag[0] === MARKER[0])).toEqual([MARKER]);
 
@@ -142,13 +160,50 @@ test("a typed @all resolves to the group like a picked one", async ({
   await page.getByTestId("send-message").click();
   await expect
     .poll(() => sent(page, "@all typed hello"))
-    .toEqual([expect.objectContaining({ pubkeys: [...HUMANS].sort() })]);
+    .toEqual([
+      expect.objectContaining({ pubkeys: [...GENERAL_RECIPIENTS].sort() }),
+    ]);
+});
+
+test("@all in a channel of agents tags the eligible ones and skips the rest", async ({
+  page,
+}) => {
+  await open(page, "agents", undefined, {
+    relayAgents: [
+      {
+        pubkey: OWNED_RELAY_AGENT,
+        name: "nadia",
+        ownerPubkey: VIEWER,
+        respondTo: "owner-only",
+        channelNames: ["agents"],
+      },
+    ],
+  });
+  const input = page.getByTestId("message-input");
+  await input.click();
+  await page.keyboard.type("@al");
+  const option = page.getByTestId("mention-suggestion-group-all");
+  await expect(option).toContainText("Notify 1 member in this channel");
+  await expect(option.getByRole("button")).not.toHaveAttribute(
+    "aria-disabled",
+    "true",
+  );
+  await input.fill("@all agents sync");
+  await input.press("Escape");
+  await page.getByTestId("send-message").click();
+  await expect
+    .poll(() => sent(page, "@all agents sync"))
+    .toEqual([
+      expect.objectContaining({ pubkeys: [...AGENTS_RECIPIENTS].sort() }),
+    ]);
+  const [event] = await sent(page, "@all agents sync");
+  expect(event.tags.filter((tag) => tag[0] === MARKER[0])).toEqual([MARKER]);
 });
 
 test("@all over the cap is disabled with a reason and blocks typed sends", async ({
   page,
 }) => {
-  // 50 extra humans + Bob = 51 people besides the sender.
+  // 50 extra members + Alice and Bob = 52 besides the sender.
   const extra = Array.from({ length: 50 }, (_, index) =>
     (index + 1).toString(16).padStart(64, "7"),
   );
@@ -157,9 +212,7 @@ test("@all over the cap is disabled with a reason and blocks typed sends", async
   await input.click();
   await page.keyboard.type("@al");
   const option = page.getByTestId("mention-suggestion-group-all");
-  await expect(option).toContainText(
-    "@all is limited to channels with up to 50 people",
-  );
+  await expect(option).toContainText("@all can notify at most 50 members");
   const button = option.getByRole("button");
   await expect(button).toHaveAttribute("aria-disabled", "true");
   // aria-disabled is not native `disabled`: force the pointer press through
@@ -190,7 +243,7 @@ test("@all over the cap is disabled with a reason and blocks typed sends", async
   await expect(
     page
       .getByText(
-        "@all is limited to channels with up to 50 people. This channel has 51.",
+        "@all can notify at most 50 members. This channel has 52 besides you.",
       )
       .first(),
   ).toBeVisible();
@@ -215,9 +268,7 @@ test("a large roster still lists @all first on @a, @al and @all", async ({
     await expect(option).toBeInViewport();
     await expect(option).toHaveAttribute("data-mention-suggestion-index", "0");
   }
-  await expect(option).toContainText(
-    "@all is limited to channels with up to 50 people",
-  );
+  await expect(option).toContainText("@all can notify at most 50 members");
 });
 
 test("DMs never offer @all", async ({ page }) => {

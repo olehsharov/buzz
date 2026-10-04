@@ -14,6 +14,10 @@ import {
   mentionAllSendResolution,
   resolveMentionAllAudience,
 } from "./mentionAllAudience.ts";
+import {
+  getAgentIdentityPubkeys,
+  getMentionableAgentPubkeys,
+} from "../../agents/lib/agentAutocompleteEligibility.ts";
 import { buildMentionAllCandidate } from "./mentionCandidates.ts";
 import { rankMentionCandidates } from "./mentionRanking.ts";
 import { mapMentionCandidateToSuggestion } from "./mentionSuggestionMapping.ts";
@@ -26,78 +30,154 @@ const BOB = "c".repeat(64);
 const AGENT = "d".repeat(64);
 const MARKER = ["buzz:mention-group", "all"];
 
-const humans = (count) =>
+const members = (count) =>
   Array.from({ length: count }, (_, index) => ({
     pubkey: index.toString(16).padStart(64, "f"),
   }));
 
 // ── Audience ───────────────────────────────────────────────────────────
 
-test("@all resolves to every human member except the sender, deduped and lowercased", () => {
-  const audience = resolveMentionAllAudience({
-    agentPubkeys: new Set([AGENT]),
-    currentPubkey: ME.toUpperCase(),
+const CHANNEL = "chan";
+const OTHER_OWNER = "e".repeat(64);
+const relayAgent = (pubkey, overrides = {}) => ({
+  pubkey,
+  ownerPubkey: OTHER_OWNER,
+  respondTo: "anyone",
+  respondToAllowlist: [],
+  channelIds: [CHANNEL],
+  ...overrides,
+});
+
+// The audience as the composer computes it: agent identity and mention
+// eligibility come from the same helpers the picker and send revalidation use.
+function audienceFor({
+  currentPubkey = ME,
+  members: roster,
+  managed = [],
+  relayAgents = [],
+}) {
+  const managedAgentPubkeys = new Set(managed);
+  return resolveMentionAllAudience({
+    admittedAgentPubkeys: getMentionableAgentPubkeys({
+      currentPubkey,
+      eligibilityScope: { type: "channel", channelId: CHANNEL },
+      phase: "publish",
+      managedAgentPubkeys,
+      relayAgents,
+      sharedChannelIds: new Set([CHANNEL]),
+    }),
+    agentPubkeys: getAgentIdentityPubkeys({
+      managedAgentPubkeys,
+      relayAgents,
+      members: roster ?? [],
+      profileIsAgent: () => false,
+    }),
+    currentPubkey,
+    members: roster,
+  });
+}
+
+test("@all resolves to every member except the sender, deduped and lowercased", () => {
+  assert.deepEqual(
+    audienceFor({
+      currentPubkey: ME.toUpperCase(),
+      members: [
+        { pubkey: ME },
+        { pubkey: ALICE.toUpperCase() },
+        { pubkey: ALICE },
+        { pubkey: BOB },
+      ],
+    }),
+    { status: "available", recipients: [ALICE, BOB] },
+  );
+});
+
+test("@all tags every agent the owner manages: owner plus 5 agents", () => {
+  const agents = Array.from({ length: 5 }, (_, index) =>
+    index.toString(16).padStart(64, "9"),
+  );
+  assert.deepEqual(
+    audienceFor({
+      members: [{ pubkey: ME }, ...agents.map((pubkey) => ({ pubkey }))],
+      managed: agents,
+    }),
+    { status: "available", recipients: agents },
+  );
+});
+
+test("@all includes an eligible relay agent and skips one that would not answer", () => {
+  const ineligible = "8".repeat(64);
+  const audience = audienceFor({
     members: [
       { pubkey: ME },
-      { pubkey: ALICE.toUpperCase() },
-      { pubkey: ALICE },
       { pubkey: BOB },
       { pubkey: AGENT },
+      { pubkey: ineligible, role: "bot" },
+    ],
+    relayAgents: [
+      relayAgent(AGENT),
+      relayAgent(ineligible, { respondTo: "owner-only" }),
     ],
   });
-  assert.deepEqual(audience, { status: "available", recipients: [ALICE, BOB] });
+  assert.deepEqual(audience, { status: "available", recipients: [BOB, AGENT] });
+});
+
+test("@all with only ineligible agents besides the sender is empty, not blocked by them", () => {
+  assert.deepEqual(
+    audienceFor({
+      members: [{ pubkey: ME }, { pubkey: AGENT, role: "bot" }],
+      relayAgents: [relayAgent(AGENT, { channelIds: ["elsewhere"] })],
+    }),
+    { status: "empty" },
+  );
 });
 
 test("@all is available at the cap and over-cap one past it, never truncated", () => {
-  const at = resolveMentionAllAudience({
-    agentPubkeys: new Set(),
-    currentPubkey: ME,
-    members: [{ pubkey: ME }, ...humans(MENTION_ALL_RECIPIENT_CAP)],
+  const at = audienceFor({
+    members: [{ pubkey: ME }, ...members(MENTION_ALL_RECIPIENT_CAP)],
   });
   assert.equal(at.status, "available");
   assert.equal(at.recipients.length, 50);
-  const over = resolveMentionAllAudience({
-    agentPubkeys: new Set(),
-    currentPubkey: ME,
-    members: [{ pubkey: ME }, ...humans(MENTION_ALL_RECIPIENT_CAP + 1)],
-  });
-  assert.deepEqual(over, { status: "over-cap", count: 51 });
+  assert.deepEqual(
+    audienceFor({
+      members: [{ pubkey: ME }, ...members(MENTION_ALL_RECIPIENT_CAP + 1)],
+    }),
+    { status: "over-cap", count: 51 },
+  );
 });
 
-test("agents do not count toward the cap and never become recipients", () => {
-  const agents = Array.from({ length: 10 }, (_, index) => ({
-    pubkey: index.toString(16).padStart(64, "9"),
-  }));
-  const audience = resolveMentionAllAudience({
-    agentPubkeys: new Set(agents.map((agent) => agent.pubkey)),
-    currentPubkey: ME,
-    members: [...humans(45), ...agents],
-  });
-  assert.equal(audience.status, "available");
-  assert.equal(audience.recipients.length, 45);
+test("eligible agents count toward the cap; skipped agents do not", () => {
+  const agents = Array.from({ length: 5 }, (_, index) =>
+    index.toString(16).padStart(64, "9"),
+  );
+  const roster = [...members(45), ...agents.map((pubkey) => ({ pubkey }))];
   assert.equal(
-    audience.recipients.some((pubkey) => pubkey.startsWith("9")),
-    false,
+    audienceFor({ members: roster, managed: agents }).status,
+    "available",
+  );
+  const extra = "7".repeat(64);
+  assert.deepEqual(
+    audienceFor({
+      members: [...roster, { pubkey: extra }],
+      managed: agents,
+    }),
+    { status: "over-cap", count: 51 },
+  );
+  assert.equal(
+    audienceFor({
+      members: [...roster, { pubkey: extra, role: "bot" }],
+      managed: agents,
+    }).status,
+    "available",
   );
 });
 
 test("@all with nobody else or an unloaded roster is unavailable", () => {
   assert.deepEqual(
-    resolveMentionAllAudience({
-      agentPubkeys: new Set([AGENT]),
-      currentPubkey: ME,
-      members: [{ pubkey: ME }, { pubkey: AGENT }],
-    }),
+    audienceFor({ members: [{ pubkey: ME }, { pubkey: ME.toUpperCase() }] }),
     { status: "empty" },
   );
-  assert.deepEqual(
-    resolveMentionAllAudience({
-      agentPubkeys: new Set(),
-      currentPubkey: ME,
-      members: undefined,
-    }),
-    { status: "loading" },
-  );
+  assert.deepEqual(audienceFor({ members: undefined }), { status: "loading" });
 });
 
 test("send resolution blocks every non-available audience with a reason", () => {
@@ -109,7 +189,7 @@ test("send resolution blocks every non-available audience with a reason", () => 
     mentionAllSendResolution({ status: "over-cap", count: 51 }),
     {
       status: "blocked",
-      message: `${MENTION_ALL_OVER_CAP_REASON}. This channel has 51.`,
+      message: `${MENTION_ALL_OVER_CAP_REASON}. This channel has 51 besides you.`,
     },
   );
   assert.equal(mentionAllSendResolution({ status: "empty" }).status, "blocked");
@@ -139,14 +219,14 @@ test("send plan adds the marker and enforces the combined cap", () => {
     }),
     { recipients: [], tags: [] },
   );
-  const fifty = humans(50).map((member) => member.pubkey);
+  const fifty = members(50).map((member) => member.pubkey);
   assert.match(
     planMentionAllSend({
       otherRecipientPubkeys: [],
       pendingPersonaCount: 1,
       resolution: { status: "resolved", recipients: fifty },
     }).error,
-    /would notify 51 people/,
+    /would notify 51 recipients/,
   );
   // Recipients already in the group do not double-count.
   assert.equal(
@@ -205,10 +285,7 @@ test("@all candidate carries count, or a disabled reason over the cap", () => {
     channelType: "stream",
     label: "all",
   });
-  assert.equal(
-    over.disabledReason,
-    "@all is limited to channels with up to 50 people",
-  );
+  assert.equal(over.disabledReason, "@all can notify at most 50 members");
   assert.equal(
     buildMentionAllCandidate({ status: "empty" }).disabledReason,
     MENTION_ALL_EMPTY_REASON,

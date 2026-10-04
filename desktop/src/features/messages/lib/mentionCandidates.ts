@@ -56,7 +56,7 @@ export type MentionCandidate = {
   isGlobalSearchResult?: boolean;
   /** Group mentions only: why the entry is shown but cannot be picked. */
   disabledReason?: string | null;
-  /** Group mentions only: how many people selecting it would notify. */
+  /** Group mentions only: how many members selecting it would notify. */
   groupRecipientCount?: number;
 };
 
@@ -171,7 +171,7 @@ export function formatTeamMention(
 
 /**
  * The `@all` autocomplete entry. It is always listed in a channel composer so
- * an unavailable state (too many people, nobody to notify, roster loading) is
+ * an unavailable state (too many members, nobody to notify, roster loading) is
  * explained rather than silently missing.
  */
 export function buildMentionAllCandidate(

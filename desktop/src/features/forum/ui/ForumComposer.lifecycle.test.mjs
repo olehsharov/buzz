@@ -584,7 +584,7 @@ for (const action of ["navigation", "return", "edit", "unmount"]) {
 const ALICE = "c".repeat(64);
 const BOB = "d".repeat(64);
 
-test("forum @all publishes the resolved humans plus the group marker", async () => {
+test("forum @all publishes the resolved recipients plus the group marker", async () => {
   const s = await setup();
   s.control.mentionAll = { status: "resolved", recipients: [ALICE, BOB] };
   s.edit("@all standup moved", []);
@@ -605,14 +605,14 @@ test("forum @all blocked at send keeps the draft and publishes nothing", async (
   s.control.mentionAll = {
     status: "blocked",
     message:
-      "@all is limited to channels with up to 50 people. This channel has 51.",
+      "@all can notify at most 50 members. This channel has 51 besides you.",
   };
   s.edit("@all standup moved", []);
   await s.submit();
   assert.equal(s.calls.filter((call) => call[0] === "send").length, 0);
   assert.deepEqual(
     s.calls.filter((call) => call[0] === "error").map((call) => call[1]),
-    ["@all is limited to channels with up to 50 people. This channel has 51."],
+    ["@all can notify at most 50 members. This channel has 51 besides you."],
   );
   assert.equal(s.text, "@all standup moved");
 });

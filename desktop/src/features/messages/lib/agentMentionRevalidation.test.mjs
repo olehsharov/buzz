@@ -3,7 +3,9 @@ import test from "node:test";
 
 import {
   revalidateAgentMentionPubkeys,
+  filterEligibleAgentMentionPubkeys,
   AgentMentionAuthorizationError,
+  AgentMentionDirectoryError,
 } from "./agentMentionRevalidation.ts";
 
 const CURRENT = "a".repeat(64);
@@ -215,5 +217,72 @@ test("publication cannot authorize a DM that still has no destination", async ()
       ],
     }),
     AgentMentionAuthorizationError,
+  );
+});
+
+// ── Skip mode (`@all`) ────────────────────────────────────────────────
+
+const OTHER_OWNER = "f".repeat(64);
+const SILENT_AGENT = "d".repeat(64);
+
+function mixedChannel() {
+  return {
+    ...options(),
+    pubkeys: [HUMAN, AGENT, SILENT_AGENT, LOCAL_AGENT],
+    agentPubkeys: new Set([AGENT, SILENT_AGENT, LOCAL_AGENT]),
+    refetchManagedAgents: async () => ({
+      data: [{ pubkey: LOCAL_AGENT }],
+      error: null,
+    }),
+    fetchRelayAgents: async () => [
+      {
+        pubkey: AGENT,
+        respondTo: "anyone",
+        respondToAllowlist: [],
+        channelIds: ["general"],
+      },
+      {
+        pubkey: SILENT_AGENT,
+        ownerPubkey: OTHER_OWNER,
+        respondTo: "owner-only",
+        respondToAllowlist: [],
+        channelIds: ["general"],
+      },
+    ],
+  };
+}
+
+test("skip mode keeps eligible agents and drops one that would not answer", async () => {
+  assert.deepEqual(await filterEligibleAgentMentionPubkeys(mixedChannel()), [
+    HUMAN,
+    AGENT,
+    LOCAL_AGENT,
+  ]);
+  // The strict pass over the same input still fails closed.
+  await assert.rejects(
+    revalidateAgentMentionPubkeys(mixedChannel()),
+    AgentMentionAuthorizationError,
+  );
+});
+
+test("skip mode fails closed when a directory outage could hide an eligible agent", async () => {
+  await assert.rejects(
+    filterEligibleAgentMentionPubkeys({
+      ...mixedChannel(),
+      fetchRelayAgents: async () => {
+        throw new Error("relay directory unavailable");
+      },
+    }),
+    AgentMentionDirectoryError,
+  );
+  await assert.rejects(
+    filterEligibleAgentMentionPubkeys({
+      ...mixedChannel(),
+      refetchManagedAgents: async () => ({
+        data: undefined,
+        error: new Error("runtime unavailable"),
+      }),
+    }),
+    AgentMentionDirectoryError,
   );
 });

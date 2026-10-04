@@ -33,7 +33,7 @@ export type MentionSuggestion = {
   role?: string | null;
   /** Shown but not selectable (e.g. `@all` in a channel over the cap). */
   disabledReason?: string | null;
-  /** `@all` only: how many people selecting it would notify. */
+  /** `@all` only: how many members selecting it would notify. */
   groupRecipientCount?: number;
 };
 
@@ -63,7 +63,7 @@ type MentionAutocompleteProps = {
 
 /** Visible + accessible summary for an available `@all` entry. */
 export function formatGroupMentionSummary(count: number): string {
-  return `Notify ${count} ${count === 1 ? "person" : "people"} in this channel`;
+  return `Notify ${count} ${count === 1 ? "member" : "members"} in this channel`;
 }
 
 export function showMentionAgentProvenanceMarker(
