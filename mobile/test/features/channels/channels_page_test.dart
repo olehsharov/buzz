@@ -2323,12 +2323,7 @@ void main() {
       ),
     ];
     final readState = _FakeReadStateNotifier(
-      const ReadStateState(
-        isReady: true,
-        pubkey: 'pk',
-        contexts: {'1': 10},
-        version: 0,
-      ),
+      const ReadStateState(isReady: true, pubkey: 'pk', contexts: {'1': 10}),
     );
 
     await tester.pumpWidget(
@@ -2387,12 +2382,7 @@ void main() {
       ),
     ];
     final readState = _FakeReadStateNotifier(
-      const ReadStateState(
-        isReady: true,
-        pubkey: 'pk',
-        contexts: {'1': 10},
-        version: 0,
-      ),
+      const ReadStateState(isReady: true, pubkey: 'pk', contexts: {'1': 10}),
     );
 
     await tester.pumpWidget(
@@ -2450,12 +2440,7 @@ void main() {
       ),
     ];
     final readState = _FakeReadStateNotifier(
-      const ReadStateState(
-        isReady: true,
-        pubkey: 'pk',
-        contexts: {},
-        version: 0,
-      ),
+      const ReadStateState(isReady: true, pubkey: 'pk', contexts: {}),
     );
 
     await tester.pumpWidget(
@@ -2497,12 +2482,7 @@ void main() {
       ),
     ];
     final readState = _FakeReadStateNotifier(
-      const ReadStateState(
-        isReady: false,
-        pubkey: 'pk',
-        contexts: {},
-        version: 0,
-      ),
+      const ReadStateState(isReady: false, pubkey: 'pk', contexts: {}),
     );
 
     await tester.pumpWidget(
@@ -2773,7 +2753,6 @@ class _FakeReadStateNotifier extends ReadStateNotifier {
       isReady: true,
       pubkey: state.pubkey,
       contexts: state.contexts,
-      version: state.version + 1,
       forcedUnreadContexts: state.forcedUnreadContexts,
     );
   }

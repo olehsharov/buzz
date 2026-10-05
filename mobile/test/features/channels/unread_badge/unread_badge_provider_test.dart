@@ -76,7 +76,6 @@ void main() {
               isReady: readStateReady,
               pubkey: 'me',
               contexts: readContexts,
-              version: 1,
               forcedUnreadContexts: forcedUnreadContexts,
             ),
           ),
@@ -339,12 +338,7 @@ void main() {
         channelsProvider.overrideWith(() => _LoadingChannelsNotifier()),
         readStateProvider.overrideWith(
           () => _ReadStateNotifier(
-            const ReadStateState(
-              isReady: true,
-              pubkey: 'me',
-              contexts: {},
-              version: 1,
-            ),
+            const ReadStateState(isReady: true, pubkey: 'me', contexts: {}),
           ),
         ),
       ],

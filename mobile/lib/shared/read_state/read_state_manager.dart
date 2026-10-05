@@ -134,8 +134,11 @@ class ReadStateManager {
     await _publish();
   }
 
-  Future<void> reinitializeRemote() async {
-    if (_disposed || !_remoteEnabled || !_initialized) return;
+  /// Re-fetch remote state and restart the live subscription after a
+  /// reconnect. Returns whether the refresh ran: it is skipped before
+  /// [initialize] has started, since that first pass fetches on its own.
+  Future<bool> reinitializeRemote() async {
+    if (_disposed || !_remoteEnabled || !_initialized) return false;
     debugPrint('[ReadStateManager] reinitializeRemote');
     if (_isPublishing) {
       await _publishCompleter?.future;
@@ -148,6 +151,7 @@ class ReadStateManager {
       _schedulePublish();
     }
     _onChanged();
+    return true;
   }
 
   void dispose({bool flushPending = true}) {
@@ -284,6 +288,9 @@ class ReadStateManager {
         unsub.call();
         return;
       }
+      // initialize() and a reconnect refresh can overlap; the later
+      // subscription supersedes the earlier one so only one stays live.
+      _unsubscribeLive?.call();
       _unsubscribeLive = unsub;
       debugPrint('[ReadStateManager] live subscription established');
     } catch (e) {

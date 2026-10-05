@@ -1999,12 +1999,7 @@ void main() {
           ],
           relaySessionNotifier: relaySession,
           readStateNotifier: _SynchronousReadStateNotifier(
-            const ReadStateState(
-              isReady: false,
-              pubkey: 'self',
-              contexts: {},
-              version: 0,
-            ),
+            const ReadStateState(isReady: false, pubkey: 'self', contexts: {}),
           ),
         ),
       );
@@ -2159,12 +2154,7 @@ void main() {
 
     testWidgets('defers read-state mark until after build', (tester) async {
       final readState = _SynchronousReadStateNotifier(
-        const ReadStateState(
-          isReady: true,
-          pubkey: 'self',
-          contexts: {},
-          version: 0,
-        ),
+        const ReadStateState(isReady: true, pubkey: 'self', contexts: {}),
       );
 
       await tester.pumpWidget(
@@ -3997,7 +3987,6 @@ void main() {
           isReady: true,
           pubkey: 'self',
           contexts: {_channelId: 1020},
-          version: 0,
         ),
       );
 
@@ -4098,7 +4087,6 @@ void main() {
           isReady: true,
           pubkey: 'self',
           contexts: {_channelId: 1020},
-          version: 0,
         ),
       );
 
@@ -4170,7 +4158,6 @@ void main() {
           isReady: true,
           pubkey: 'self',
           contexts: {_channelId: 1020},
-          version: 0,
         ),
       );
 
@@ -4241,12 +4228,7 @@ void main() {
         },
       );
       final readState = _SynchronousReadStateNotifier(
-        const ReadStateState(
-          isReady: true,
-          pubkey: 'self',
-          contexts: {},
-          version: 0,
-        ),
+        const ReadStateState(isReady: true, pubkey: 'self', contexts: {}),
       );
 
       await tester.pumpWidget(
@@ -4300,7 +4282,6 @@ void main() {
           isReady: true,
           pubkey: 'self',
           contexts: {_channelId: 1020},
-          version: 0,
           forcedUnreadContexts: {_channelId: _channelId},
         ),
       );
@@ -4371,7 +4352,6 @@ void main() {
           isReady: true,
           pubkey: 'self',
           contexts: {_channelId: 1020},
-          version: 0,
         ),
       );
 
@@ -4442,7 +4422,6 @@ void main() {
           isReady: true,
           pubkey: 'self',
           contexts: {_channelId: 1020},
-          version: 0,
           forcedUnreadContexts: {'msg:msg75': _channelId},
         ),
       );
@@ -4486,7 +4465,6 @@ void main() {
           isReady: true,
           pubkey: 'self',
           contexts: {_channelId: 2000},
-          version: 0,
           forcedUnreadContexts: {
             'msg:msg20': _channelId,
             'msg:msg5': _channelId,
@@ -4541,7 +4519,6 @@ void main() {
           isReady: true,
           pubkey: 'self',
           contexts: {_channelId: 1000},
-          version: 0,
         ),
       );
 
@@ -5491,7 +5468,6 @@ void main() {
             isReady: true,
             pubkey: 'self',
             contexts: {_channelId: 1004},
-            version: 0,
           ),
         );
 

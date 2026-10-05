@@ -9,7 +9,6 @@ ReadStateState _state(
   isReady: true,
   pubkey: 'pk',
   contexts: contexts,
-  version: 1,
   forcedUnreadContexts: forced,
 );
 
