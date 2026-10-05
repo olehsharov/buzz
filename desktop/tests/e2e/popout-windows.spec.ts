@@ -110,6 +110,13 @@ test.describe("main window openers", () => {
 
     await expectPointerModalitiesOpen(page, row, `/channels/${ENGINEERING_ID}`);
 
+    // Keyboard: Cmd/Ctrl+Enter on the focused row.
+    await clearCommandLog(page);
+    await row.focus();
+    await page.keyboard.press(`${await primaryModifier(page)}+Enter`);
+    await expectPopoutRequest(page, `/channels/${ENGINEERING_ID}`);
+    expect(page.url()).not.toContain(ENGINEERING_ID);
+
     await clearCommandLog(page);
     await row.click();
     await expect(page).toHaveURL(new RegExp(`#/channels/${ENGINEERING_ID}$`));

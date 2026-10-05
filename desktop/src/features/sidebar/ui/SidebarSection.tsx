@@ -305,6 +305,9 @@ export function ChannelMenuButton({
         if (newWindow.handleClick(event)) return;
         onSelectChannel(channel.id);
       }}
+      onKeyDown={(event) => {
+        newWindow.handleKeyDown(event);
+      }}
       {...newWindow.pointerProps}
       tooltip={resolvedLabel}
       type="button"
