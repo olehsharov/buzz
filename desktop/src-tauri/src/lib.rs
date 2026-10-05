@@ -37,6 +37,7 @@ mod nostr_bind;
 pub mod nostr_convert;
 mod observed_unread;
 mod persona_catalog;
+mod popout;
 mod prevent_sleep;
 mod ptt_shortcut;
 mod relay;
@@ -143,11 +144,21 @@ pub fn run() {
                 // Visibility is excluded: the native reveal plugin below
                 // shows the window after saved geometry has been restored.
                 .with_state_flags(StateFlags::all() & !StateFlags::VISIBLE)
+                // Only the main window keeps saved geometry. Pop-out and huddle
+                // windows have per-instance labels that would otherwise pile up
+                // in the state file forever.
+                .with_filter(popout::persists_window_state)
                 .build(),
         )
         .plugin(
             tauri::plugin::Builder::<_, ()>::new("initial-window-reveal")
                 .on_webview_ready(|webview| {
+                    if popout::is_popout_label(webview.label()) {
+                        // Pop-outs host the same composer (voice notes) as
+                        // the main window; they are revealed by their builder.
+                        linux_media::enable_media_capture(&webview);
+                        return;
+                    }
                     if webview.label() != "main" {
                         return;
                     }
@@ -236,6 +247,7 @@ pub fn run() {
         .manage(native_relay_client::NativeRelayClient::default())
         .manage(observed_unread::ObservedUnreadStore::default())
         .manage(channel_head_cache::ChannelHeadCacheStore::default())
+        .manage(popout::PopoutRegistry::default())
         .setup(move |app| {
             let app_handle = app.handle().clone();
             #[cfg(target_os = "macos")]
@@ -408,7 +420,7 @@ pub fn run() {
                 && !reset_outcome.completed
                 && migration::migrate_legacy_nest()
             {
-                let _ = app_handle.emit("legacy-nest-migrated", ());
+                let _ = app_handle.emit_to(popout::MAIN_WINDOW_LABEL, "legacy-nest-migrated", ());
             }
 
             // One-time migration for dev builds: copy accumulated knowledge
@@ -536,6 +548,9 @@ pub fn run() {
             terminal_runtime::terminal_ack,
             terminal_runtime::terminal_viewport_ready,
             terminal_runtime::terminal_focus,
+            popout::open_popout_window,
+            popout::take_popout_launch,
+            popout::focus_main_window_route,
             take_pending_community_deep_link,
             acknowledge_pending_community_deep_link,
             take_pending_navigation_deep_link,
@@ -949,10 +964,19 @@ pub fn run() {
                                 .is_some_and(|channel_id| label == format!("huddle-{channel_id}"))
                     });
             if is_active_huddle_window {
-                if let Err(error) = app_handle.emit("huddle-companion-returned", ()) {
+                if let Err(error) =
+                    app_handle.emit_to(popout::MAIN_WINDOW_LABEL, "huddle-companion-returned", ())
+                {
                     eprintln!("buzz-desktop: failed to restore huddle drawer: {error}");
                 }
             }
+        }
+        RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::Destroyed,
+            ..
+        } if popout::is_popout_label(&label) => {
+            app_handle.state::<popout::PopoutRegistry>().release(&label);
         }
         RunEvent::ExitRequested { code, .. } => {
             if is_restart_request(code) {

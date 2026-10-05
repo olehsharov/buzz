@@ -27,13 +27,81 @@ fn assert_current_apply_generation(
     }
 }
 
+/// Enter the serialized apply transaction. Returns `None` without advancing
+/// the generation when `already_applied` reports, under the lock, that the
+/// request is already the installed workspace: a no-op must never supersede
+/// (or re-run the side effects of) the transaction that installed it.
 async fn begin_workspace_apply(
     lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     generation: &std::sync::atomic::AtomicU64,
-) -> (tokio::sync::OwnedMutexGuard<()>, u64) {
+    already_applied: impl FnOnce() -> bool,
+) -> Option<(tokio::sync::OwnedMutexGuard<()>, u64)> {
     let guard = lock.lock_owned().await;
+    if already_applied() {
+        return None;
+    }
     let ticket = next_apply_generation(generation);
-    (guard, ticket)
+    Some((guard, ticket))
+}
+
+/// The workspace configuration the last successful `apply_workspace`
+/// installed, plus the identity that was active when it completed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppliedWorkspace {
+    relay_url: String,
+    repos_dir: Option<String>,
+    agent_managed_profiles: bool,
+    pubkey: String,
+}
+
+/// Whether applying `(relay_url, nsec, repos_dir, agent_managed_profiles)`
+/// would only reinstall the workspace that is already applied.
+///
+/// Every window of the app (main and pop-outs) runs community init, so the
+/// same configuration is re-applied whenever a secondary window starts. Those
+/// repeats must not reset relay admission or re-run reconciliation. A request
+/// carrying an `nsec`, a changed relay override, or an identity changed out of
+/// band since the last apply is never treated as a repeat.
+fn workspace_already_applied(
+    state: &AppState,
+    relay_url: &str,
+    nsec: Option<&str>,
+    repos_dir: Option<&str>,
+    agent_managed_profiles: Option<bool>,
+) -> bool {
+    if nsec.is_some_and(|value| !value.trim().is_empty()) {
+        return false;
+    }
+    let Ok(applied) = state.applied_workspace.lock() else {
+        return false;
+    };
+    let Some(applied) = applied.as_ref() else {
+        return false;
+    };
+    let override_matches = state
+        .relay_url_override
+        .lock()
+        .is_ok_and(|current| current.as_deref() == Some(relay_url));
+    let Ok(pubkey) = state.keys.lock().map(|keys| keys.public_key().to_hex()) else {
+        return false;
+    };
+    override_matches
+        && *applied
+            == AppliedWorkspace {
+                relay_url: relay_url.to_owned(),
+                repos_dir: repos_dir.map(str::to_owned),
+                agent_managed_profiles: agent_managed_profiles.unwrap_or(false),
+                pubkey,
+            }
+}
+
+fn set_applied_workspace(state: &AppState, applied: Option<AppliedWorkspace>) {
+    match state.applied_workspace.lock() {
+        Ok(mut guard) => *guard = applied,
+        // A poisoned record must not let a stale config look applied; the
+        // next apply then simply runs in full.
+        Err(poisoned) => *poisoned.into_inner() = None,
+    }
 }
 
 /// Adopt the pre-scoping global retention database's pending rows into `scope`.
@@ -200,15 +268,42 @@ pub async fn apply_workspace(
     app: AppHandle,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
+    let is_repeat = || {
+        workspace_already_applied(
+            &state,
+            &relay_url,
+            nsec.as_deref(),
+            repos_dir.as_deref(),
+            agent_managed_profiles,
+        )
+    };
+    // Fast path for a secondary window re-applying the installed workspace:
+    // return without waiting behind a launch restore that still holds the lock.
+    if is_repeat() {
+        return Ok(());
+    }
     // Take the generation only after entering the serialized transaction. An
     // apply that is already running remains authoritative until it releases
     // the lock; the next apply then advances the generation. This keeps every
     // awaited reconciliation/event-sync phase inside one ordered transaction.
-    let (apply_guard, apply_generation) = begin_workspace_apply(
+    // The repeat check runs again under the lock: an apply of this same
+    // workspace may have completed while this request waited.
+    let Some((apply_guard, apply_generation)) = begin_workspace_apply(
         state.workspace_apply_lock.clone(),
         &state.workspace_apply_generation,
+        is_repeat,
     )
-    .await;
+    .await
+    else {
+        return Ok(());
+    };
+    let applied_record = AppliedWorkspace {
+        relay_url: relay_url.clone(),
+        repos_dir: repos_dir.clone(),
+        agent_managed_profiles: agent_managed_profiles.unwrap_or(false),
+        // Filled in from the active identity once the apply has completed.
+        pubkey: String::new(),
+    };
 
     let restore_app = app.clone();
     let apply_app = app.clone();
@@ -240,7 +335,7 @@ pub async fn apply_workspace(
             Some(nest) => match effective_repos_dir(nest, repos_dir.as_deref()) {
                 Ok(value) => value,
                 Err(error) => {
-                    let _ = app.emit("repos-dir-error", error);
+                    let _ = app.emit_to(crate::popout::MAIN_WINDOW_LABEL, "repos-dir-error", error);
                     None
                 }
             },
@@ -253,6 +348,9 @@ pub async fn apply_workspace(
         assert_current_apply_generation(&state.workspace_apply_generation, apply_generation)?;
 
         // ── Apply all state changes (nothing below can fail) ──────────────────
+        // Forget the previously applied workspace before mutating: until this
+        // transaction completes, no request may be treated as a repeat.
+        set_applied_workspace(&state, None);
         {
             let mut override_guard = state.relay_url_override.lock().map_err(|e| e.to_string())?;
             *override_guard = Some(relay_url);
@@ -288,7 +386,7 @@ pub async fn apply_workspace(
             }
             if let Err(error) = ensure_repos_symlink(nest, effective_repos_dir.as_deref()) {
                 eprintln!("buzz-desktop: repos dir setup failed: {error}");
-                let _ = app.emit("repos-dir-error", error);
+                let _ = app.emit_to(crate::popout::MAIN_WINDOW_LABEL, "repos-dir-error", error);
             }
         }
 
@@ -356,6 +454,23 @@ pub async fn apply_workspace(
         }
     }
 
+    // The workspace is now fully applied: later identical requests (secondary
+    // windows running community init) become no-ops.
+    assert_current_apply_generation(&state.workspace_apply_generation, apply_generation)?;
+    let pubkey = state
+        .keys
+        .lock()
+        .map_err(|e| e.to_string())?
+        .public_key()
+        .to_hex();
+    set_applied_workspace(
+        &state,
+        Some(AppliedWorkspace {
+            pubkey,
+            ..applied_record
+        }),
+    );
+
     let restore_pending = state
         .managed_agent_restore_pending
         .swap(false, Ordering::AcqRel);
@@ -421,7 +536,113 @@ mod tests {
         Arc,
     };
 
-    use super::{assert_current_apply_generation, begin_workspace_apply, next_apply_generation};
+    use super::{
+        assert_current_apply_generation, begin_workspace_apply, next_apply_generation,
+        set_applied_workspace, workspace_already_applied, AppliedWorkspace,
+    };
+
+    const RELAY: &str = "wss://relay-a.example";
+
+    #[tokio::test]
+    async fn repeat_apply_neither_advances_generation_nor_holds_the_lock() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let generation = AtomicU64::new(0);
+        let ticket = next_apply_generation(&generation);
+
+        let skipped = begin_workspace_apply(Arc::clone(&lock), &generation, || true).await;
+
+        assert!(skipped.is_none());
+        assert_eq!(generation.load(Ordering::Acquire), ticket);
+        assert_current_apply_generation(&generation, ticket).unwrap();
+        assert!(lock.try_lock().is_ok());
+    }
+
+    /// State as a completed `apply_workspace` of `RELAY` leaves it.
+    fn applied_state() -> crate::app_state::AppState {
+        let state = crate::app_state::build_app_state();
+        *state.relay_url_override.lock().unwrap() = Some(RELAY.into());
+        let pubkey = state.keys.lock().unwrap().public_key().to_hex();
+        set_applied_workspace(
+            &state,
+            Some(AppliedWorkspace {
+                relay_url: RELAY.into(),
+                repos_dir: Some("/repos".into()),
+                agent_managed_profiles: false,
+                pubkey,
+            }),
+        );
+        state
+    }
+
+    #[test]
+    fn identical_request_is_a_repeat() {
+        let state = applied_state();
+        assert!(workspace_already_applied(
+            &state,
+            RELAY,
+            None,
+            Some("/repos"),
+            None
+        ));
+        // An explicit `false` equals an omitted flag; a blank nsec is no nsec.
+        assert!(workspace_already_applied(
+            &state,
+            RELAY,
+            Some("  "),
+            Some("/repos"),
+            Some(false)
+        ));
+    }
+
+    #[test]
+    fn any_difference_runs_a_full_apply() {
+        let state = applied_state();
+        let repeat =
+            |relay: &str, nsec: Option<&str>, repos: Option<&str>, managed: Option<bool>| {
+                workspace_already_applied(&state, relay, nsec, repos, managed)
+            };
+        assert!(!repeat("wss://relay-b.example", None, Some("/repos"), None));
+        assert!(!repeat(RELAY, None, None, None));
+        assert!(!repeat(RELAY, None, Some("/other"), None));
+        assert!(!repeat(RELAY, None, Some("/repos"), Some(true)));
+        assert!(!repeat(RELAY, Some("nsec1anything"), Some("/repos"), None));
+    }
+
+    #[test]
+    fn out_of_band_state_changes_invalidate_the_record() {
+        let state = applied_state();
+        *state.keys.lock().unwrap() = nostr::Keys::generate();
+        assert!(!workspace_already_applied(
+            &state,
+            RELAY,
+            None,
+            Some("/repos"),
+            None
+        ));
+
+        let state = applied_state();
+        *state.relay_url_override.lock().unwrap() = Some("wss://relay-b.example".into());
+        assert!(!workspace_already_applied(
+            &state,
+            RELAY,
+            None,
+            Some("/repos"),
+            None
+        ));
+    }
+
+    #[test]
+    fn cleared_record_is_never_a_repeat() {
+        let state = applied_state();
+        set_applied_workspace(&state, None);
+        assert!(!workspace_already_applied(
+            &state,
+            RELAY,
+            None,
+            Some("/repos"),
+            None
+        ));
+    }
 
     #[test]
     fn explicit_newer_generation_supersedes_older_ticket() {
@@ -439,12 +660,16 @@ mod tests {
         let lock = Arc::new(tokio::sync::Mutex::new(()));
         let generation = Arc::new(AtomicU64::new(0));
         let (running_guard, running_ticket) =
-            begin_workspace_apply(Arc::clone(&lock), &generation).await;
+            begin_workspace_apply(Arc::clone(&lock), &generation, || false)
+                .await
+                .unwrap();
 
         let queued_lock = Arc::clone(&lock);
         let queued_generation = Arc::clone(&generation);
         let queued = tokio::spawn(async move {
-            let (_guard, ticket) = begin_workspace_apply(queued_lock, &queued_generation).await;
+            let (_guard, ticket) = begin_workspace_apply(queued_lock, &queued_generation, || false)
+                .await
+                .unwrap();
             ticket
         });
         tokio::task::yield_now().await;

@@ -95,11 +95,11 @@ define_class!(
                 if let Some(target) = target_from_response(response) {
                     queue_activation(target);
                     crate::tray_menu::show_main_window(&self.ivars().app);
-                    if let Err(error) = self
-                        .ivars()
-                        .app
-                        .emit(NATIVE_NOTIFICATION_ACTIVATED_EVENT, ())
-                    {
+                    if let Err(error) = self.ivars().app.emit_to(
+                        crate::popout::MAIN_WINDOW_LABEL,
+                        NATIVE_NOTIFICATION_ACTIVATED_EVENT,
+                        (),
+                    ) {
                         eprintln!(
                             "buzz-desktop: failed to emit macOS notification activation: {error}"
                         );

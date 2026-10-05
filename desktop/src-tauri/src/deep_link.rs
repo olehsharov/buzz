@@ -625,7 +625,11 @@ pub(crate) fn handle_deep_link_url(app: &tauri::AppHandle, url_str: &str) {
             };
             activate_main_window(app);
             queue_community_deep_link(app, "connect", relay_url.clone(), None, None, None);
-            let _ = app.emit("deep-link-connect", relay_url);
+            let _ = app.emit_to(
+                crate::popout::MAIN_WINDOW_LABEL,
+                "deep-link-connect",
+                relay_url,
+            );
         }
         Some("join") => {
             // `buzz://join?relay=<ws(s)://...>&code=<invite code>` — fired by
@@ -640,7 +644,7 @@ pub(crate) fn handle_deep_link_url(app: &tauri::AppHandle, url_str: &str) {
             let code = payload["code"].as_str().map(str::to_owned);
             let policy_receipt = payload["policyReceipt"].as_str().map(str::to_owned);
             queue_community_deep_link(app, "join", relay_url, code, policy_receipt, None);
-            let _ = app.emit("deep-link-join", payload);
+            let _ = app.emit_to(crate::popout::MAIN_WINDOW_LABEL, "deep-link-join", payload);
         }
         Some("add-community") => {
             let Some(payload) = parse_add_community_deep_link(&url) else {
@@ -656,7 +660,11 @@ pub(crate) fn handle_deep_link_url(app: &tauri::AppHandle, url_str: &str) {
                 None,
                 payload.name.clone(),
             );
-            let _ = app.emit("deep-link-add-community", payload);
+            let _ = app.emit_to(
+                crate::popout::MAIN_WINDOW_LABEL,
+                "deep-link-add-community",
+                payload,
+            );
         }
         Some("channel") => {
             let Some(payload) = parse_channel_deep_link(&url) else {
@@ -666,10 +674,18 @@ pub(crate) fn handle_deep_link_url(app: &tauri::AppHandle, url_str: &str) {
             activate_main_window(app);
             if payload["messageId"].is_string() {
                 queue_navigation_deep_link(app, "message", &payload);
-                let _ = app.emit("deep-link-message", payload);
+                let _ = app.emit_to(
+                    crate::popout::MAIN_WINDOW_LABEL,
+                    "deep-link-message",
+                    payload,
+                );
             } else {
                 queue_navigation_deep_link(app, "channel", &payload);
-                let _ = app.emit("deep-link-channel", payload);
+                let _ = app.emit_to(
+                    crate::popout::MAIN_WINDOW_LABEL,
+                    "deep-link-channel",
+                    payload,
+                );
             }
         }
         Some("message") => {
@@ -687,7 +703,11 @@ pub(crate) fn handle_deep_link_url(app: &tauri::AppHandle, url_str: &str) {
             };
             activate_main_window(app);
             queue_navigation_deep_link(app, "message", &payload);
-            let _ = app.emit("deep-link-message", payload);
+            let _ = app.emit_to(
+                crate::popout::MAIN_WINDOW_LABEL,
+                "deep-link-message",
+                payload,
+            );
         }
         Some("repo" | "project" | "pr" | "issue") => {
             // OS routing uses this build's scheme; frontend navigation consumes
@@ -701,12 +721,20 @@ pub(crate) fn handle_deep_link_url(app: &tauri::AppHandle, url_str: &str) {
             };
             activate_main_window(app);
             let pending = queue_entity_deep_link(app, href);
-            let _ = app.emit("deep-link-entity", pending);
+            let _ = app.emit_to(
+                crate::popout::MAIN_WINDOW_LABEL,
+                "deep-link-entity",
+                pending,
+            );
         }
         Some("nostr-bind") => match parse_nostr_bind_deep_link(&url) {
             Ok(payload) => {
                 activate_main_window(app);
-                let _ = app.emit("deep-link-nostr-bind", payload);
+                let _ = app.emit_to(
+                    crate::popout::MAIN_WINDOW_LABEL,
+                    "deep-link-nostr-bind",
+                    payload,
+                );
             }
             Err(error) => {
                 eprintln!("buzz-desktop: rejecting nostr-bind deep link: {error}: {url_str}");

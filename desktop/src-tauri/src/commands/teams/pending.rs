@@ -488,7 +488,8 @@ fn emit_team_catalog_auto_retracted<R: tauri::Runtime>(
         reason: &'a str,
     }
 
-    if let Err(e) = app.emit(
+    if let Err(e) = app.emit_to(
+        crate::popout::MAIN_WINDOW_LABEL,
         "team-catalog-auto-retracted",
         TeamCatalogAutoRetractedPayload { team_name, reason },
     ) {

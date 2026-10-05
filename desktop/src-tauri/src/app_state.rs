@@ -37,6 +37,9 @@ pub struct AppState {
     pub agent_avatar_communities: Mutex<Vec<String>>,
     pub workspace_apply_lock: Arc<AsyncMutex<()>>,
     pub workspace_apply_generation: AtomicU64,
+    /// Workspace installed by the last successful `apply_workspace`; lets a
+    /// repeated identical apply (a secondary window's init) be a no-op.
+    pub applied_workspace: Mutex<Option<crate::commands::AppliedWorkspace>>,
     /// Defers managed-agent restore until `apply_workspace` installs relay and identity.
     pub managed_agent_restore_pending: AtomicBool,
     /// Experiment state applied to managed-agent starts and profile reconciliation.
@@ -220,6 +223,7 @@ pub fn build_app_state() -> AppState {
         agent_avatar_communities: Mutex::new(Vec::new()),
         workspace_apply_lock: Arc::new(AsyncMutex::new(())),
         workspace_apply_generation: AtomicU64::new(0),
+        applied_workspace: Mutex::new(None),
         managed_agent_restore_pending: AtomicBool::new(false),
         managed_agent_experiments: crate::managed_agents::ManagedAgentExperimentState::default(),
         shutdown_started: AtomicBool::new(false),

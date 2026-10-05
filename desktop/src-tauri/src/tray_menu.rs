@@ -253,7 +253,11 @@ fn queue_tray_action<R: Runtime>(app: &AppHandle<R>, mut action: TrayAction) {
     queue.pending_actions.push(action);
     drop(queue);
 
-    if let Err(error) = app.emit("tray-action-available", ()) {
+    if let Err(error) = app.emit_to(
+        crate::popout::MAIN_WINDOW_LABEL,
+        "tray-action-available",
+        (),
+    ) {
         eprintln!("buzz-desktop: failed to notify frontend of tray action: {error}");
     }
 }
@@ -536,8 +540,12 @@ pub fn requeue_tray_actions<R: Runtime>(
         .map_err(|_| "Buzz tray action queue is unavailable".to_string())?;
     requeue_actions(&mut queue, actions);
     drop(queue);
-    app.emit("tray-action-available", ())
-        .map_err(|error| error.to_string())
+    app.emit_to(
+        crate::popout::MAIN_WINDOW_LABEL,
+        "tray-action-available",
+        (),
+    )
+    .map_err(|error| error.to_string())
 }
 
 /// Clears community-scoped agent activity and queued channel navigation from
