@@ -118,3 +118,13 @@ fn launch_payload_serializes_camel_case() {
         serde_json::json!({ "route": "/channels/a", "community": { "id": "community-a" } })
     );
 }
+
+#[test]
+fn bare_root_route_is_the_focus_only_request() {
+    // Pop-outs send exactly "/" to `focus_main_window_route` to mean "just
+    // bring the main window forward"; the main window ignores it as a
+    // non-destination route.
+    assert!(validate_route("/").is_ok());
+    assert!(validate_route("//").is_err());
+    assert!(validate_route("/\\").is_err());
+}
