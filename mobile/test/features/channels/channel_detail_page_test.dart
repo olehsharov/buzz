@@ -16,6 +16,7 @@ import 'package:flutter/rendering.dart'
         ScrollDirection,
         SemanticsAction;
 import 'package:flutter/services.dart';
+import 'package:gpt_markdown/gpt_markdown.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:http/http.dart' as http;
@@ -49,6 +50,7 @@ import 'package:buzz/features/channels/thread_detail_page.dart';
 import 'package:buzz/features/channels/thread_replies_provider.dart';
 import 'package:buzz/features/channels/timeline_message.dart';
 import 'package:buzz/features/channels/channels_provider.dart';
+import 'package:buzz/shared/read_state/read_state_format.dart';
 import 'package:buzz/shared/read_state/read_state_provider.dart';
 import 'package:buzz/features/channels/unread_badge/observed_unread_event.dart';
 import 'package:buzz/features/channels/small_avatar.dart';
@@ -2184,6 +2186,89 @@ void main() {
       expect(tester.takeException(), isNull);
     });
 
+    testWidgets('unrelated read markers and older pages keep existing rows', (
+      tester,
+    ) async {
+      final readState = _SynchronousReadStateNotifier(
+        const ReadStateState(isReady: true, pubkey: 'self', contexts: {}),
+      );
+      final first = _textMsg(
+        id: 'msg1',
+        pubkey: 'alice',
+        content: 'First',
+        createdAt: 1100,
+      );
+      final second = _textMsg(
+        id: 'msg2',
+        pubkey: 'bob',
+        content: 'Second',
+        createdAt: 1200,
+      );
+      final messages = _FakeMessagesNotifier([first, second]);
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: const [],
+          messagesNotifier: messages,
+          readStateNotifier: readState,
+        ),
+      );
+      await tester.pump();
+      await tester.pump();
+
+      GptMarkdown markdownOf(String messageId) => tester.widget<GptMarkdown>(
+        find.descendant(
+          of: find.byKey(ValueKey('message-row-$messageId')),
+          matching: find.byType(GptMarkdown),
+        ),
+      );
+      final firstBefore = markdownOf('msg1');
+      final secondBefore = markdownOf('msg2');
+      // The page hands the list a new widget whenever it rebuilds.
+      Widget messageList() => tester.widget(
+        find.byWidgetPredicate(
+          (widget) => widget.runtimeType.toString() == '_MessageList',
+        ),
+      );
+      final listBefore = messageList();
+
+      // Another channel's marker and an unrelated message's marker do not
+      // rebuild the page at all.
+      readState.markContextRead('other-channel', 5000);
+      await tester.pump();
+      readState.markContextRead(msgContextKey('elsewhere'), 5000);
+      await tester.pump();
+      expect(identical(messageList(), listBefore), isTrue);
+      expect(identical(markdownOf('msg1'), firstBefore), isTrue);
+      expect(identical(markdownOf('msg2'), secondBefore), isTrue);
+
+      // An older page loading rebuilds the list without moving the loaded
+      // rows (index 0 is the newest), so those rows are reused as-is.
+      final older = _textMsg(
+        id: 'msg0',
+        pubkey: 'carol',
+        content: 'Zeroth',
+        createdAt: 1000,
+      );
+      messages.setMessages([older, first, second]);
+      await tester.pump();
+      await tester.pump();
+      expect(find.text('Zeroth'), findsOneWidget);
+      expect(identical(markdownOf('msg1'), firstBefore), isTrue);
+      expect(identical(markdownOf('msg2'), secondBefore), isTrue);
+
+      // A row whose own content changed is rebuilt; its neighbours are not.
+      messages.setMessages([
+        older,
+        first,
+        second,
+        _reaction(id: 'r1', targetId: 'msg2'),
+      ]);
+      await tester.pump();
+      await tester.pump();
+      expect(identical(markdownOf('msg1'), firstBefore), isTrue);
+      expect(identical(markdownOf('msg2'), secondBefore), isFalse);
+    });
+
     testWidgets('shows forum posts view for forum channels', (tester) async {
       final forumChannel = Channel(
         id: _channelId,
@@ -3320,6 +3405,47 @@ void main() {
         find.byKey(const ValueKey('channel-jump-to-latest')),
         findsNothing,
       );
+    });
+
+    testWidgets('composer growth moves list padding without rebuilding it', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: [
+            _textMsg(id: 'msg1', pubkey: 'alice', content: 'Hello world!'),
+          ],
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      Widget messageList() => tester.widget(
+        find.byWidgetPredicate(
+          (widget) => widget.runtimeType.toString() == '_MessageList',
+        ),
+      );
+      double listBottomPadding() => tester
+          .widget<ScrollablePositionedList>(
+            find.byKey(const ValueKey('channel-message-list')),
+          )
+          .padding!
+          .bottom;
+      final composerDock = find.byKey(const ValueKey('channel-composer-dock'));
+      final listBefore = messageList();
+      final dockBefore = tester.getSize(composerDock).height;
+      expect(listBottomPadding(), dockBefore);
+
+      // Expanding the composer and growing it to several lines both resize
+      // the dock.
+      await tester.tap(find.text('Message #general'));
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField), 'one\ntwo\nthree\nfour');
+      await tester.pumpAndSettle();
+
+      final dockAfter = tester.getSize(composerDock).height;
+      expect(dockAfter, greaterThan(dockBefore));
+      expect(listBottomPadding(), dockAfter);
+      expect(identical(messageList(), listBefore), isTrue);
     });
 
     testWidgets('keeps animated message avatars static and transparent', (

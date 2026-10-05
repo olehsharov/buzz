@@ -7,7 +7,6 @@ class _MessageBubble extends HookConsumerWidget {
   final Map<String, String> channelNames;
   final String currentChannelId;
   final String? currentPubkey;
-  final List<TimelineMessage>? allMessages;
   final bool isMember;
   final bool isArchived;
   final FocusNode? composerFocusNode;
@@ -20,7 +19,6 @@ class _MessageBubble extends HookConsumerWidget {
     required this.channelNames,
     required this.currentChannelId,
     required this.currentPubkey,
-    this.allMessages,
     this.isMember = false,
     this.isArchived = false,
     this.composerFocusNode,
@@ -100,6 +98,24 @@ class _MessageBubble extends HookConsumerWidget {
       normalizedMentionPubkeys,
     );
 
+    // Read at interaction time rather than held as a prop: the timeline list
+    // changes with every message, and holding it would invalidate this row.
+    List<TimelineMessage> allMessages() =>
+        ref.read(channelTimelineProvider(currentChannelId)).messages;
+
+    void openThread() => Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => ThreadDetailPage(
+          threadHead: message,
+          allMessages: allMessages(),
+          channelId: currentChannelId,
+          currentPubkey: currentPubkey,
+          isMember: isMember,
+          isArchived: isArchived,
+        ),
+      ),
+    );
+
     void openMessageActions(MessageLongPressDetails details) {
       showMessageActions(
         context: context,
@@ -107,7 +123,7 @@ class _MessageBubble extends HookConsumerWidget {
         message: message,
         channelId: currentChannelId,
         canManageMessage: canManageMessage,
-        allMessages: allMessages,
+        allMessages: allMessages(),
         currentPubkey: currentPubkey,
         isMember: isMember,
         isArchived: isArchived,
@@ -137,20 +153,7 @@ class _MessageBubble extends HookConsumerWidget {
           snapshotKey: messageSnapshotKey,
           // Tap opens existing threads; long-press can start a new one.
           // MessageContent handles mention, channel-link, and media taps.
-          onTap: (!hasReplies && !hasLocalReplies) || allMessages == null
-              ? null
-              : () => Navigator.of(context).push(
-                  MaterialPageRoute<void>(
-                    builder: (_) => ThreadDetailPage(
-                      threadHead: message,
-                      allMessages: allMessages!,
-                      channelId: currentChannelId,
-                      currentPubkey: currentPubkey,
-                      isMember: isMember,
-                      isArchived: isArchived,
-                    ),
-                  ),
-                ),
+          onTap: !hasReplies && !hasLocalReplies ? null : openThread,
           child: Padding(
             padding: EdgeInsets.only(
               top: showAuthor ? 0 : Grid.xxs,
@@ -257,23 +260,10 @@ class _MessageBubble extends HookConsumerWidget {
                                 ),
                                 scaleEmojiOnly: true,
                                 mediaCarouselTrailingOverflow: Grid.gutter,
-                                onMediaReply: allMessages == null
-                                    ? null
-                                    : () {
-                                        if (!context.mounted) return;
-                                        Navigator.of(context).push(
-                                          MaterialPageRoute<void>(
-                                            builder: (_) => ThreadDetailPage(
-                                              threadHead: message,
-                                              allMessages: allMessages!,
-                                              channelId: currentChannelId,
-                                              currentPubkey: currentPubkey,
-                                              isMember: isMember,
-                                              isArchived: isArchived,
-                                            ),
-                                          ),
-                                        );
-                                      },
+                                onMediaReply: () {
+                                  if (!context.mounted) return;
+                                  openThread();
+                                },
                                 onMediaMore: (viewerContext, imageUrl) =>
                                     showImageActions(
                                       context: viewerContext,
