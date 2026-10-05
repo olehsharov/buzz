@@ -148,6 +148,8 @@ type MockInstallRuntimeResult = {
 type MockBridgeOptions = {
   /** Tauri window label exposed to the app. Defaults to the main window. */
   windowLabel?: string;
+  /** One-time `take_popout_launch` payload for a `popout-<uuid>` window. */
+  popoutLaunch?: { route: string; community: unknown } | null;
   ttsSettings?: {
     version: number;
     agentTextToSpeech: boolean;

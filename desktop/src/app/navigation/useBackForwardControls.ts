@@ -10,6 +10,7 @@ import { listen } from "@tauri-apps/api/event";
 import { matchBackForwardChord } from "@/app/navigation/backForwardChords";
 import { traverseHistory } from "@/app/navigation/navigationGuard";
 import { isMacPlatform } from "@/shared/lib/platform";
+import { isMainWindow } from "@/shared/lib/windowKind";
 import { trimMapToSize } from "@/shared/lib/trimMapToSize";
 
 type RouterHistoryState = {
@@ -115,7 +116,9 @@ export function useBackForwardControls() {
   // swipe gestures to the DOM, so the native layer catches them
   // (`mouse_nav.rs`) and forwards them as a Tauri event.
   React.useEffect(() => {
-    if (!isTauri()) {
+    // The native layer forwards mouse/swipe navigation to the main window
+    // only; a global listener in an auxiliary window would replay it there.
+    if (!isTauri() || !isMainWindow()) {
       return;
     }
 

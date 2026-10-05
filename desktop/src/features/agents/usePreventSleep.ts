@@ -6,6 +6,7 @@ import {
 } from "@/features/agents/observerRelayStore";
 import { createPreventSleepActivityTracker } from "@/features/agents/preventSleepActivity";
 import { setPreventSleepActive } from "@/shared/api/tauri";
+import { isMainWindow } from "@/shared/lib/windowKind";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { listen } from "@tauri-apps/api/event";
 
@@ -81,20 +82,25 @@ function usePreventSleepInternal() {
     setEnabledState(value);
   }, []);
 
+  // The OS sleep assertion is app-global: only the main window drives it
+  // and hears its expiry, so auxiliary windows cannot fight over it.
+  const ownsSleepAssertion = isMainWindow();
   React.useEffect(() => {
+    if (!ownsSleepAssertion) return;
     void setPreventSleepActive(active);
-  }, [active]);
+  }, [active, ownsSleepAssertion]);
   React.useEffect(() => {
+    if (!ownsSleepAssertion) return;
     const unlisten = listen("prevent-sleep-expired", () => {
       setExpired(true);
     });
     return () => {
       void unlisten.then((fn) => fn());
     };
-  }, []);
+  }, [ownsSleepAssertion]);
 
   React.useEffect(() => {
-    if (!enabled || !runningAgentPubkeyKey) return;
+    if (!ownsSleepAssertion || !enabled || !runningAgentPubkeyKey) return;
 
     const observedPubkeys = runningAgentPubkeyKey.split(",");
     const tracker = createPreventSleepActivityTracker();
@@ -115,7 +121,7 @@ function usePreventSleepInternal() {
 
     observeActivity();
     return subscribeAgentObserverStore(observeActivity);
-  }, [enabled, expired, runningAgentPubkeyKey]);
+  }, [enabled, expired, ownsSleepAssertion, runningAgentPubkeyKey]);
 
   return {
     enabled,

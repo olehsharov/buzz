@@ -105,7 +105,8 @@ function renderApp() {
                   <PoofBurstProvider>
                     <UpdaterProvider>
                       <App />
-                      <NostrBindConsentDialog />
+                      {/* Nostr-bind deep links are main-window work. */}
+                      {isMainWindow() ? <NostrBindConsentDialog /> : null}
                     </UpdaterProvider>
                     <Toaster />
                   </PoofBurstProvider>

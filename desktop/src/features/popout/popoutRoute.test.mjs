@@ -19,7 +19,11 @@ test("buildPopoutRoute builds every MVP destination", () => {
     `/channels/${CHANNEL}`,
   );
   assert.equal(
-    buildPopoutRoute({ kind: "thread", channelId: CHANNEL, threadRootId: ROOT }),
+    buildPopoutRoute({
+      kind: "thread",
+      channelId: CHANNEL,
+      threadRootId: ROOT,
+    }),
     `/channels/${CHANNEL}?thread=${ROOT}`,
   );
   assert.equal(
@@ -152,10 +156,13 @@ test("popoutDestinationFromLocation ignores unrelated search keys", () => {
     }),
     { kind: "thread", channelId: CHANNEL, threadRootId: ROOT },
   );
-  assert.deepEqual(popoutDestinationFromLocation("/pulse", { profile: PUBKEY }), {
-    kind: "profile",
-    pubkey: PUBKEY,
-  });
+  assert.deepEqual(
+    popoutDestinationFromLocation("/pulse", { profile: PUBKEY }),
+    {
+      kind: "profile",
+      pubkey: PUBKEY,
+    },
+  );
   assert.equal(popoutDestinationFromLocation("/", {}), null);
   assert.equal(popoutDestinationFromLocation("/projects", {}), null);
 });
