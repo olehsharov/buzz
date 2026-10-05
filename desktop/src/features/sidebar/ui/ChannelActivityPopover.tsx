@@ -1,4 +1,7 @@
 import * as React from "react";
+import type { PopoutDestination } from "@/features/popout/popoutRoute";
+import { NewWindowContextMenu } from "@/features/popout/ui/NewWindowContextMenu";
+import { useNewWindowGestures } from "@/features/popout/useOpenInNewWindow";
 import { Clock, Loader2, MailOpen } from "lucide-react";
 
 import { useAppShell } from "@/app/AppShellContext";
@@ -80,27 +83,39 @@ function RowActionButton({
 function ThreadPreviewRow({
   isAgent,
   item,
+  newWindowDestination,
   onMarkRead,
   onOpen,
   onRemindLater,
 }: {
   isAgent: boolean;
   item: InboxItem;
+  newWindowDestination: PopoutDestination;
   onMarkRead: () => void;
   onOpen: () => void;
   onRemindLater: () => void;
 }) {
+  const newWindow = useNewWindowGestures(newWindowDestination);
   return (
     <div
       className="group/activity-row relative border-t border-border/50 first:border-t-0"
       data-testid={`channel-activity-item-${item.conversationId}`}
     >
-      <button
-        aria-label={`Open thread from ${item.senderLabel}`}
-        className="absolute inset-0 z-0 w-full text-left"
-        onClick={onOpen}
-        type="button"
-      />
+      <NewWindowContextMenu destination={newWindowDestination}>
+        <button
+          aria-label={`Open thread from ${item.senderLabel}`}
+          className="absolute inset-0 z-0 w-full text-left"
+          onClick={(event) => {
+            if (newWindow.handleClick(event)) return;
+            onOpen();
+          }}
+          onKeyDown={(event) => {
+            newWindow.handleKeyDown(event);
+          }}
+          {...newWindow.pointerProps}
+          type="button"
+        />
+      </NewWindowContextMenu>
       <div className="pointer-events-none relative z-10 flex min-w-0 items-start gap-2.5 px-3 py-3 transition-colors group-hover/activity-row:bg-muted/50 group-focus-within/activity-row:bg-muted/50">
         <UserAvatar
           avatarUrl={item.avatarUrl}
@@ -444,6 +459,12 @@ export function ChannelActivityPopover({
                     }
                     item={item}
                     key={item.conversationId}
+                    newWindowDestination={{
+                      kind: "channel",
+                      channelId: channel.id,
+                      messageId: item.id,
+                      threadRootId: item.conversationId,
+                    }}
                     onMarkRead={() => handleMarkRead(item)}
                     onOpen={() => {
                       clearUnreadOverride(item);

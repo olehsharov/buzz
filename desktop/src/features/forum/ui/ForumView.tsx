@@ -249,6 +249,11 @@ export function ForumView({
                     deletePostMutation.isPending &&
                     deletePostMutation.variables?.eventId === post.eventId
                   }
+                  newWindowDestination={{
+                    kind: "forum-post",
+                    channelId: channel.id,
+                    postId: post.eventId,
+                  }}
                   onClick={() => onSelectPost(post.eventId)}
                   onDelete={(eventId) => {
                     deletePostMutation.mutate({ eventId });

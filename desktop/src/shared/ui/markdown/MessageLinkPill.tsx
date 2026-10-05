@@ -15,6 +15,9 @@ import {
 } from "@/shared/ui/tooltip";
 import { truncateInlineChipLabel } from "@/shared/ui/mentionChip";
 
+import { NewWindowContextMenu } from "@/features/popout/ui/NewWindowContextMenu";
+import { useNewWindowGestures } from "@/features/popout/useOpenInNewWindow";
+
 import { BuzzLinkChip } from "./BuzzLinkChip";
 import { useInlineTooltipPosition } from "./useInlineTooltipPosition";
 import { useMessageLinkMetadata } from "./useMessageLinkMetadata";
@@ -163,6 +166,16 @@ function MessageLinkPillContents({
   openable?: boolean;
 }) {
   const [isHovered, setIsHovered] = React.useState(false);
+  const sentFromThreadNewWindow = useNewWindowGestures(
+    variant === "sent-from-thread" && interactive && openable
+      ? {
+          kind: "channel",
+          channelId: link.channelId,
+          messageId: link.messageId,
+          threadRootId: link.threadRootId,
+        }
+      : null,
+  );
   const channelLabel = resolvedChannelLabel ?? link.channelId.slice(0, 8);
   const isSentFromThread = variant === "sent-from-thread";
   const permalink = href ?? buildMessageLink(link);
@@ -208,6 +221,24 @@ function MessageLinkPillContents({
           isDeleted && "buzz-link-deleted",
         )}
         interactive={openable && interactive}
+        newWindowDestination={
+          openable
+            ? isDeleted
+              ? link.threadRootId
+                ? {
+                    kind: "thread",
+                    channelId: link.channelId,
+                    threadRootId: link.threadRootId,
+                  }
+                : { kind: "channel", channelId: link.channelId }
+              : {
+                  kind: "channel",
+                  channelId: link.channelId,
+                  messageId: link.messageId,
+                  threadRootId: link.threadRootId,
+                }
+            : null
+        }
         onOpenLink={() => {
           if (!openable) return;
           if (!isDeleted) {
@@ -247,39 +278,59 @@ function MessageLinkPillContents({
   }
 
   return (
-    <button
-      type="button"
-      data-message-link=""
-      data-hovered={isHovered ? "" : undefined}
-      aria-label={`Open thread in ${channelLabel}`}
-      title={label}
-      className={cn(
-        "max-w-80 cursor-pointer truncate",
-        "inline-block min-w-0 text-left font-medium text-foreground focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring",
-      )}
-      onMouseEnter={() => setIsHovered(true)}
-      onMouseLeave={() => setIsHovered(false)}
-      onClick={() => onOpenMessageLink(link)}
+    <NewWindowContextMenu
+      destination={
+        sentFromThreadNewWindow.enabled
+          ? {
+              kind: "channel",
+              channelId: link.channelId,
+              messageId: link.messageId,
+              threadRootId: link.threadRootId,
+            }
+          : null
+      }
     >
-      {segmentLinkLabel(label).map((segment) =>
-        segment.isEmoji ? (
-          <span key={segment.start} data-message-link-emoji="">
-            {segment.text}
-          </span>
-        ) : (
-          <span
-            key={segment.start}
-            className="transition-shadow"
-            data-message-link-text=""
-            style={{
-              boxShadow: isHovered ? "inset 0 -1px 0 currentColor" : "none",
-            }}
-          >
-            {segment.text}
-          </span>
-        ),
-      )}
-    </button>
+      <button
+        type="button"
+        data-message-link=""
+        data-hovered={isHovered ? "" : undefined}
+        aria-label={`Open thread in ${channelLabel}`}
+        title={label}
+        className={cn(
+          "max-w-80 cursor-pointer truncate",
+          "inline-block min-w-0 text-left font-medium text-foreground focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring",
+        )}
+        onMouseEnter={() => setIsHovered(true)}
+        onMouseLeave={() => setIsHovered(false)}
+        onClick={(event) => {
+          if (sentFromThreadNewWindow.handleClick(event)) return;
+          onOpenMessageLink(link);
+        }}
+        onKeyDown={(event) => {
+          sentFromThreadNewWindow.handleKeyDown(event);
+        }}
+        {...sentFromThreadNewWindow.pointerProps}
+      >
+        {segmentLinkLabel(label).map((segment) =>
+          segment.isEmoji ? (
+            <span key={segment.start} data-message-link-emoji="">
+              {segment.text}
+            </span>
+          ) : (
+            <span
+              key={segment.start}
+              className="transition-shadow"
+              data-message-link-text=""
+              style={{
+                boxShadow: isHovered ? "inset 0 -1px 0 currentColor" : "none",
+              }}
+            >
+              {segment.text}
+            </span>
+          ),
+        )}
+      </button>
+    </NewWindowContextMenu>
   );
 }
 

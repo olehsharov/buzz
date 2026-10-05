@@ -1,4 +1,4 @@
-import { Search } from "lucide-react";
+import { AppWindow, Search } from "lucide-react";
 import * as React from "react";
 import { resolveUserLabel } from "@/features/profile/lib/identity";
 import { getMinimumSearchQueryLength } from "@/features/search/hooks";
@@ -17,7 +17,18 @@ import {
   SearchDialogInputRow,
 } from "@/features/search/ui/SearchScopeControls";
 import { HighlightedSearchText } from "@/features/search/ui/HighlightedSearchText";
-import { useSearchMenuKeyboardNavigation } from "@/features/search/ui/useSearchMenuKeyboardNavigation";
+import {
+  isNewWindowSearchResult,
+  useSearchMenuKeyboardNavigation,
+} from "@/features/search/ui/useSearchMenuKeyboardNavigation";
+import { isNewWindowPointerEvent } from "@/features/popout/newWindowGesture";
+import { OPEN_IN_NEW_WINDOW_LABEL } from "@/features/popout/ui/OpenInNewWindowMenuItem";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuTrigger,
+} from "@/shared/ui/context-menu";
 import type { Channel, SearchHit, UserSearchResult } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
 import { normalizePubkey, truncateNpub } from "@/shared/lib/pubkey";
@@ -39,6 +50,8 @@ type TopbarSearchProps = {
   onOpenChannel: (channelId: string) => void;
   onOpenResult: (hit: SearchHit, query: string) => void;
   onOpenUser?: (user: UserSearchResult) => void | Promise<void>;
+  /** Opens a channel/DM/person/message result in a pop-out window. */
+  onOpenResultInNewWindow?: (result: SearchResult, query: string) => void;
   onBrowseChannels?: () => void | Promise<void>;
   onCreateAgent?: () => void | Promise<void>;
   onCreateChannel?: () => void | Promise<void>;
@@ -383,6 +396,7 @@ export function TopbarSearch({
   onOpenChannel,
   onOpenResult,
   onOpenUser,
+  onOpenResultInNewWindow,
   onBrowseChannels,
   onCreateAgent,
   onCreateChannel,
@@ -586,6 +600,21 @@ export function TopbarSearch({
     ],
   );
 
+  const openResultInNewWindow = React.useMemo(
+    () =>
+      onOpenResultInNewWindow
+        ? (result: SearchResult) => {
+            if (!isNewWindowSearchResult(result)) return;
+            const queryForResult = resultQuery;
+            setIsOpen(false);
+            setScopeChannelId(null);
+            setQuery("");
+            onOpenResultInNewWindow(result, queryForResult);
+          }
+        : undefined,
+    [onOpenResultInNewWindow, resultQuery, setQuery],
+  );
+
   // Edge-trigger: the counter never resets, so `!== 0` would replay on remount.
   const lastFocusRequestRef = React.useRef(focusRequest);
   React.useEffect(() => {
@@ -645,6 +674,7 @@ export function TopbarSearch({
     hasLeadingAction: hasScopeAction,
     onActivateLeadingAction: activateCurrentChannelScope,
     onOpenResult: openResult,
+    onOpenResultInNewWindow: openResultInNewWindow,
     onRemoveScope: removeChannelScope,
     query,
     scopeActive: Boolean(scopeChannel),
@@ -696,7 +726,7 @@ export function TopbarSearch({
           ? formatRelativeTime(result.hit.createdAt)
           : null;
 
-    return (
+    const row = (
       <button
         aria-selected={menuIndex === selectedMenuIndex}
         className={cn(
@@ -708,7 +738,32 @@ export function TopbarSearch({
             : "hover:bg-muted/35",
         )}
         key={resultKey(result)}
-        onClick={() => openResult(result)}
+        onClick={(event) => {
+          if (
+            openResultInNewWindow &&
+            isNewWindowSearchResult(result) &&
+            isNewWindowPointerEvent(event)
+          ) {
+            event.preventDefault();
+            openResultInNewWindow(result);
+            return;
+          }
+          openResult(result);
+        }}
+        onAuxClick={(event) => {
+          if (
+            event.button !== 1 ||
+            !openResultInNewWindow ||
+            !isNewWindowSearchResult(result)
+          ) {
+            return;
+          }
+          event.preventDefault();
+          openResultInNewWindow(result);
+        }}
+        onMouseDown={(event) => {
+          if (event.button === 1) event.preventDefault();
+        }}
         onMouseEnter={() => setSelectedMenuIndex(menuIndex)}
         role="option"
         type="button"
@@ -792,6 +847,23 @@ export function TopbarSearch({
           </span>
         ) : null}
       </button>
+    );
+    if (!openResultInNewWindow || !isNewWindowSearchResult(result)) {
+      return row;
+    }
+    return (
+      <ContextMenu key={resultKey(result)}>
+        <ContextMenuTrigger asChild>{row}</ContextMenuTrigger>
+        <ContextMenuContent>
+          <ContextMenuItem
+            data-testid="open-in-new-window"
+            onSelect={() => openResultInNewWindow(result)}
+          >
+            <AppWindow aria-hidden="true" className="h-4 w-4" />
+            <span>{OPEN_IN_NEW_WINDOW_LABEL}</span>
+          </ContextMenuItem>
+        </ContextMenuContent>
+      </ContextMenu>
     );
   };
 

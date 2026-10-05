@@ -11,6 +11,8 @@ type AppHuddleShellProps = {
   currentPubkey?: string;
   isCompanionOpen: boolean;
   isDrawerOpen: boolean;
+  /** Pop-out windows show no huddle bar and never own the audio session. */
+  isPopout?: boolean;
   isRoom: boolean;
   onCompanionOpen: () => void;
   onHuddleStartPendingChange: (pending: boolean) => void;
@@ -47,6 +49,7 @@ export function AppHuddleShell({
   currentPubkey,
   isCompanionOpen,
   isDrawerOpen,
+  isPopout = false,
   isRoom,
   onCompanionOpen,
   onHuddleStartPendingChange,
@@ -55,15 +58,16 @@ export function AppHuddleShell({
   onViewHuddleChannel,
   onVisibilityChange,
 }: AppHuddleShellProps) {
+  const isMainShell = !isRoom && !isPopout;
   return (
     <HuddleProvider
-      ownsAudioSession={!isRoom}
+      ownsAudioSession={isMainShell}
       onHuddleStartPendingChange={
-        isRoom ? undefined : onHuddleStartPendingChange
+        isMainShell ? onHuddleStartPendingChange : undefined
       }
-      onHuddleStarted={isRoom ? undefined : onHuddleStarted}
-      onShowHuddleInMainApp={isRoom ? undefined : onShowHuddleInMainApp}
-      onViewHuddleChannel={isRoom ? undefined : onViewHuddleChannel}
+      onHuddleStarted={isMainShell ? onHuddleStarted : undefined}
+      onShowHuddleInMainApp={isMainShell ? onShowHuddleInMainApp : undefined}
+      onViewHuddleChannel={isMainShell ? onViewHuddleChannel : undefined}
     >
       <HuddleShortcutHandler>
         <RemindMeLaterProvider pubkey={currentPubkey}>
@@ -91,7 +95,7 @@ export function AppHuddleShell({
               <BuzzTheme.GradientLayer />
               {children}
             </div>
-            {isRoom || !isCompanionOpen ? (
+            {!isPopout && (isRoom || !isCompanionOpen) ? (
               <div className="buzz-huddle-drawer-slot absolute inset-x-0 bottom-0 z-[2] h-(--buzz-huddle-drawer-height)">
                 <AppHuddleBar
                   mode={isRoom ? "room" : "main"}

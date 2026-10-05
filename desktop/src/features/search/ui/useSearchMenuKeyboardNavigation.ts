@@ -1,12 +1,19 @@
 import * as React from "react";
 
+import { isNewWindowKeyEvent } from "@/features/popout/newWindowGesture";
 import type { SearchResult } from "@/features/search/ui/SearchResultItem";
+
+/** Search results that have a pop-out destination (not create/browse actions). */
+export function isNewWindowSearchResult(result: SearchResult): boolean {
+  return result.kind !== "action";
+}
 
 export function useSearchMenuKeyboardNavigation({
   activeResults,
   hasLeadingAction,
   onActivateLeadingAction,
   onOpenResult,
+  onOpenResultInNewWindow,
   onRemoveScope,
   query,
   scopeActive,
@@ -17,6 +24,8 @@ export function useSearchMenuKeyboardNavigation({
   hasLeadingAction: boolean;
   onActivateLeadingAction: () => void;
   onOpenResult: (result: SearchResult) => void;
+  /** Cmd+Enter (macOS) / Ctrl+Enter: open the selected result in a new window. */
+  onOpenResultInNewWindow?: (result: SearchResult) => void;
   onRemoveScope: () => void;
   query: string;
   scopeActive: boolean;
@@ -63,6 +72,16 @@ export function useSearchMenuKeyboardNavigation({
 
       if (event.key === "Enter" && !event.nativeEvent.isComposing) {
         event.preventDefault();
+        if (onOpenResultInNewWindow && isNewWindowKeyEvent(event)) {
+          const result =
+            hasLeadingAction && selectedMenuIndex === 0
+              ? undefined
+              : activeResults[selectedMenuIndex - (hasLeadingAction ? 1 : 0)];
+          if (result && isNewWindowSearchResult(result)) {
+            onOpenResultInNewWindow(result);
+          }
+          return;
+        }
         if (hasLeadingAction && selectedMenuIndex === 0) {
           onActivateLeadingAction();
           return;
@@ -77,6 +96,7 @@ export function useSearchMenuKeyboardNavigation({
       hasLeadingAction,
       onActivateLeadingAction,
       onOpenResult,
+      onOpenResultInNewWindow,
       onRemoveScope,
       query.length,
       scopeActive,

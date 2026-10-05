@@ -9,6 +9,9 @@ import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
 import type { ForumPost } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
+import type { PopoutDestination } from "@/features/popout/popoutRoute";
+import { NewWindowContextMenu } from "@/features/popout/ui/NewWindowContextMenu";
+import { useNewWindowGestures } from "@/features/popout/useOpenInNewWindow";
 import { resolveMentionProps } from "@/shared/lib/resolveMentionNames";
 import { Markdown } from "@/shared/ui/markdown";
 import { hasLinkPreviewSuppression } from "@/features/messages/lib/formatTimelineMessages";
@@ -26,6 +29,8 @@ type ForumPostCardProps = {
   isDeleting?: boolean;
   onClick: (post: ForumPost) => void;
   onDelete?: (eventId: string) => void;
+  /** Where modified clicks and the context menu open a new window. */
+  newWindowDestination?: PopoutDestination | null;
 };
 
 export function ForumPostCard({
@@ -37,7 +42,9 @@ export function ForumPostCard({
   isDeleting,
   onClick,
   onDelete,
+  newWindowDestination,
 }: ForumPostCardProps) {
+  const newWindow = useNewWindowGestures(newWindowDestination);
   const authorLabel = resolveUserLabel({
     pubkey: post.pubkey,
     currentPubkey,
@@ -62,95 +69,103 @@ export function ForumPostCard({
       : post.content;
 
   return (
-    // biome-ignore lint/a11y/useSemanticElements: Cannot use <button> because DeleteActionMenu renders a nested <button> via DropdownMenuTrigger, which is invalid HTML
-    <div
-      role="button"
-      tabIndex={0}
-      className={cn(
-        "group w-full cursor-pointer rounded-xl border border-border/60 bg-card p-4 text-left transition-colors hover:border-border hover:bg-accent/40",
-        isActive && "border-primary/40 bg-accent/60",
-        isDeleting && "pointer-events-none opacity-50",
-      )}
-      onClick={() => onClick(post)}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
+    <NewWindowContextMenu destination={newWindowDestination}>
+      {/* biome-ignore lint/a11y/useSemanticElements: Cannot use <button> because DeleteActionMenu renders a nested <button> via DropdownMenuTrigger, which is invalid HTML */}
+      <div
+        role="button"
+        tabIndex={0}
+        className={cn(
+          "group w-full cursor-pointer rounded-xl border border-border/60 bg-card p-4 text-left transition-colors hover:border-border hover:bg-accent/40",
+          isActive && "border-primary/40 bg-accent/60",
+          isDeleting && "pointer-events-none opacity-50",
+        )}
+        data-testid={`forum-post-card-${post.eventId}`}
+        onClick={(event) => {
+          if (newWindow.handleClick(event)) return;
           onClick(post);
-        }
-      }}
-    >
-      <div className="flex items-center gap-2">
-        {/* biome-ignore lint/a11y/noStaticElementInteractions: presentation wrapper stops click propagation to parent card */}
-        <div onClick={(e) => e.stopPropagation()} role="presentation">
-          <UserProfilePopover
-            pubkey={post.pubkey}
-            role={authorIsAgent ? "bot" : undefined}
-          >
-            <button
-              className="flex items-center gap-2 rounded-lg focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
-              type="button"
+        }}
+        {...newWindow.pointerProps}
+        onKeyDown={(e) => {
+          if (newWindow.handleKeyDown(e)) return;
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            onClick(post);
+          }
+        }}
+      >
+        <div className="flex items-center gap-2">
+          {/* biome-ignore lint/a11y/noStaticElementInteractions: presentation wrapper stops click propagation to parent card */}
+          <div onClick={(e) => e.stopPropagation()} role="presentation">
+            <UserProfilePopover
+              pubkey={post.pubkey}
+              role={authorIsAgent ? "bot" : undefined}
             >
-              <UserAvatar
-                accent={authorIsAgent}
-                avatarUrl={avatarUrl}
-                displayName={authorLabel}
-                shape={authorIsAgent ? "squircle" : "circle"}
-                size="sm"
-              />
-              <span className="truncate text-sm font-medium text-foreground hover:underline">
-                {authorLabel}
-              </span>
-            </button>
-          </UserProfilePopover>
-        </div>
-        <span className="text-xs text-muted-foreground">
-          {formatRelativeTime(post.createdAt)}
-        </span>
+              <button
+                className="flex items-center gap-2 rounded-lg focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                type="button"
+              >
+                <UserAvatar
+                  accent={authorIsAgent}
+                  avatarUrl={avatarUrl}
+                  displayName={authorLabel}
+                  shape={authorIsAgent ? "squircle" : "circle"}
+                  size="sm"
+                />
+                <span className="truncate text-sm font-medium text-foreground hover:underline">
+                  {authorLabel}
+                </span>
+              </button>
+            </UserProfilePopover>
+          </div>
+          <span className="text-xs text-muted-foreground">
+            {formatRelativeTime(post.createdAt)}
+          </span>
 
-        {canDelete && onDelete ? (
-          // biome-ignore lint/a11y/noStaticElementInteractions: presentation wrapper only stops click propagation to parent card link
-          <div
-            className="ml-auto"
-            onClick={(e) => e.stopPropagation()}
-            role="presentation"
-          >
-            <DeleteActionMenu
-              label="post"
-              onConfirm={() => onDelete(post.eventId)}
-            />
+          {canDelete && onDelete ? (
+            // biome-ignore lint/a11y/noStaticElementInteractions: presentation wrapper only stops click propagation to parent card link
+            <div
+              className="ml-auto"
+              onClick={(e) => e.stopPropagation()}
+              role="presentation"
+            >
+              <DeleteActionMenu
+                label="post"
+                onConfirm={() => onDelete(post.eventId)}
+              />
+            </div>
+          ) : null}
+        </div>
+
+        <div className="mt-2">
+          <Markdown
+            className="text-sm"
+            content={previewContent}
+            messageId={post.eventId}
+            linkPreviewsSuppressed={hasLinkPreviewSuppression(post.tags)}
+            linkPreviewTags={post.tags}
+            imetaByUrl={imetaByUrl}
+            mentionAll={mentionAll}
+            mentionNames={mentionNames}
+            mentionPubkeysByName={mentionPubkeysByName}
+          />
+        </div>
+
+        {summary && summary.replyCount > 0 ? (
+          <div className="mt-3 flex items-center gap-1.5 text-xs text-muted-foreground">
+            <MessageSquare className="h-4 w-4" />
+            <span>
+              {summary.replyCount}{" "}
+              {summary.replyCount === 1 ? "reply" : "replies"}
+            </span>
+            {summary.lastReplyAt ? (
+              <>
+                <span className="text-muted-foreground/50">·</span>
+                <span>last {formatRelativeTime(summary.lastReplyAt)}</span>
+              </>
+            ) : null}
           </div>
         ) : null}
       </div>
-
-      <div className="mt-2">
-        <Markdown
-          className="text-sm"
-          content={previewContent}
-          messageId={post.eventId}
-          linkPreviewsSuppressed={hasLinkPreviewSuppression(post.tags)}
-          linkPreviewTags={post.tags}
-          imetaByUrl={imetaByUrl}
-          mentionAll={mentionAll}
-          mentionNames={mentionNames}
-          mentionPubkeysByName={mentionPubkeysByName}
-        />
-      </div>
-
-      {summary && summary.replyCount > 0 ? (
-        <div className="mt-3 flex items-center gap-1.5 text-xs text-muted-foreground">
-          <MessageSquare className="h-4 w-4" />
-          <span>
-            {summary.replyCount}{" "}
-            {summary.replyCount === 1 ? "reply" : "replies"}
-          </span>
-          {summary.lastReplyAt ? (
-            <>
-              <span className="text-muted-foreground/50">·</span>
-              <span>last {formatRelativeTime(summary.lastReplyAt)}</span>
-            </>
-          ) : null}
-        </div>
-      ) : null}
-    </div>
+    </NewWindowContextMenu>
   );
 }

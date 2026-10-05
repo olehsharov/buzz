@@ -1,5 +1,11 @@
 import * as React from "react";
 
+import type { PopoutDestination } from "@/features/popout/popoutRoute";
+import { OPEN_IN_NEW_WINDOW_LABEL } from "@/features/popout/ui/OpenInNewWindowMenuItem";
+import {
+  type NewWindowGestures,
+  useNewWindowGestures,
+} from "@/features/popout/useOpenInNewWindow";
 import { copyTextToClipboard } from "@/shared/lib/clipboard";
 import { cn } from "@/shared/lib/cn";
 import { InlineChip } from "@/shared/ui/InlineChip";
@@ -20,10 +26,12 @@ import {
 function useBuzzLinkContextMenu({
   href,
   interactive,
+  newWindow,
   onOpenLink,
 }: {
   href: string | undefined;
   interactive: boolean;
+  newWindow: NewWindowGestures;
   onOpenLink: () => void;
 }) {
   const [position, setPosition] =
@@ -52,6 +60,17 @@ function useBuzzLinkContextMenu({
               onOpenLink();
             },
           },
+          ...(newWindow.enabled
+            ? [
+                {
+                  label: OPEN_IN_NEW_WINDOW_LABEL,
+                  onSelect: () => {
+                    closeMenu();
+                    newWindow.open();
+                  },
+                },
+              ]
+            : []),
           {
             label: "Copy link",
             onSelect: () => {
@@ -111,6 +130,7 @@ export function BuzzLinkChip({
   href,
   icon: Icon,
   interactive,
+  newWindowDestination,
   onOpenLink,
   wrapping = false,
   ...props
@@ -118,12 +138,18 @@ export function BuzzLinkChip({
   href?: string;
   icon: InlineChipIconKind;
   interactive: boolean;
+  /** Where Cmd/Ctrl-click, middle click, and the menu open a new window. */
+  newWindowDestination?: PopoutDestination | null;
   onOpenLink: () => void;
   wrapping?: boolean;
 }) {
+  const newWindow = useNewWindowGestures(
+    interactive ? newWindowDestination : null,
+  );
   const { contextMenu, onContextMenuCapture } = useBuzzLinkContextMenu({
     href,
     interactive,
+    newWindow,
     onOpenLink,
   });
   const visibleChildren =
@@ -137,16 +163,14 @@ export function BuzzLinkChip({
   const onKeyDown = React.useCallback(
     (event: React.KeyboardEvent<HTMLSpanElement>) => {
       props.onKeyDown?.(event);
-      if (
-        event.defaultPrevented ||
-        (event.key !== "Enter" && event.key !== " ")
-      ) {
+      if (event.defaultPrevented || newWindow.handleKeyDown(event)) return;
+      if (event.key !== "Enter" && event.key !== " ") {
         return;
       }
       event.preventDefault();
       onOpenLink();
     },
-    [onOpenLink, props.onKeyDown],
+    [newWindow, onOpenLink, props.onKeyDown],
   );
 
   if (!interactive) {
@@ -172,7 +196,11 @@ export function BuzzLinkChip({
         interactive
         role="button"
         tabIndex={0}
-        onClick={onOpenLink}
+        onClick={(event) => {
+          if (newWindow.handleClick(event)) return;
+          onOpenLink();
+        }}
+        {...newWindow.pointerProps}
         onContextMenuCapture={onContextMenuCapture}
         onKeyDown={onKeyDown}
       >
@@ -187,18 +215,25 @@ export function BuzzInlineLink({
   children,
   href,
   interactive,
+  newWindowDestination,
   onOpenLink,
   ...props
 }: Omit<React.ComponentPropsWithoutRef<"button">, "onClick"> & {
   href?: string;
   interactive: boolean;
+  /** Where Cmd/Ctrl-click, middle click, and the menu open a new window. */
+  newWindowDestination?: PopoutDestination | null;
   onOpenLink: () => void;
 }) {
   const contextMenuHref =
     href ?? (typeof props.title === "string" ? props.title : undefined);
+  const newWindow = useNewWindowGestures(
+    interactive ? newWindowDestination : null,
+  );
   const { contextMenu, onContextMenuCapture } = useBuzzLinkContextMenu({
     href: contextMenuHref,
     interactive,
+    newWindow,
     onOpenLink,
   });
 
@@ -212,7 +247,15 @@ export function BuzzInlineLink({
         {...props}
         type="button"
         className="cursor-pointer font-medium text-primary underline underline-offset-4 transition-colors hover:text-primary/80"
-        onClick={onOpenLink}
+        onClick={(event) => {
+          if (newWindow.handleClick(event)) return;
+          onOpenLink();
+        }}
+        onKeyDown={(event) => {
+          props.onKeyDown?.(event);
+          if (!event.defaultPrevented) newWindow.handleKeyDown(event);
+        }}
+        {...newWindow.pointerProps}
         onContextMenuCapture={onContextMenuCapture}
       >
         {children}
