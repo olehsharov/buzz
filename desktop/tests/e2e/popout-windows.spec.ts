@@ -479,10 +479,10 @@ test.describe("pop-out window", () => {
     await expect(paused).toContainText("E2E Test");
     await expect(page.getByTestId("chat-title")).toHaveCount(0);
 
-    // "Open in main window" from the paused state only focuses the main
+    // "Show main window" from the paused state only focuses the main
     // window: this window's route belongs to a different community.
     await clearCommandLog(page);
-    await paused.getByRole("button", { name: "Open in main window" }).click();
+    await paused.getByRole("button", { name: "Show main window" }).click();
     await expect
       .poll(async () =>
         (await commandLog(page))
@@ -581,7 +581,7 @@ test.describe("pop-out window", () => {
     );
     await expect(empty).toBeVisible();
     await expect(
-      empty.getByRole("button", { name: "Open in main window" }),
+      empty.getByRole("button", { name: "Show main window" }),
     ).toBeVisible();
     await expect(page.getByTestId("app-sidebar")).toHaveCount(0);
   });

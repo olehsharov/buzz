@@ -19,6 +19,8 @@ import { useIsFullscreen } from "@/shared/lib/useIsFullscreen";
 import { Button } from "@/shared/ui/button";
 
 export const OPEN_IN_MAIN_WINDOW_LABEL = "Open in main window";
+/** Focus-only variant: no destination is handed over. */
+export const SHOW_MAIN_WINDOW_LABEL = "Show main window";
 
 /**
  * Hands `destination` (or, failing that, the window's launch route) to the
@@ -56,7 +58,7 @@ export function OpenInMainWindowButton({
       variant="ghost"
     >
       <AppWindowMac aria-hidden="true" />
-      {OPEN_IN_MAIN_WINDOW_LABEL}
+      {focusOnly ? SHOW_MAIN_WINDOW_LABEL : OPEN_IN_MAIN_WINDOW_LABEL}
     </Button>
   );
 }
