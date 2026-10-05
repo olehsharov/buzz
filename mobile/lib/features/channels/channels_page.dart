@@ -46,12 +46,11 @@ import 'channel_sections/channel_sections_storage.dart';
 import 'channel_sort/channel_sort_provider.dart';
 import 'channel_sort/channel_sort_storage.dart';
 import 'channel_stars/channel_stars_provider.dart';
+import 'channel_unread_provider.dart';
 import 'channels_provider.dart';
 import '../../shared/read_state/deferred_read_state_update.dart';
-import '../../shared/read_state/read_state_format.dart';
 import '../../shared/read_state/read_state_provider.dart';
 import '../../shared/read_state/read_state_time.dart';
-import 'unread_badge/observed_unread_event.dart';
 
 part 'channels_page/body.dart';
 part 'channels_page/browse_channels_sheet.dart';
@@ -105,59 +104,6 @@ const Curve _kSectionCollapseCurve = Curves.easeInCubic;
 const double _kSectionCollapsedScaleY = 0.98;
 const double _kHeaderFrostScrollDistance = Grid.xxl;
 const double _kHeaderFrostMaxBlurSigma = 23.12;
-
-class _UnreadChannelState {
-  final Set<String> ids;
-
-  const _UnreadChannelState({required this.ids});
-}
-
-_UnreadChannelState _computeUnreadChannelState({
-  required Iterable<Channel> channels,
-  required ReadStateState readState,
-  required ChannelsNotifier channelsNotifier,
-}) {
-  if (!readState.isReady) {
-    return const _UnreadChannelState(ids: {});
-  }
-
-  final latestObservedByChannel = channelsNotifier.latestObservedByChannel;
-  final observedEventsByChannel =
-      channelsNotifier.observedUnreadEventsByChannel;
-  final ids = <String>{};
-
-  for (final channel in channels) {
-    if (readState.locallyForcedChannelIds.contains(channel.id)) {
-      ids.add(channel.id);
-      continue;
-    }
-
-    final latestObserved = latestObservedByChannel[channel.id];
-    if (latestObserved == null) continue;
-
-    final channelReadAt = readState.effectiveTimestamp(channel.id);
-    if (channelReadAt != null && latestObserved <= channelReadAt) continue;
-
-    final observedEvents = observedEventsByChannel[channel.id];
-    int? readAtForObservedEvent(ObservedUnreadEvent event) =>
-        observedUnreadEventReadAt(
-          event,
-          channelReadAt,
-          (rootId) => readState.effectiveTimestamp(threadContextKey(rootId)),
-          (messageId) => readState.effectiveTimestamp(msgContextKey(messageId)),
-        );
-
-    final unreadCount = countUnreadObservedEvents(
-      observedEvents,
-      readAtForObservedEvent,
-    );
-    if (unreadCount == 0) continue;
-
-    ids.add(channel.id);
-  }
-
-  return _UnreadChannelState(ids: ids);
-}
 
 class ChannelsPage extends HookConsumerWidget {
   const ChannelsPage({

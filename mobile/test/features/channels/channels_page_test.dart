@@ -2361,6 +2361,72 @@ void main() {
     );
   });
 
+  testWidgets('reading one channel rebuilds only that channel tile', (
+    tester,
+  ) async {
+    Channel channel(String id, String name) => Channel(
+      id: id,
+      name: name,
+      channelType: 'stream',
+      visibility: 'open',
+      description: '',
+      createdBy: 'abc',
+      createdAt: DateTime(2025),
+      memberCount: 3,
+      lastMessageAt: DateTime.fromMillisecondsSinceEpoch(
+        20 * 1000,
+        isUtc: true,
+      ),
+      isMember: true,
+    );
+    final readState = _FakeReadStateNotifier(
+      const ReadStateState(
+        isReady: true,
+        pubkey: 'pk',
+        contexts: {'a': 10, 'b': 10, 'c': 10},
+      ),
+    );
+
+    await tester.pumpWidget(
+      buildTestable(
+        overrides: [
+          channelsProvider.overrideWith(
+            () => _FakeNotifier(
+              [
+                channel('a', 'alpha'),
+                channel('b', 'beta'),
+                channel('c', 'gamma'),
+              ],
+              observedEventsByChannel: {
+                'a': [_observed(id: 'msg-a', createdAt: 20)],
+                'b': [_observed(id: 'msg-b', createdAt: 20)],
+                'c': [_observed(id: 'msg-c', createdAt: 20)],
+              },
+            ),
+          ),
+          readStateProvider.overrideWith(() => readState),
+        ],
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    Text label(String name) => tester.widget<Text>(find.text(name));
+    final betaBefore = label('beta');
+    final gammaBefore = label('gamma');
+    for (final name in ['alpha', 'beta', 'gamma']) {
+      expect(label(name).style?.fontWeight, FontWeight.w700, reason: name);
+    }
+
+    readState.markContextRead('a', 20);
+    await tester.pump();
+
+    expect(label('alpha').style?.fontWeight, FontWeight.w400);
+    // The other tiles were not rebuilt: their widgets are the same instances.
+    expect(identical(label('beta'), betaBefore), isTrue);
+    expect(identical(label('gamma'), gammaBefore), isTrue);
+    expect(label('beta').style?.fontWeight, FontWeight.w700);
+  });
+
   testWidgets('bolds channels with unread thread activity without a badge', (
     tester,
   ) async {

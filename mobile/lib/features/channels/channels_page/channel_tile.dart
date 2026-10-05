@@ -2,7 +2,9 @@ part of '../channels_page.dart';
 
 class _ChannelTile extends ConsumerWidget {
   final Channel channel;
-  final bool isUnread;
+
+  /// Whether the list has seeded read markers; see [ChannelListUnread].
+  final bool unreadSeeded;
   final bool isMuted;
   final String? currentPubkey;
   final VoidCallback onTap;
@@ -16,7 +18,7 @@ class _ChannelTile extends ConsumerWidget {
 
   const _ChannelTile({
     required this.channel,
-    required this.isUnread,
+    required this.unreadSeeded,
     required this.currentPubkey,
     required this.onTap,
     this.isMuted = false,
@@ -26,6 +28,8 @@ class _ChannelTile extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final unread = ref.watch(channelListUnreadProvider(channel.id));
+    final isUnread = unread.hasUnread && (unreadSeeded || unread.hasReadMarker);
     final contentColor = isMuted
         ? navigationSecondaryForeground(context)
         : navigationPrimaryForeground(
@@ -35,7 +39,7 @@ class _ChannelTile extends ConsumerWidget {
     return InkWell(
       borderRadius: BorderRadius.circular(Radii.md),
       onTap: onTap,
-      onLongPress: () => _showChannelActions(context, ref),
+      onLongPress: () => _showChannelActions(context, ref, isUnread),
       child: Padding(
         padding: const EdgeInsets.only(
           left: _kChannelSectionInset,
@@ -123,7 +127,7 @@ class _ChannelTile extends ConsumerWidget {
     );
   }
 
-  void _showChannelActions(BuildContext context, WidgetRef ref) {
+  void _showChannelActions(BuildContext context, WidgetRef ref, bool isUnread) {
     showChannelActionsSheet(
       context: context,
       channel: channel,
