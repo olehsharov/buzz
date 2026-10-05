@@ -1,3 +1,4 @@
+import type { SearchResult } from "@/features/search/ui/SearchResultItem";
 import type { AddCommunityPrefillRequest } from "@/features/communities/addCommunityPrefill";
 import type { LeaveCommunityResult } from "@/features/communities/leaveCommunity";
 import type { Community } from "@/features/communities/types";
@@ -92,6 +93,8 @@ export type AppSidebarProps = {
   onSelectHome: () => void;
   onSelectChannel: (channelId: string) => void;
   onOpenSearchResult: (hit: SearchHit, query: string) => void;
+  /** Opens a search result in a pop-out window (Cmd/Ctrl+Enter, menu). */
+  onOpenSearchResultInNewWindow?: (result: SearchResult, query: string) => void;
   /** Full channel set for global search, including channels outside the joined sidebar list. */
   searchChannels: Channel[];
   searchFocusRequests: readonly [global: number, channel: number];

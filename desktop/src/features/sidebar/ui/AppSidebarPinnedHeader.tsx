@@ -1,3 +1,4 @@
+import type { SearchResult } from "@/features/search/ui/SearchResultItem";
 import { Activity, Bot, Folders, Inbox, Zap } from "lucide-react";
 
 import { TopbarSearch } from "@/features/search/ui/TopbarSearch";
@@ -32,6 +33,7 @@ type AppSidebarPinnedHeaderProps = {
   onCreateChannel: () => void;
   onOpenDm: (input: { pubkeys: string[] }) => Promise<void>;
   onOpenSearchResult: (hit: SearchHit, query: string) => void;
+  onOpenSearchResultInNewWindow?: (result: SearchResult, query: string) => void;
   onSelectChannel: (channelId: string) => void;
   searchChannels: Channel[];
   searchFocusRequest: number;
@@ -59,6 +61,7 @@ export function AppSidebarPinnedHeader({
   onCreateChannel,
   onOpenDm,
   onOpenSearchResult,
+  onOpenSearchResultInNewWindow,
   onSelectChannel,
   searchChannels,
   searchFocusRequest,
@@ -78,6 +81,7 @@ export function AppSidebarPinnedHeader({
         focusRequest={searchFocusRequest}
         onOpenChannel={onSelectChannel}
         onOpenResult={onOpenSearchResult}
+        onOpenResultInNewWindow={onOpenSearchResultInNewWindow}
         onOpenUser={(user) => onOpenDm({ pubkeys: [user.pubkey] })}
         onBrowseChannels={onBrowseChannels}
         onCreateAgent={onCreateAgent}

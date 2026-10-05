@@ -63,18 +63,27 @@ import { communityRelaySetKey } from "./communityRelaySet";
  * See AGENTS.md "Community Switching" for the full contract.
  */
 async function resetCommunityState({
+  ownsAppGlobals,
   resetAvatarState,
 }: {
+  /**
+   * False in pop-out windows: native app-global state (the pending deep-link
+   * queue, the tray) belongs to the main window, so a pop-out resets only its
+   * own webview's singletons.
+   */
+  ownsAppGlobals: boolean;
   resetAvatarState: boolean;
 }): Promise<void> {
   relayClient.disconnect();
-  await resetNavigationDeepLinkDrain();
+  if (ownsAppGlobals) {
+    await resetNavigationDeepLinkDrain();
+  }
   resetRateLimitGate();
   clearAllDrafts();
   resetAgentObserverStore();
   resetActiveAgentTurnsStore();
   resetAgentWorkingSignal();
-  if (isTauri() && isMacPlatform()) {
+  if (ownsAppGlobals && isTauri() && isMacPlatform()) {
     void clearTrayAgentActivity();
   }
   if (resetAvatarState) {
@@ -127,6 +136,12 @@ type CommunityInitResult =
  * Returns a discriminated union — only render the app after the
  * community is applied. When `needsSetup` is true, the caller
  * should show a first-run welcome screen.
+ *
+ * `options.popout`: a pop-out window never mutates native app-global state.
+ * It does not apply the workspace (the main window already applied it — see
+ * popoutCommunityGate), refresh avatar trust, auto-connect a default relay,
+ * or touch the native deep-link queue / tray. A null community just tears
+ * down this window's singletons (the pause path).
  */
 export function useCommunityInit(
   activeCommunity: Community | null,
@@ -134,7 +149,9 @@ export function useCommunityInit(
   isSharedIdentity: boolean,
   suppressAutoConnect = false,
   communities: readonly Community[] = [],
+  options: { popout?: boolean } = {},
 ): CommunityInitResult {
+  const isPopout = options.popout === true;
   const communityRelaysKey = communityRelaySetKey(communities);
   const [result, setResult] = useState<CommunityInitResult>({
     isReady: false,
@@ -146,6 +163,7 @@ export function useCommunityInit(
   // Startup waits for this narrow IPC before workspace apply can restore agents.
   const avatarTrustUpdateRef = useRef(Promise.resolve());
   useEffect(() => {
+    if (isPopout) return;
     // Keep native writes ordered too, not just the frontend waiters. A failed
     // update leaves the chain rejected so restoration stays blocked until reload.
     const update = avatarTrustUpdateRef.current.then(() =>
@@ -161,7 +179,7 @@ export function useCommunityInit(
         error: "Could not refresh avatar source permissions. Reload to retry.",
       });
     });
-  }, [communityRelaysKey]);
+  }, [communityRelaysKey, isPopout]);
 
   // Track whether this is the initial mount or a community switch.
   // On the initial mount we skip resetting singletons (they're fresh).
@@ -184,6 +202,25 @@ export function useCommunityInit(
     let cancelled = false;
 
     async function init() {
+      if (!activeCommunity && isPopout) {
+        if (hasInitializedRef.current) {
+          hasInitializedRef.current = false;
+          appliedRelayUrlRef.current = null;
+          prevCommunityIdRef.current = null;
+          try {
+            await resetCommunityState({
+              ownsAppGlobals: false,
+              resetAvatarState: true,
+            });
+          } catch (error) {
+            console.error("Failed to pause pop-out community state:", error);
+          }
+        }
+        if (!cancelled) {
+          setResult({ isReady: false, needsSetup: false, appliedKey: null });
+        }
+        return;
+      }
       if (!activeCommunity) {
         if (hasInitializedRef.current) {
           if (prevCommunityIdRef.current) {
@@ -191,7 +228,10 @@ export function useCommunityInit(
             prevCommunityIdRef.current = null;
           }
           try {
-            await resetCommunityState({ resetAvatarState: true });
+            await resetCommunityState({
+              ownsAppGlobals: true,
+              resetAvatarState: true,
+            });
           } catch (error) {
             console.error("Failed to reset community state:", error);
             if (!cancelled) {
@@ -311,6 +351,7 @@ export function useCommunityInit(
         }
         try {
           await resetCommunityState({
+            ownsAppGlobals: !isPopout,
             resetAvatarState:
               appliedRelayUrlRef.current !== activeCommunity.relayUrl ||
               (identityPubkey !== null &&
@@ -355,13 +396,18 @@ export function useCommunityInit(
           await trustUpdate;
           if (cancelled) return;
         } while (trustUpdate !== avatarTrustUpdateRef.current);
-        await applyCommunity(
-          activeCommunity.relayUrl,
-          undefined,
-          activeCommunity.token,
-          activeCommunity.reposDir,
-          getOverrides().agentManagedProfiles === true,
-        );
+        // The backend workspace is process-global and owned by the main
+        // window; a pop-out only renders once its community is already the
+        // applied one (popoutCommunityGate).
+        if (!isPopout) {
+          await applyCommunity(
+            activeCommunity.relayUrl,
+            undefined,
+            activeCommunity.token,
+            activeCommunity.reposDir,
+            getOverrides().agentManagedProfiles === true,
+          );
+        }
       } catch (error) {
         // A bad `repos_dir` no longer reaches here — `apply_workspace` treats
         // it as non-fatal (relay/keys apply, bad value not persisted, REPOS
@@ -432,6 +478,7 @@ export function useCommunityInit(
     isSharedIdentity,
     suppressAutoConnect,
     communityKey,
+    isPopout,
   ]);
 
   return result;

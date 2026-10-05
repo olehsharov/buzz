@@ -106,7 +106,17 @@ import { AppShellTrayMenu } from "@/app/useAppShellTrayMenu";
 import { AppProfilePanelProvider } from "@/app/AppProfilePanelProvider";
 import { AppWorkflowEditorOverlayProvider } from "@/app/AppWorkflowEditorOverlayProvider";
 import { LazySettingsScreen } from "@/app/LazySettingsScreen";
+import {
+  openInMainWindow,
+  PopoutHeader,
+  PopoutUnavailableState,
+} from "@/features/popout/ui/PopoutChrome";
+import { useMainWindowPopoutNavigation } from "@/features/popout/useMainWindowPopoutNavigation";
+import { openSearchResultInNewWindow } from "@/features/popout/searchResultNewWindow";
+import type { SearchResult } from "@/features/search/ui/SearchResultItem";
+import { currentWindowKind } from "@/shared/lib/windowKind";
 const EMPTY_CHANNELS: Channel[] = [];
+const EMPTY_COMMUNITIES: never[] = [];
 export function AppShell() {
   useWebviewZoomShortcuts();
   useTauriWindowDrag();
@@ -128,6 +138,11 @@ export function AppShell() {
     showHuddleInMainApp,
     viewHuddleChannel,
   } = useHuddlePresentation();
+  // Huddle companions and pop-outs load this same shell but own no
+  // app-global work: unread tracking, notifications, badge, deep links,
+  // settings, sidebar, and community rail stay with the main window.
+  const isPopout = currentWindowKind() === "popout";
+  const isAuxWindow = isHuddleRoom || isPopout;
   const hasCommunityRail = communitiesHook.communities.length > 1;
   const addCommunityDialog = useAddCommunityDialogState();
   const [isChannelManagementOpen, setIsChannelManagementOpen] =
@@ -143,7 +158,9 @@ export function AppShell() {
   const mainInsetRef = React.useRef<HTMLElement>(null);
   const location = useLocation();
   const queryClient = useQueryClient();
-  useManagedAgentRuntimeReconciliation(communitiesHook.communities); // sync storage snapshot
+  useManagedAgentRuntimeReconciliation(
+    isPopout ? EMPTY_COMMUNITIES : communitiesHook.communities,
+  ); // sync storage snapshot
   const {
     goAgents,
     goChannel,
@@ -154,6 +171,7 @@ export function AppShell() {
     goSettings,
     goWorkflows,
     closeSettings,
+    openInNewWindow,
     openSearchHit,
   } = useAppNavigation();
   const { canGoBack, canGoForward, goBack, goForward } =
@@ -173,7 +191,7 @@ export function AppShell() {
     selectedView,
   });
   // Settings lives in history so back returns to the previous app entry.
-  const settingsOpen = location.pathname === "/settings";
+  const settingsOpen = !isPopout && location.pathname === "/settings";
   const rawLocationSearchSection = (location.search as { section?: unknown })
     .section;
   // Migrate the legacy "moderation" token to "relay-admin" (renamed section
@@ -201,12 +219,12 @@ export function AppShell() {
     communitiesHook.activeCommunity?.relayUrl,
   );
   usePersonaSync(
-    identityQuery.data?.pubkey,
+    isPopout ? undefined : identityQuery.data?.pubkey,
     communitiesHook.activeCommunity?.relayUrl,
   );
   useAgentsDataRefresh();
   // Chunk F: auto-restart drifted idle agents (per-agent opt-out, default ON).
-  useAutoRestartPolicy(communitiesHook.activeCommunity?.relayUrl);
+  useAutoRestartPolicy(communitiesHook.activeCommunity?.relayUrl, !isPopout);
   // Owner-global observer ingestion: receives + decrypts agent observer
   // frames and keeps derived active-turn liveness in sync app-wide, so no
   // individual screen/panel has to mount its own bridge for ingestion.
@@ -219,7 +237,7 @@ export function AppShell() {
   // deferred): seeds kind 24200 for fresh identities, no-ops for explicit
   // opt-outs. Frames before the listener opens are permanently lost.
   const observerReconciled = useObserverArchiveReconciliation(
-    identityQuery.data?.pubkey,
+    isPopout ? undefined : identityQuery.data?.pubkey,
   );
   // useArchiveSync must wait for reconciliation, or listeners could open
   // before kind 24200 is guaranteed present in the subscription.
@@ -230,14 +248,17 @@ export function AppShell() {
   // Kind 44200 is relay-persisted (durable) and stays deferred: missed
   // startup frames can be replayed, so there's no ordering constraint.
   const deferredPubkey = startupReady ? identityQuery.data?.pubkey : undefined;
-  useAgentMetricArchiveSeed(deferredPubkey);
+  useAgentMetricArchiveSeed(isPopout ? undefined : deferredPubkey);
   const profileQuery = useProfileQuery();
   useRelayAutoHeal();
   usePresenceSubscription();
   useUserStatusSubscription();
   useCommunityEmojiLiveUpdates();
   useMembershipNotifications(identityQuery.data?.pubkey);
-  const presenceSession = usePresenceSession(deferredPubkey);
+  // Presence is published by the main window only.
+  const presenceSession = usePresenceSession(
+    isPopout ? undefined : deferredPubkey,
+  );
   const selfStatusQuery = useUserStatusQuery(
     deferredPubkey ? [deferredPubkey] : [],
   );
@@ -248,7 +269,7 @@ export function AppShell() {
   const channelsQuery = useChannelsQuery();
   const channels = channelsQuery.data ?? [];
   useReminderNotifications(
-    identityQuery.data?.pubkey,
+    isPopout ? undefined : identityQuery.data?.pubkey,
     notificationSettings.settings,
     channels,
   );
@@ -290,6 +311,7 @@ export function AppShell() {
   React.useEffect(() => {
     const activeCommunityId = communitiesHook.activeCommunity?.id;
     if (
+      isPopout ||
       hasRestoredCommunityDestinationRef.current ||
       !channelsQuery.isSuccess ||
       channelsQuery.dataUpdatedAt === 0 ||
@@ -331,6 +353,7 @@ export function AppShell() {
     communitiesHook.activeCommunity?.id,
     goChannel,
     goHome,
+    isPopout,
     selectedView,
     sidebarChannels,
   ]);
@@ -363,7 +386,7 @@ export function AppShell() {
     handleThreadReplyDesktopNotification,
   } = useAppShellDesktopNotifications({
     channels,
-    enabled: !isHuddleRoom,
+    enabled: !isAuxWindow,
     goChannel,
     goHome,
     notificationSettings: notificationSettings.settings,
@@ -399,12 +422,16 @@ export function AppShell() {
     muteThread,
     unmuteThread,
   } = useUnreadChannels(
-    isHuddleRoom ? EMPTY_CHANNELS : sidebarChannels,
-    isHuddleRoom ? null : activeChannel,
+    isAuxWindow ? EMPTY_CHANNELS : sidebarChannels,
+    isAuxWindow ? null : activeChannel,
     {
       pubkey: identityQuery.data?.pubkey,
       relayClient,
-      relayUrl: communitiesHook.activeCommunity?.relayUrl,
+      // Without a relay scope the observed-unread store never opens, so the
+      // main window stays its single writer. Read markers still publish.
+      relayUrl: isPopout
+        ? undefined
+        : communitiesHook.activeCommunity?.relayUrl,
       currentPubkey: identityQuery.data?.pubkey,
       mutedChannelIds,
       notifyForActiveChannel: notificationSettings.settings.notifyWhileViewing,
@@ -462,7 +489,7 @@ export function AppShell() {
       identityQuery.data?.pubkey,
       notificationSettings.settings,
       notificationSettings.setDesktopEnabled,
-      !isHuddleRoom,
+      !isAuxWindow,
       selectedView === "home" && !settingsOpen,
       getChannelReadAt,
       readStateVersion,
@@ -511,7 +538,7 @@ export function AppShell() {
   const openDmMutation = useOpenDmMutation();
   const hideDmMutation = useHideDmMutation();
   useDmResurfaceFromMessages({
-    pubkey: identityQuery.data?.pubkey,
+    pubkey: isPopout ? undefined : identityQuery.data?.pubkey,
     relayUrl: communitiesHook.activeCommunity?.relayUrl,
     reopen: openDmMutation.mutateAsync,
   });
@@ -640,9 +667,14 @@ export function AppShell() {
   const handleOpenSettings = React.useCallback(
     (section: SettingsSection = DEFAULT_SETTINGS_SECTION) => {
       setIsChannelManagementOpen(false);
+      // Settings belong to the main window; a pop-out just brings it forward.
+      if (isPopout) {
+        openInMainWindow(null, true);
+        return;
+      }
       void goSettings(section);
     },
-    [goSettings],
+    [goSettings, isPopout],
   );
   const handleCloseSettings = React.useCallback(
     () => closeSettings(),
@@ -663,14 +695,27 @@ export function AppShell() {
     },
     [openSearchHit],
   );
+  const openDmAsync = openDmMutation.mutateAsync;
+  const handleOpenSearchResultInNewWindow = React.useCallback(
+    (result: SearchResult) => {
+      void openSearchResultInNewWindow(result, {
+        openDm: openDmAsync,
+        openInNewWindow,
+      }).catch((error: unknown) => {
+        console.error("Failed to open search result in a new window:", error);
+      });
+    },
+    [openDmAsync, openInNewWindow],
+  );
   useAppShellLifecycleEffects({
-    desktopBadgeEnabled: !isHuddleRoom,
+    desktopBadgeEnabled: !isAuxWindow,
     homeBadgeCountExcludingHighPriority,
     topLevelUnreadChannelIds,
     unreadChannelNotificationCount,
   });
   // Dispatch `buzz://` deep links only from the main window; the companion is dedicated to its active Huddle route.
-  useAppDeepLinks(!isHuddleRoom);
+  useAppDeepLinks(!isAuxWindow);
+  useMainWindowPopoutNavigation(!isAuxWindow);
   const handleOpenCreateChannel = React.useCallback(
     () => setIsCreateChannelOpen(true),
     [],
@@ -679,7 +724,7 @@ export function AppShell() {
     activeChannelId: selectedView === "channel" ? selectedChannelId : null,
     canSearchCurrentChannel:
       selectedView === "channel" && Boolean(activeChannel),
-    disabled: settingsOpen || isHuddleRoom,
+    disabled: settingsOpen || isAuxWindow,
     onBrowseChannels: handleOpenBrowseChannels,
     onCreateChannel: handleOpenCreateChannel,
     onGoHome: goHome,
@@ -690,9 +735,12 @@ export function AppShell() {
   useSettingsShortcuts({
     onClose: handleCloseSettings,
     onOpenSettings: handleOpenSettings,
-    open: isHuddleRoom ? undefined : settingsOpen,
+    open: isAuxWindow ? undefined : settingsOpen,
   });
   useMarkAsReadShortcuts({
+    // Escape still marks the visible channel read in a pop-out; Shift+Escape
+    // (mark everything read) is a main-window action.
+    allowMarkAll: !isAuxWindow,
     activeChannelId: activeChannel?.id ?? null,
     activeChannelLastMessageAt: activeChannel?.lastMessageAt,
     markAllChannelsRead,
@@ -701,7 +749,7 @@ export function AppShell() {
   });
   return (
     <PreventSleepProvider>
-      {!isHuddleRoom ? (
+      {!isAuxWindow ? (
         <AppShellTrayMenu
           channels={channels}
           goChannel={goChannel}
@@ -752,6 +800,7 @@ export function AppShell() {
             currentPubkey={identityQuery.data?.pubkey}
             isCompanionOpen={isHuddleCompanionOpen}
             isDrawerOpen={isHuddleDrawerOpen}
+            isPopout={isPopout}
             isRoom={isHuddleRoom}
             onCompanionOpen={handleHuddleCompanionOpen}
             onHuddleStartPendingChange={handleHuddleStartPendingChange}
@@ -760,7 +809,7 @@ export function AppShell() {
             onViewHuddleChannel={viewHuddleChannel}
             onVisibilityChange={handleHuddleVisibilityChange}
           >
-            {hasCommunityRail && !isHuddleRoom ? (
+            {hasCommunityRail && !isAuxWindow ? (
               <CommunityRail
                 activeCommunityId={communitiesHook.activeCommunity?.id ?? null}
                 onAddCommunity={addCommunityDialog.openDialog}
@@ -776,7 +825,13 @@ export function AppShell() {
             >
               <AppProfilePanelProvider>
                 <AppWorkflowEditorOverlayProvider>
-                  {!settingsOpen && !isHuddleRoom ? (
+                  {isPopout ? (
+                    <PopoutHeader
+                      channels={channels}
+                      currentPubkey={identityQuery.data?.pubkey}
+                    />
+                  ) : null}
+                  {!settingsOpen && !isAuxWindow ? (
                     <AppTopChrome
                       canGoBack={canGoBack}
                       canGoForward={canGoForward}
@@ -827,7 +882,7 @@ export function AppShell() {
                     </div>
                   ) : (
                     <div className="relative flex min-h-0 flex-1 overflow-visible">
-                      {!isHuddleRoom ? (
+                      {!isAuxWindow ? (
                         <AppSidebar
                           activeCommunity={communitiesHook.activeCommunity}
                           channels={sidebarChannels}
@@ -885,6 +940,9 @@ export function AppShell() {
                           onSelectAgents={() => void goAgents()}
                           onSelectChannel={handleSidebarChannelSelect}
                           onOpenSearchResult={handleOpenSearchResult}
+                          onOpenSearchResultInNewWindow={
+                            handleOpenSearchResultInNewWindow
+                          }
                           searchChannels={channels}
                           searchFocusRequests={[
                             searchFocusRequest,
@@ -939,15 +997,20 @@ export function AppShell() {
                           hasCommunityRail={hasCommunityRail}
                           isHuddleRoom={isHuddleRoom}
                           isHuddleRoomStarting={isHuddleRoomStarting}
+                          isPopout={isPopout}
                           mainInsetRef={mainInsetRef}
                           terminal={
                             <TerminalBootstrap {...effectiveTerminalContext} />
                           }
                         >
-                          <Outlet />
+                          {isPopout && location.pathname === "/" ? (
+                            <PopoutUnavailableState kind="empty" />
+                          ) : (
+                            <Outlet />
+                          )}
                         </AppShellChannelSurface>
                       </TerminalContextOverrideProvider>
-                      {!isHuddleRoom ? (
+                      {!isAuxWindow ? (
                         <RelayConnectionOverlay
                           card={relayConnectionCard}
                           errorMessage={channelsErrorMessage}
@@ -992,7 +1055,7 @@ export function AppShell() {
                     onOpenChange={setIsSendFeedbackOpen}
                     open={isSendFeedbackOpen}
                   />
-                  {!isHuddleRoom ? <ProtectedGlobalOverlay /> : null}
+                  {!isAuxWindow ? <ProtectedGlobalOverlay /> : null}
                 </AppWorkflowEditorOverlayProvider>
               </AppProfilePanelProvider>
             </SidebarProvider>

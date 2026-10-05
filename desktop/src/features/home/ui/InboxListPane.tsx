@@ -1,4 +1,5 @@
 import {
+  AppWindow,
   AlertCircle,
   Bell,
   Clock,
@@ -18,6 +19,13 @@ import {
 import { buildInboxListRows } from "@/features/home/lib/inboxListRows";
 import { hasRenderedVideoAttachment } from "@/features/messages/lib/videoReviewContext";
 import { getThreadReference } from "@/features/messages/lib/threading";
+import {
+  isNewWindowKeyEvent,
+  isNewWindowPointerEvent,
+} from "@/features/popout/newWindowGesture";
+import type { PopoutDestination } from "@/features/popout/popoutRoute";
+import { OPEN_IN_NEW_WINDOW_LABEL } from "@/features/popout/ui/OpenInNewWindowMenuItem";
+import { useOpenInNewWindow } from "@/features/popout/useOpenInNewWindow";
 import { InboxFilterMenu } from "@/features/home/ui/InboxFilterMenu";
 import {
   DraftsPanel,
@@ -240,6 +248,20 @@ type InboxListPaneProps = {
   unreadOnly: boolean;
 };
 
+/** Pop-out destination for an inbox row's conversation context. */
+function inboxItemNewWindowDestination(
+  item: InboxItem,
+): PopoutDestination | null {
+  const channelId = item.item.channelId;
+  if (!channelId) return null;
+  return {
+    kind: "channel",
+    channelId,
+    messageId: item.id,
+    threadRootId: getThreadReference(item.item.tags).rootId,
+  };
+}
+
 export function InboxListPane({
   activeReminderEventIds,
   agentPubkeys,
@@ -272,6 +294,7 @@ export function InboxListPane({
   const isReminders = filter === "reminders";
   const isDrafts = filter === "drafts";
   const isMixedInboxView = filter === "all";
+  const openInNewWindow = useOpenInNewWindow();
   const scrollRef = React.useRef<HTMLDivElement>(null);
   const inboxRows = React.useMemo(
     () =>
@@ -331,6 +354,29 @@ export function InboxListPane({
     const rowHighlightColor = isSelected
       ? "color-mix(in srgb, hsl(var(--background)) 70%, hsl(var(--muted)) 30%)"
       : "color-mix(in srgb, hsl(var(--background)) 75%, hsl(var(--muted)) 25%)";
+    const newWindowDestination = canOpen
+      ? inboxItemNewWindowDestination(item)
+      : null;
+    // Cmd/Ctrl-click and middle click open the item's context in a pop-out;
+    // Cmd/Ctrl+Enter does the same from the keyboard row button.
+    const openRowInNewWindow = (event: {
+      preventDefault: () => void;
+      stopPropagation: () => void;
+    }) => {
+      if (!newWindowDestination) return false;
+      event.preventDefault();
+      event.stopPropagation();
+      openInNewWindow(newWindowDestination);
+      return true;
+    };
+    const newWindowPointerProps = {
+      onAuxClick: (event: React.MouseEvent<HTMLElement>) => {
+        if (event.button === 1) openRowInNewWindow(event);
+      },
+      onMouseDown: (event: React.MouseEvent<HTMLElement>) => {
+        if (event.button === 1 && newWindowDestination) event.preventDefault();
+      },
+    };
     const handleRowContentClick = (event: React.MouseEvent<HTMLElement>) => {
       const target = event.target;
       if (
@@ -339,6 +385,7 @@ export function InboxListPane({
       ) {
         return;
       }
+      if (isNewWindowPointerEvent(event) && openRowInNewWindow(event)) return;
       onSelect(item.id);
     };
     const row = (
@@ -355,7 +402,16 @@ export function InboxListPane({
         <button
           aria-label={`Open inbox item from ${item.senderLabel}`}
           className="absolute inset-0 z-0 block w-full border-l border-l-transparent text-left"
-          onClick={() => onSelect(item.id)}
+          onClick={(event) => {
+            if (isNewWindowPointerEvent(event) && openRowInNewWindow(event)) {
+              return;
+            }
+            onSelect(item.id);
+          }}
+          onKeyDown={(event) => {
+            if (isNewWindowKeyEvent(event)) openRowInNewWindow(event);
+          }}
+          {...newWindowPointerProps}
           type="button"
         >
           <span
@@ -373,6 +429,7 @@ export function InboxListPane({
         <div
           className="relative z-10 block w-full cursor-pointer px-3 py-4 text-left"
           onClick={handleRowContentClick}
+          {...newWindowPointerProps}
         >
           <div className="flex min-w-0 items-start gap-2.5">
             <div
@@ -583,6 +640,15 @@ export function InboxListPane({
             <ExternalLink className="h-4 w-4" />
             {openLabel}
           </ContextMenuItem>
+          {newWindowDestination ? (
+            <ContextMenuItem
+              data-testid="open-in-new-window"
+              onClick={() => openInNewWindow(newWindowDestination)}
+            >
+              <AppWindow aria-hidden="true" className="h-4 w-4" />
+              {OPEN_IN_NEW_WINDOW_LABEL}
+            </ContextMenuItem>
+          ) : null}
           <ContextMenuItem
             disabled={!hasChannelTarget}
             onClick={() => {

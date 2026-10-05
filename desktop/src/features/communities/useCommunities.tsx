@@ -2,6 +2,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useRef,
   useState,
@@ -157,13 +158,30 @@ export type UseCommunitiesReturn = {
 
 const CommunitiesContext = createContext<UseCommunitiesReturn | null>(null);
 
-export function CommunitiesProvider({ children }: { children: ReactNode }) {
-  const value = useCommunitiesInternal();
+export function CommunitiesProvider({
+  children,
+  pinnedCommunityId,
+}: {
+  children: ReactNode;
+  /**
+   * Pop-out windows pin their community: it is the window's active community
+   * regardless of (and without ever writing) the main window's persisted
+   * active-community selection. `null` pins to "no community". Omit for the
+   * main window.
+   */
+  pinnedCommunityId?: string | null;
+}) {
+  const value = useCommunitiesInternal(pinnedCommunityId);
   return (
     <CommunitiesContext.Provider value={value}>
       {children}
     </CommunitiesContext.Provider>
   );
+}
+
+/** Like useCommunities, but null outside a CommunitiesProvider. */
+export function useOptionalCommunities(): UseCommunitiesReturn | null {
+  return useContext(CommunitiesContext);
 }
 
 export function useCommunities(): UseCommunitiesReturn {
@@ -174,20 +192,43 @@ export function useCommunities(): UseCommunitiesReturn {
   return ctx;
 }
 
-function useCommunitiesInternal(): UseCommunitiesReturn {
+function useCommunitiesInternal(
+  pinnedCommunityId?: string | null,
+): UseCommunitiesReturn {
+  const isPinned = pinnedCommunityId !== undefined;
   const [communities, setCommunitiesState] =
     useState<Community[]>(loadCommunities);
-  const [activeId, setActiveId] = useState<string | null>(
-    loadActiveCommunityId,
+  const [storedActiveId, setActiveId] = useState<string | null>(() =>
+    isPinned ? null : loadActiveCommunityId(),
   );
+  const activeId = isPinned ? pinnedCommunityId : storedActiveId;
   const [reinitKey, setReinitKey] = useState(0);
   const communitiesRef = useRef(communities);
   communitiesRef.current = communities;
 
   const activeCommunity = useMemo(
-    () => communities.find((w) => w.id === activeId) ?? communities[0] ?? null,
-    [communities, activeId],
+    () =>
+      isPinned
+        ? // A pinned window never falls back to another community.
+          (communities.find((w) => w.id === activeId) ?? null)
+        : (communities.find((w) => w.id === activeId) ??
+          communities[0] ??
+          null),
+    [communities, activeId, isPinned],
   );
+
+  // A pinned (pop-out) window follows edits the main window makes to the
+  // shared community list (rename, relay/token change) via storage events.
+  useEffect(() => {
+    if (!isPinned) return;
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === null || event.key === "buzz-communities") {
+        setCommunitiesState(loadCommunities());
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [isPinned]);
 
   const addCommunity = useCallback((community: Community): string => {
     const existing = communitiesRef.current.find(
@@ -266,7 +307,7 @@ function useCommunitiesInternal(): UseCommunitiesReturn {
         } else {
           saveCommunities(result.communities);
 
-          if (result.activeId !== activeId && result.activeId) {
+          if (!isPinned && result.activeId !== activeId && result.activeId) {
             saveActiveCommunityId(result.activeId);
             setActiveId(result.activeId);
           }
@@ -275,16 +316,17 @@ function useCommunitiesInternal(): UseCommunitiesReturn {
         return result.communities;
       });
     },
-    [activeId],
+    [activeId, isPinned],
   );
 
   const switchCommunity = useCallback(
     (id: string) => {
-      if (id === activeId) return;
+      // A pinned window's community is fixed for its lifetime.
+      if (isPinned || id === activeId) return;
       saveActiveCommunityId(id);
       setActiveId(id);
     },
-    [activeId],
+    [activeId, isPinned],
   );
 
   const reconnectCommunity = useCallback(() => {

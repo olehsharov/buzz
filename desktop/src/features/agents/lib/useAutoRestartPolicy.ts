@@ -73,7 +73,11 @@ const POLICY_TICK_MS = 15_000;
  * further shrunk by the pre-fire summary re-fetch). `relayUrl` is the active
  * community's relay, which the restarts target.
  */
-export function useAutoRestartPolicy(relayUrl: string | undefined) {
+export function useAutoRestartPolicy(
+  relayUrl: string | undefined,
+  /** False in pop-out windows: agent lifecycle is owned by the main window. */
+  enabled = true,
+) {
   const queryClient = useQueryClient();
   const agents: ManagedAgent[] | undefined = useManagedAgentsQuery().data;
   const edgesRef = React.useRef(new Map<string, AutoRestartEdgeState>());
@@ -94,7 +98,7 @@ export function useAutoRestartPolicy(relayUrl: string | undefined) {
   // No dependency array by design: the tick pattern re-runs this effect
   // every render so it reads live store state; all mutation is ref-local.
   React.useEffect(() => {
-    if (!agents) return;
+    if (!agents || !enabled) return;
     const now = Date.now();
     const edges = edgesRef.current;
 

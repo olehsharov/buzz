@@ -211,6 +211,12 @@ type E2eConfig = {
   mock?: {
     /** Tauri window label exposed to the app. Defaults to the main window. */
     windowLabel?: string;
+    /**
+     * One-time payload returned by `take_popout_launch` (pop-out windows,
+     * label `popout-<uuid>`). Consumed on first read, like the native side;
+     * null/omitted simulates a reloaded pop-out.
+     */
+    popoutLaunch?: { route: string; community: unknown } | null;
     ttsSettings?: {
       version: number;
       agentTextToSpeech: boolean;
@@ -12223,6 +12229,18 @@ export function maybeInstallE2eTauriMocks() {
         return null;
       case "close_huddle_companion":
         await emit("huddle-companion-returned", null);
+        return null;
+      // Pop-out windows. Calls are recorded in __BUZZ_E2E_COMMAND_LOG__.
+      case "open_popout_window":
+        return `popout-${crypto.randomUUID()}`;
+      case "take_popout_launch": {
+        const launchKey = "buzz.e2e.popout-launch-taken.v1";
+        // One-time per window, surviving reloads like the native slot.
+        if (window.sessionStorage.getItem(launchKey) === "1") return null;
+        window.sessionStorage.setItem(launchKey, "1");
+        return activeConfig?.mock?.popoutLaunch ?? null;
+      }
+      case "focus_main_window_route":
         return null;
       case "leave_huddle":
       case "end_huddle":

@@ -16,6 +16,7 @@ import {
 } from "lucide-react";
 
 import { useAppShell } from "@/app/AppShellContext";
+import { OpenInNewWindowMenuItem } from "@/features/popout/ui/OpenInNewWindowMenuItem";
 import {
   useArchiveChannelMutation,
   useChannelMembersQuery,
@@ -235,6 +236,10 @@ export function ChannelContextMenuItems({
 
   return (
     <>
+      <OpenInNewWindowMenuItem
+        destination={{ kind: "channel", channelId: channel.id }}
+      />
+      <ContextMenuSeparator />
       <CopyChannelSubmenu channel={channel} />
       {showMove ? (
         <MoveToSectionSubmenu

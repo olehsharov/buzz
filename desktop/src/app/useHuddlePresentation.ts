@@ -10,6 +10,7 @@ import {
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { channelsQueryKey } from "@/features/channels/hooks";
 import { huddleWindowChannelId } from "@/features/huddle/lib/huddleWindow";
+import { currentWindowKind } from "@/shared/lib/windowKind";
 import {
   channelMessagesKey,
   channelWindowKey,
@@ -31,6 +32,8 @@ type HuddleTranscriptRouteState = {
 export function useHuddlePresentation() {
   const huddleRoomChannelId = huddleWindowChannelId();
   const isHuddleRoom = huddleRoomChannelId !== null;
+  // Only the main window opens the huddle companion or follows it back.
+  const isMainWindowShell = currentWindowKind() === "main";
   const [isHuddleDrawerOpen, setIsHuddleDrawerOpen] = React.useState(false);
   const [isHuddleCompanionOpen, setIsHuddleCompanionOpen] =
     React.useState(false);
@@ -344,7 +347,7 @@ export function useHuddlePresentation() {
   );
 
   React.useEffect(() => {
-    if (isHuddleRoom) return;
+    if (!isMainWindowShell) return;
 
     let cancelled = false;
     let unlisten: (() => void) | null = null;
@@ -375,7 +378,7 @@ export function useHuddlePresentation() {
       cancelled = true;
       unlisten?.();
     };
-  }, [isHuddleRoom, showHuddleInMainApp]);
+  }, [isMainWindowShell, showHuddleInMainApp]);
 
   React.useEffect(() => {
     let cancelled = false;
@@ -403,7 +406,7 @@ export function useHuddlePresentation() {
           event.payload.parent_channel_id;
       }
       if (
-        !isHuddleRoom &&
+        isMainWindowShell &&
         event.payload.phase === "creating" &&
         event.payload.ephemeral_channel_id
       ) {
@@ -438,7 +441,7 @@ export function useHuddlePresentation() {
     };
   }, [
     hideHuddleChannel,
-    isHuddleRoom,
+    isMainWindowShell,
     openHuddleCompanion,
     queryClient,
     returnToHuddleParentAfterEnd,

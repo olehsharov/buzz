@@ -124,6 +124,7 @@ export function AppSidebar({
   onSelectHome,
   onSelectChannel,
   onOpenSearchResult,
+  onOpenSearchResultInNewWindow,
   searchChannels,
   searchFocusRequests,
   onSelectSettings,
@@ -532,6 +533,7 @@ export function AppSidebar({
           onCreateChannel={handleOpenCreateChannel}
           onOpenDm={onOpenDm}
           onOpenSearchResult={onOpenSearchResult}
+          onOpenSearchResultInNewWindow={onOpenSearchResultInNewWindow}
           onSelectChannel={onSelectChannel}
           searchChannels={searchChannels}
           searchFocusRequest={searchFocusRequests[0]}

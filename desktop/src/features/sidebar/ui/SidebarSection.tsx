@@ -9,6 +9,7 @@ import {
 
 import { AgentManagementMarker } from "@/features/agents/ui/OtherSetupAgentMarker";
 import { ChannelContextMenuItems } from "@/features/sidebar/ui/ChannelContextMenu";
+import { useNewWindowGestures } from "@/features/popout/useOpenInNewWindow";
 import type { ActiveChannelTurnSummary } from "@/features/agents/activeAgentTurnsStore";
 import { formatElapsed } from "@/features/agents/ui/agentSessionUtils";
 import { ChannelGlyph } from "@/features/channels/ui/ChannelGlyph";
@@ -265,6 +266,10 @@ export function ChannelMenuButton({
   onSelectChannel: (channelId: string) => void;
 }) {
   const resolvedLabel = label ?? channel.name;
+  const newWindow = useNewWindowGestures({
+    kind: "channel",
+    channelId: channel.id,
+  });
   const ephemeralDisplay = getEphemeralChannelDisplay(channel);
   const { hasSidebarUnreadProjections, unreadThreadChannelIds } = useAppShell();
   const hasThreadUnread =
@@ -296,7 +301,14 @@ export function ChannelMenuButton({
       data-channel-id={channel.id}
       data-testid={`channel-${channel.name}`}
       isActive={isActive}
-      onClick={() => onSelectChannel(channel.id)}
+      onClick={(event) => {
+        if (newWindow.handleClick(event)) return;
+        onSelectChannel(channel.id);
+      }}
+      onKeyDown={(event) => {
+        newWindow.handleKeyDown(event);
+      }}
+      {...newWindow.pointerProps}
       tooltip={resolvedLabel}
       type="button"
     >

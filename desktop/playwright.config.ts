@@ -32,6 +32,7 @@ export default defineConfig({
         "**/exact-key-profile.spec.ts",
         "**/key-import-reveal.spec.ts",
         "**/navigation.spec.ts",
+        "**/popout-windows.spec.ts",
         "**/channels.spec.ts",
         "**/stream-draft-ghost.spec.ts",
         "**/channel-shared-header-backdrop.spec.ts",
