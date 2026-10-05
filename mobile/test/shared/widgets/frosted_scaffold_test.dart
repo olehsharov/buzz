@@ -1,7 +1,11 @@
+import 'package:buzz/features/channels/jump_to_latest_button.dart';
+import 'package:buzz/features/channels/sticky_date_header.dart';
 import 'package:buzz/shared/theme/theme.dart';
 import 'package:buzz/shared/widgets/frosted_app_bar.dart';
 import 'package:buzz/shared/widgets/frosted_scaffold.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 Border? _appBarBorder(WidgetTester tester) {
@@ -105,5 +109,60 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(_appBarBorder(tester)?.bottom.color.a, 0);
+  });
+
+  testWidgets('frosted surfaces share one backdrop snapshot per scaffold', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    final stickyState = ValueNotifier(
+      const StickyDateHeaderState(label: 'Today'),
+    );
+    try {
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: AppTheme.light(),
+          home: FrostedScaffold(
+            appBar: const FrostedAppBar(title: Text('general')),
+            body: Stack(
+              children: [
+                Positioned(
+                  top: 120,
+                  left: 0,
+                  right: 0,
+                  child: StickyDateHeader(state: stickyState),
+                ),
+                Positioned(
+                  bottom: 40,
+                  left: 0,
+                  right: 0,
+                  child: Center(child: JumpToLatestButton(onPressed: () {})),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+
+      List<RenderBackdropFilter> filters() => tester
+          .renderObjectList<RenderBackdropFilter>(find.byType(BackdropFilter))
+          .toList();
+      // App bar, sticky date pill, and jump-to-latest button.
+      expect(filters(), hasLength(3));
+      final keys = filters().map((filter) => filter.backdropKey).toSet();
+      expect(keys, hasLength(1));
+      expect(keys.single, isNotNull);
+
+      // The group key survives rebuilds; a fresh key per build would make the
+      // engine re-snapshot and rebuild every grouped filter.
+      final firstKey = keys.single;
+      stickyState.value = const StickyDateHeaderState(label: 'Yesterday');
+      tester.element(find.byType(FrostedScaffold)).markNeedsBuild();
+      await tester.pump();
+      expect(filters().map((filter) => filter.backdropKey).toSet(), {firstKey});
+    } finally {
+      stickyState.dispose();
+      debugDefaultTargetPlatformOverride = null;
+    }
   });
 }

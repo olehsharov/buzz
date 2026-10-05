@@ -314,7 +314,7 @@ class FrostedAppBar extends StatelessWidget {
 
     final child = ClipRect(
       child: frosted
-          ? BackdropFilter(
+          ? BackdropFilter.grouped(
               filter: ImageFilter.blur(
                 sigmaX: frostedBlurSigma,
                 sigmaY: frostedBlurSigma,

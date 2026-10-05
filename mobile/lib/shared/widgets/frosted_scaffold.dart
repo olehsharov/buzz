@@ -52,6 +52,9 @@ class FrostedScaffold extends HookWidget {
     final isScrolledUnder = useState(false);
     final pendingScrolledUnder = useRef<bool?>(null);
     final scrollUpdateScheduled = useRef(false);
+    // One stable key per scaffold: a fresh [BackdropGroup] key on every build
+    // would notify every grouped filter and defeat the shared snapshot.
+    final backdropKey = useMemoized(BackdropKey.new);
 
     void updateScrollUnder(bool next) {
       if (scrollUpdateScheduled.value) {
@@ -94,7 +97,13 @@ class FrostedScaffold extends HookWidget {
       floatingActionButton: floatingActionButton,
       body: FrostedScrollUnderScope(
         isScrolledUnder: isScrolledUnder.value,
-        child: Stack(children: _stackChildren(observedBody)),
+        // The app bar, sticky date pill, and jump-to-latest button blur the
+        // same page content. Grouping them lets the engine capture that
+        // backdrop once per frame instead of once per filter.
+        child: BackdropGroup(
+          backdropKey: backdropKey,
+          child: Stack(children: _stackChildren(observedBody)),
+        ),
       ),
     );
     if (!useUtilitySurfaceTheme) return scaffold;

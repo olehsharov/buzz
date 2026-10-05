@@ -3,6 +3,7 @@ import 'package:buzz/features/channels/sticky_date_header.dart';
 import 'package:buzz/shared/theme/theme.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -164,6 +165,13 @@ void main() {
 
       expect(find.byType(UiKitView), findsNothing);
       expect(find.byType(BackdropFilter), findsOneWidget);
+      // Outside a BackdropGroup the pill keeps its own backdrop snapshot.
+      expect(
+        tester
+            .renderObject<RenderBackdropFilter>(find.byType(BackdropFilter))
+            .backdropKey,
+        isNull,
+      );
       expect(find.text('Today'), findsOneWidget);
       expect(
         find.byKey(const ValueKey('sticky-date-header-clip')),
@@ -202,6 +210,37 @@ void main() {
             )
             .width,
         lessThan(tester.getSize(find.byType(StickyDateHeader)).width),
+      );
+    } finally {
+      state.dispose();
+      debugDefaultTargetPlatformOverride = null;
+    }
+  });
+
+  testWidgets('Android date pill joins the enclosing backdrop group', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    final state = ValueNotifier(const StickyDateHeaderState(label: 'Today'));
+    final groupKey = BackdropKey();
+    try {
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: AppTheme.light(),
+          home: Scaffold(
+            body: BackdropGroup(
+              backdropKey: groupKey,
+              child: StickyDateHeader(state: state),
+            ),
+          ),
+        ),
+      );
+
+      expect(
+        tester
+            .renderObject<RenderBackdropFilter>(find.byType(BackdropFilter))
+            .backdropKey,
+        same(groupKey),
       );
     } finally {
       state.dispose();
