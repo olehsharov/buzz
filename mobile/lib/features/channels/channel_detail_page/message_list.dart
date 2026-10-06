@@ -15,7 +15,11 @@ class _MessageList extends HookConsumerWidget {
   final bool isMember;
   final bool isArchived;
   final double appBarTitleContentHeight;
-  final double composerBottomInset;
+
+  /// Height of the composer dock. Listened to rather than passed by value so
+  /// composer and keyboard resizes move the list padding without rebuilding
+  /// the list or its rows.
+  final ValueListenable<double> composerBottomInset;
   final FocusNode? composerFocusNode;
   final VoidCallback? restoreComposerFocus;
 
@@ -93,9 +97,11 @@ class _MessageList extends HookConsumerWidget {
               .clamp(0.0, double.infinity)
               .toDouble()
         : settledImeBottomInset.value;
-    final timelineBottomInset =
-        composerBottomInset + (followsLatest.value ? settledImeLift : 0);
-    final navigationBottomInset = composerBottomInset + settledImeLift;
+    // The part of the bottom inset owned by this widget's state; the composer
+    // dock height is added from [composerBottomInset] where it is consumed.
+    final timelineImeInset = followsLatest.value ? settledImeLift : 0.0;
+    double timelineBottomInset() =>
+        composerBottomInset.value + (followsLatest.value ? settledImeLift : 0);
     var currentDayTimestamp =
         displayEntries.firstOrNull?.first.message.createdAt;
     var currentDayStartIndex = displayEntries.isEmpty
@@ -225,7 +231,7 @@ class _MessageList extends HookConsumerWidget {
     double latestAlignment() {
       final viewportHeight = timelineViewportHeight.value;
       return viewportHeight > 0
-          ? (timelineBottomInset / viewportHeight).clamp(0.0, 1.0).toDouble()
+          ? (timelineBottomInset() / viewportHeight).clamp(0.0, 1.0).toDouble()
           : 0.0;
     }
 
@@ -435,7 +441,7 @@ class _MessageList extends HookConsumerWidget {
               context,
               titleContentHeight: appBarTitleContentHeight,
             ) -
-            composerBottomInset,
+            composerBottomInset.value,
       );
       final hidesJumpToLatest = shouldHideChannelJumpToLatest(
         isAtLatest: latestIsAtBoundary(),
@@ -535,7 +541,6 @@ class _MessageList extends HookConsumerWidget {
         entries.length,
         itemPositionsListener,
         appBarTitleContentHeight,
-        composerBottomInset,
       ],
     );
 
@@ -548,10 +553,17 @@ class _MessageList extends HookConsumerWidget {
     // Composer size changes and keyboard metrics changes arrive in separate
     // layout passes. Preserve the latest-message anchor for both, but only
     // while the user has not deliberately left the tail.
+    final realignLatest = useRef(realignLatestAfterLayoutChange)
+      ..value = realignLatestAfterLayoutChange;
     useEffect(() {
       realignLatestAfterLayoutChange();
       return null;
-    }, [timelineBottomInset]);
+    }, [timelineImeInset]);
+    useEffect(() {
+      void onComposerInsetChanged() => realignLatest.value();
+      composerBottomInset.addListener(onComposerInsetChanged);
+      return () => composerBottomInset.removeListener(onComposerInsetChanged);
+    }, [composerBottomInset]);
 
     useEffect(() {
       final observer = ImeMetricsSettleObserver(
@@ -673,6 +685,19 @@ class _MessageList extends HookConsumerWidget {
       return null;
     }, [latestEntryId, localSendAnimations]);
 
+    // Build channel names map once for all message bubbles, and keep its
+    // identity while the channel list is unchanged so cached rows stay valid.
+    final channels = ref.watch(channelsProvider).value;
+    final channelNamesMap = useMemoized(
+      () => <String, String>{
+        for (final ch in channels ?? const <Channel>[])
+          ch.name.toLowerCase(): ch.id,
+      },
+      [channels],
+    );
+    final rowCache = useMemoized(_TimelineRowCache.new);
+    rowCache.retainMessages({for (final entry in entries) entry.message.id});
+
     if (entries.isEmpty) {
       return Center(
         child: Column(
@@ -702,14 +727,136 @@ class _MessageList extends HookConsumerWidget {
       );
     }
 
-    // Build channel names map once for all message bubbles.
-    final channelsAsync = ref.watch(channelsProvider);
-    final channelNamesMap = <String, String>{};
-    channelsAsync.whenData((channels) {
-      for (final ch in channels) {
-        channelNamesMap[ch.name.toLowerCase()] = ch.id;
+    Widget buildItem(BuildContext context, int index) {
+      // Loading indicator at the top (last index in reversed list).
+      if (index >= displayEntries.length) {
+        return const Padding(
+          padding: EdgeInsets.symmetric(vertical: Grid.xs),
+          child: Center(
+            child: BuzzLoadingIndicator(
+              size: 24,
+              semanticLabel: 'Loading older messages',
+            ),
+          ),
+        );
       }
-    });
+
+      // Reversed list: index 0 = newest (bottom of screen).
+      final chronIdx = displayEntries.length - 1 - index;
+      final entryGroup = displayEntries[chronIdx];
+      final entry = entryGroup.first;
+      final message = entry.message;
+
+      // Day boundary check — applies to all messages including system.
+      final prevEntry = chronIdx > 0 ? displayEntries[chronIdx - 1].last : null;
+      final prevMessage = prevEntry?.message;
+      final showDayDivider =
+          prevMessage == null ||
+          !isSameDay(prevMessage.createdAt, message.createdAt);
+
+      final showAuthor =
+          !message.isSystem &&
+          (message.hasAttachments ||
+              prevMessage == null ||
+              prevMessage.isSystem ||
+              showDayDivider ||
+              prevMessage.pubkey.toLowerCase() !=
+                  message.pubkey.toLowerCase() ||
+              (message.createdAt - prevMessage.createdAt) > 300);
+
+      return LocalMessageSendTransition(
+        key: ValueKey('channel-message-send-${message.id}'),
+        animate: isRecentLocalMessageSendAnimation(
+          localSendAnimations,
+          message.id,
+        ),
+        startOffsetFactor: showAuthor
+            ? localMessageSendTransitionAvatarStartOffset
+            : localMessageSendTransitionStartOffset,
+        child: Padding(
+          key: ValueKey('channel-message-group-${message.id}'),
+          padding: EdgeInsets.only(bottom: index == 0 ? Grid.xs : 0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (showDayDivider)
+                DayDivider(
+                  label: formatDayHeading(message.createdAt),
+                  dayTimestamp: message.createdAt,
+                  stickyDayTimestamp: stickyDayTimestamp,
+                ),
+              if (message.isSystem)
+                _SystemMessageRow(
+                  message: message,
+                  groupedMessages: entryGroup.length > 1
+                      ? entryGroup.map((entry) => entry.message).toList()
+                      : null,
+                  channelId: channelId,
+                  currentPubkey: currentPubkey,
+                  allMessages: allMessages,
+                  isMember: isMember,
+                  isArchived: isArchived,
+                )
+              else ...[
+                rowCache.resolve(
+                  (kind: _TimelineRowKind.bubble, messageId: message.id),
+                  // Every constructor input. A row is reused only while all
+                  // of them are identical; everything else it shows comes
+                  // from its own provider watches and inherited widgets.
+                  (
+                    message,
+                    showAuthor,
+                    entry.summary != null,
+                    channelNamesMap,
+                    channelId,
+                    currentPubkey,
+                    isMember,
+                    isArchived,
+                    composerFocusNode,
+                    restoreComposerFocus,
+                  ),
+                  () => _MessageBubble(
+                    message: message,
+                    showAuthor: showAuthor,
+                    hasReplies: entry.summary != null,
+                    channelNames: channelNamesMap,
+                    currentChannelId: channelId,
+                    currentPubkey: currentPubkey,
+                    isMember: isMember,
+                    isArchived: isArchived,
+                    composerFocusNode: composerFocusNode,
+                    restoreComposerFocus: restoreComposerFocus,
+                  ),
+                ),
+                if (entry.summary case final summary?)
+                  rowCache.resolve(
+                    (
+                      kind: _TimelineRowKind.threadSummary,
+                      messageId: message.id,
+                    ),
+                    (
+                      summary,
+                      message,
+                      channelId,
+                      currentPubkey,
+                      isMember,
+                      isArchived,
+                    ),
+                    () => _ThreadSummaryRow(
+                      summary: summary,
+                      message: message,
+                      channelId: channelId,
+                      currentPubkey: currentPubkey,
+                      isMember: isMember,
+                      isArchived: isArchived,
+                    ),
+                  ),
+              ],
+            ],
+          ),
+        ),
+      );
+    }
 
     return Stack(
       children: [
@@ -758,125 +905,27 @@ class _MessageList extends HookConsumerWidget {
             return false;
           },
           child: KeyboardDismissOnDrag(
-            child: ScrollablePositionedList.builder(
-              key: const ValueKey('channel-message-list'),
-              itemScrollController: itemScrollController,
-              itemPositionsListener: itemPositionsListener,
-              reverse: true,
-              padding: EdgeInsets.only(
-                left: Grid.gutter,
-                right: Grid.gutter,
-                top: frostedAppBarHeight(
-                  context,
-                  titleContentHeight: appBarTitleContentHeight,
-                ),
-                bottom: timelineBottomInset,
-              ),
-              itemCount: displayEntries.length + (isLoadingOlder.value ? 1 : 0),
-              itemBuilder: (context, index) {
-                // Loading indicator at the top (last index in reversed list).
-                if (index >= displayEntries.length) {
-                  return const Padding(
-                    padding: EdgeInsets.symmetric(vertical: Grid.xs),
-                    child: Center(
-                      child: BuzzLoadingIndicator(
-                        size: 24,
-                        semanticLabel: 'Loading older messages',
+            child: ValueListenableBuilder<double>(
+              valueListenable: composerBottomInset,
+              builder: (context, composerInset, _) =>
+                  ScrollablePositionedList.builder(
+                    key: const ValueKey('channel-message-list'),
+                    itemScrollController: itemScrollController,
+                    itemPositionsListener: itemPositionsListener,
+                    reverse: true,
+                    padding: EdgeInsets.only(
+                      left: Grid.gutter,
+                      right: Grid.gutter,
+                      top: frostedAppBarHeight(
+                        context,
+                        titleContentHeight: appBarTitleContentHeight,
                       ),
+                      bottom: composerInset + timelineImeInset,
                     ),
-                  );
-                }
-
-                // Reversed list: index 0 = newest (bottom of screen).
-                final chronIdx = displayEntries.length - 1 - index;
-                final entryGroup = displayEntries[chronIdx];
-                final entry = entryGroup.first;
-                final message = entry.message;
-
-                // Day boundary check — applies to all messages including system.
-                final prevEntry = chronIdx > 0
-                    ? displayEntries[chronIdx - 1].last
-                    : null;
-                final prevMessage = prevEntry?.message;
-                final showDayDivider =
-                    prevMessage == null ||
-                    !isSameDay(prevMessage.createdAt, message.createdAt);
-
-                final showAuthor =
-                    !message.isSystem &&
-                    (message.hasAttachments ||
-                        prevMessage == null ||
-                        prevMessage.isSystem ||
-                        showDayDivider ||
-                        prevMessage.pubkey.toLowerCase() !=
-                            message.pubkey.toLowerCase() ||
-                        (message.createdAt - prevMessage.createdAt) > 300);
-
-                return LocalMessageSendTransition(
-                  key: ValueKey('channel-message-send-${message.id}'),
-                  animate: isRecentLocalMessageSendAnimation(
-                    localSendAnimations,
-                    message.id,
+                    itemCount:
+                        displayEntries.length + (isLoadingOlder.value ? 1 : 0),
+                    itemBuilder: buildItem,
                   ),
-                  startOffsetFactor: showAuthor
-                      ? localMessageSendTransitionAvatarStartOffset
-                      : localMessageSendTransitionStartOffset,
-                  child: Padding(
-                    key: ValueKey('channel-message-group-${message.id}'),
-                    padding: EdgeInsets.only(bottom: index == 0 ? Grid.xs : 0),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        if (showDayDivider)
-                          DayDivider(
-                            label: formatDayHeading(message.createdAt),
-                            dayTimestamp: message.createdAt,
-                            stickyDayTimestamp: stickyDayTimestamp,
-                          ),
-                        if (message.isSystem)
-                          _SystemMessageRow(
-                            message: message,
-                            groupedMessages: entryGroup.length > 1
-                                ? entryGroup
-                                      .map((entry) => entry.message)
-                                      .toList()
-                                : null,
-                            channelId: channelId,
-                            currentPubkey: currentPubkey,
-                            allMessages: allMessages,
-                            isMember: isMember,
-                            isArchived: isArchived,
-                          )
-                        else ...[
-                          _MessageBubble(
-                            message: message,
-                            showAuthor: showAuthor,
-                            hasReplies: entry.summary != null,
-                            channelNames: channelNamesMap,
-                            currentChannelId: channelId,
-                            currentPubkey: currentPubkey,
-                            allMessages: allMessages,
-                            isMember: isMember,
-                            isArchived: isArchived,
-                            composerFocusNode: composerFocusNode,
-                            restoreComposerFocus: restoreComposerFocus,
-                          ),
-                          if (entry.summary != null)
-                            _ThreadSummaryRow(
-                              summary: entry.summary!,
-                              message: message,
-                              allMessages: allMessages,
-                              channelId: channelId,
-                              currentPubkey: currentPubkey,
-                              isMember: isMember,
-                              isArchived: isArchived,
-                            ),
-                        ],
-                      ],
-                    ),
-                  ),
-                );
-              },
             ),
           ),
         ),
@@ -919,10 +968,14 @@ class _MessageList extends HookConsumerWidget {
             ),
           )
         else
-          Positioned(
-            left: 0,
-            right: 0,
-            bottom: navigationBottomInset + Grid.xs,
+          ValueListenableBuilder<double>(
+            valueListenable: composerBottomInset,
+            builder: (context, composerInset, child) => Positioned(
+              left: 0,
+              right: 0,
+              bottom: composerInset + settledImeLift + Grid.xs,
+              child: child!,
+            ),
             child: Center(
               child: JumpToLatestSwitcher(
                 id: 'channel',
@@ -933,5 +986,34 @@ class _MessageList extends HookConsumerWidget {
           ),
       ],
     );
+  }
+}
+
+enum _TimelineRowKind { bubble, threadSummary }
+
+/// Keeps one row widget instance per message while its constructor inputs are
+/// identical, so a list rebuild (a new message, a pagination page, a read
+/// marker) does not rebuild every visible row. Flutter skips rebuilding an
+/// element whose widget is the identical instance; the row still rebuilds on
+/// its own provider watches and inherited dependencies.
+class _TimelineRowCache {
+  final _rows =
+      <({_TimelineRowKind kind, String messageId}), (Object, Widget)>{};
+
+  Widget resolve(
+    ({_TimelineRowKind kind, String messageId}) key,
+    Object inputs,
+    Widget Function() build,
+  ) {
+    final cached = _rows[key];
+    if (cached != null && cached.$1 == inputs) return cached.$2;
+    final row = build();
+    _rows[key] = (inputs, row);
+    return row;
+  }
+
+  /// Drops rows for messages no longer in the timeline.
+  void retainMessages(Set<String> messageIds) {
+    _rows.removeWhere((key, _) => !messageIds.contains(key.messageId));
   }
 }

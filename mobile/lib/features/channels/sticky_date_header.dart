@@ -88,7 +88,7 @@ class StickyDateHeader extends StatelessWidget {
       ),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(Radii.full),
-        child: BackdropFilter(
+        child: BackdropFilter.grouped(
           filter: ImageFilter.blur(sigmaX: 20, sigmaY: 20),
           child: ConstrainedBox(
             key: const ValueKey('channel-sticky-date-header-surface'),

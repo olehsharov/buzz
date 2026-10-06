@@ -5,7 +5,10 @@ const _sectionMenuItemPadding = EdgeInsets.fromLTRB(Grid.xs, 0, Grid.twelve, 0);
 class _CustomChannelSection extends StatelessWidget {
   final ChannelSection section;
   final List<Channel> channels;
-  final Set<String> unreadChannelIds;
+
+  /// Whether read markers have been seeded for this community; until then
+  /// only channels with a marker may show as unread.
+  final bool unreadSeeded;
   final Set<String> mutedChannelIds;
   final String? currentPubkey;
   final bool expanded;
@@ -25,7 +28,7 @@ class _CustomChannelSection extends StatelessWidget {
   const _CustomChannelSection({
     required this.section,
     required this.channels,
-    required this.unreadChannelIds,
+    required this.unreadSeeded,
     required this.mutedChannelIds,
     required this.currentPubkey,
     required this.expanded,
@@ -70,7 +73,7 @@ class _CustomChannelSection extends StatelessWidget {
               for (final channel in channels)
                 _ChannelTile(
                   channel: channel,
-                  isUnread: unreadChannelIds.contains(channel.id),
+                  unreadSeeded: unreadSeeded,
                   isMuted: mutedChannelIds.contains(channel.id),
                   currentPubkey: currentPubkey,
                   onTap: () => onSelectChannel(channel),
@@ -377,7 +380,10 @@ class _ChannelSection extends StatelessWidget {
   final VoidCallback onToggle;
   final List<Channel> channels;
   final bool showTopDivider;
-  final Set<String> unreadChannelIds;
+
+  /// Whether read markers have been seeded for this community; until then
+  /// only channels with a marker may show as unread.
+  final bool unreadSeeded;
   final Set<String> mutedChannelIds;
   final String? currentPubkey;
   final String emptyLabel;
@@ -392,7 +398,7 @@ class _ChannelSection extends StatelessWidget {
     required this.onToggle,
     required this.channels,
     required this.showTopDivider,
-    required this.unreadChannelIds,
+    required this.unreadSeeded,
     required this.mutedChannelIds,
     required this.currentPubkey,
     required this.emptyLabel,
@@ -439,7 +445,7 @@ class _ChannelSection extends StatelessWidget {
                 for (final channel in channels)
                   _ChannelTile(
                     channel: channel,
-                    isUnread: unreadChannelIds.contains(channel.id),
+                    unreadSeeded: unreadSeeded,
                     isMuted: mutedChannelIds.contains(channel.id),
                     currentPubkey: currentPubkey,
                     onTap: () => onSelectChannel(channel),

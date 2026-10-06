@@ -74,6 +74,34 @@ final openDownloadedFileProvider = Provider<OpenDownloadedFile>((ref) {
   };
 });
 
+/// Returns an immutable copy of [tags] that keeps its identity for as long as
+/// the tag contents are unchanged, so tag parsing can be memoized by identity
+/// even when a caller rebuilds or mutates its list.
+List<List<String>> _useTagsSnapshot(List<List<String>> tags) {
+  final snapshot = useRef<List<List<String>>?>(null);
+  final current = snapshot.value;
+  if (current != null && _tagListsEqual(current, tags)) return current;
+  return snapshot.value = List.unmodifiable(
+    tags.map((tag) => List<String>.unmodifiable(tag)),
+  );
+}
+
+bool _tagListsEqual(List<List<String>> a, List<List<String>> b) {
+  if (a.length != b.length) return false;
+  for (var index = 0; index < a.length; index++) {
+    if (!listEquals(a[index], b[index])) return false;
+  }
+  return true;
+}
+
+/// Order-independent string key of a map's entries, used to memoize work on
+/// maps that callers rebuild with equal contents.
+String _sortedEntriesKey(Map<String, String> map) => [
+  for (final entry
+      in (map.entries.toList()..sort((a, b) => a.key.compareTo(b.key))))
+    '${entry.key}\u0000${entry.value}',
+].join('\u0001');
+
 String _safeDownloadedFilename(String filename) {
   final safe = filename
       .split(RegExp(r'[/\\]'))
@@ -170,11 +198,19 @@ class MessageContent extends HookConsumerWidget {
         baseStyle ??
         context.textTheme.bodyMedium?.copyWith(color: context.colors.onSurface);
     final resolvedMentionNames = mentionNames;
-    final signedMentionPubkeys = mentionedPubkeysFromTags(tags);
-    final memberMentionBindings = renderedMentionBindings(
-      content,
-      mentionNames,
-      signedMentionPubkeys,
+    // Parsing below depends only on content, tags, and the mention-name
+    // values. Callers build a fresh mentionNames map per rebuild, so it is
+    // keyed by value rather than identity.
+    final mentionNamesKey = _sortedEntriesKey(mentionNames);
+    final tagsSnapshot = _useTagsSnapshot(tags);
+    final signedMentionPubkeys = useMemoized(
+      () => mentionedPubkeysFromTags(tagsSnapshot),
+      [tagsSnapshot],
+    );
+    final memberMentionBindings = useMemoized(
+      () =>
+          renderedMentionBindings(content, mentionNames, signedMentionPubkeys),
+      [content, mentionNamesKey, signedMentionPubkeys],
     );
     // The marker records that the sender resolved `@all` as the group, so it
     // outranks a member alias "all". Without it the text is never promoted.
@@ -221,26 +257,33 @@ class MessageContent extends HookConsumerWidget {
               moreHandler.value?.call(context, url),
       const [],
     );
-    final channelPresentationKey = [
-      for (final entry
-          in (resolvedChannelNames.entries.toList()
-            ..sort((a, b) => a.key.compareTo(b.key))))
-        '${entry.key}\u0000${entry.value}',
-    ].join('\u0001');
-    final imetaByUrl = parseImetaTags(tags);
-    final trailingGallery = maxLines == null
-        ? _extractTrailingImageGallery(content, imetaByUrl)
-        : null;
+    // The list passes one channel-name map instance for every row; sorting
+    // it once per map instead of once per message build.
+    final channelPresentationKey = useMemoized(
+      () => _sortedEntriesKey(resolvedChannelNames),
+      [resolvedChannelNames],
+    );
+    final imetaByUrl = useMemoized(() => parseImetaTags(tagsSnapshot), [
+      tagsSnapshot,
+    ]);
+    final trailingGallery = useMemoized(
+      () => maxLines == null
+          ? _extractTrailingImageGallery(content, imetaByUrl)
+          : null,
+      [content, imetaByUrl, maxLines],
+    );
     final markdownContent = trailingGallery?.content ?? content;
-    final customEmoji = _mergeCustomEmoji(
-      customEmojiFromTags(tags),
-      ref.watch(customEmojiListProvider),
+    final tagCustomEmoji = useMemoized(
+      () => customEmojiFromTags(tagsSnapshot),
+      [tagsSnapshot],
+    );
+    final communityCustomEmoji = ref.watch(customEmojiListProvider);
+    final customEmoji = useMemoized(
+      () => _mergeCustomEmoji(tagCustomEmoji, communityCustomEmoji),
+      [tagCustomEmoji, communityCustomEmoji],
     );
     final mentionPresentationKey = [
-      for (final entry
-          in (resolvedMentionNames.entries.toList()
-            ..sort((a, b) => a.key.compareTo(b.key))))
-        '${entry.key}\u0000${entry.value}',
+      if (mentionNamesKey.isNotEmpty) mentionNamesKey,
       ...(resolvedAgentMentionPubkeys.toList()..sort()),
       ...(signedMentionPubkeys.toList()..sort()),
       if (mentionAll) mentionGroupTag,

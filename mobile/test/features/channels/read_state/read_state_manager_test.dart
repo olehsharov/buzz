@@ -184,6 +184,40 @@ void main() {
 
     expect(manager.getEffectiveTimestamp('channel-1'), 100);
   });
+
+  test('a reconnect refresh overlapping initialize leaves one live '
+      'subscription', () async {
+    SharedPreferences.setMockInitialValues({});
+    final prefs = await SharedPreferences.getInstance();
+    final keychain = nostr.Keys.generate();
+    final crypto = ReadStateCrypto.tryCreate(
+      nsec: keychain.nsec,
+      pubkey: keychain.public,
+    );
+    final relay = _FakeRelaySession();
+    final firstFetch = Completer<List<NostrEvent>>();
+    relay.pendingFetches.add(firstFetch);
+    final manager = ReadStateManager(
+      pubkey: keychain.public,
+      prefs: prefs,
+      crypto: crypto!,
+      relaySession: relay,
+      signedEventRelay: _FakeSignedEventRelay(),
+      remoteEnabled: true,
+      onChanged: () {},
+    );
+    addTearDown(manager.dispose);
+
+    // initialize() is stuck on a fetch issued before the relay connected;
+    // the reconnect refresh subscribes first, then initialize catches up.
+    final initializing = manager.initialize();
+    expect(await manager.reinitializeRemote(), isTrue);
+    firstFetch.complete(const []);
+    await initializing;
+
+    expect(relay.subscriptionCount, 2);
+    expect(relay.activeSubscriptions, 1);
+  });
 }
 
 class _SubmittedEvent {
@@ -289,16 +323,35 @@ NostrEvent _readStateEvent({
 class _FakeRelaySession extends RelaySessionNotifier {
   List<NostrEvent> historyEvents = [];
 
+  /// Fetches answered by these completers, in order, before [historyEvents].
+  final List<Completer<List<NostrEvent>>> pendingFetches = [];
+  int subscriptionCount = 0;
+  int activeSubscriptions = 0;
+
   @override
   Future<List<NostrEvent>> fetchHistory(
     NostrFilter filter, {
     Duration timeout = const Duration(seconds: 8),
-  }) async => historyEvents;
+  }) async {
+    if (pendingFetches.isNotEmpty) {
+      return pendingFetches.removeAt(0).future;
+    }
+    return historyEvents;
+  }
 
   @override
   Future<void Function()> subscribe(
     NostrFilter filter,
     void Function(NostrEvent) onEvent, {
     void Function(String message)? onClosed,
-  }) async => () {};
+  }) async {
+    subscriptionCount++;
+    activeSubscriptions++;
+    var active = true;
+    return () {
+      if (!active) return;
+      active = false;
+      activeSubscriptions--;
+    };
+  }
 }

@@ -1,6 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:buzz/shared/relay/relay_provider.dart';
+import 'package:buzz/shared/relay/relay_session_types.dart';
 
 void main() {
   group('RelayConfig.baseUrl normalization', () {
@@ -62,6 +63,27 @@ void main() {
     test('preserves a non-default port', () {
       final config = RelayConfig(baseUrl: 'wss://relay.example.com:8443');
       expect(config.wsUrl, 'wss://relay.example.com:8443');
+    });
+  });
+
+  group('SessionState value equality', () {
+    test('SessionState compares status and reconnect attempt', () {
+      const cases = [
+        (SessionStatus.connected, 0, SessionStatus.connected, 0, true),
+        (SessionStatus.reconnecting, 2, SessionStatus.reconnecting, 2, true),
+        (SessionStatus.reconnecting, 2, SessionStatus.reconnecting, 3, false),
+        (SessionStatus.connecting, 0, SessionStatus.connected, 0, false),
+      ];
+      for (final (aStatus, aAttempt, bStatus, bAttempt, equal) in cases) {
+        final a = SessionState(status: aStatus, reconnectAttempt: aAttempt);
+        final b = SessionState(status: bStatus, reconnectAttempt: bAttempt);
+        expect(
+          a == b,
+          equal,
+          reason: '$aStatus/$aAttempt vs $bStatus/$bAttempt',
+        );
+        if (equal) expect(a.hashCode, b.hashCode);
+      }
     });
   });
 }
