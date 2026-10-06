@@ -86,6 +86,15 @@ pub fn rotate_log(log: &std::path::Path) {
     }
 }
 
+/// Whether `systemctl --user is-system-running` output means the user
+/// manager can run units.
+pub fn user_manager_usable(state: &str) -> bool {
+    matches!(
+        state.trim(),
+        "running" | "degraded" | "starting" | "initializing" | "maintenance"
+    )
+}
+
 /// The supervisor backing this host.
 pub enum Supervisor {
     /// systemd user units (Linux).
@@ -105,9 +114,12 @@ impl Supervisor {
                     vec!["--user".into(), "is-system-running".into()],
                 )
                 .await;
-            // `is-system-running` exits non-zero for "degraded" too; any
-            // stdout means the user manager answered.
-            if probe.map(|o| !o.stdout.is_empty()).unwrap_or(false) {
+            // `is-system-running` exits non-zero for "degraded" too, so judge
+            // by the reported state rather than the exit code.
+            if probe
+                .map(|o| user_manager_usable(&o.stdout))
+                .unwrap_or(false)
+            {
                 return Ok(Self::Systemd(systemd::SystemdSupervisor::new(
                     paths.clone(),
                     Box::new(SystemRunner),

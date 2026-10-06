@@ -167,20 +167,25 @@ impl SystemdSupervisor {
         let mut out = Vec::with_capacity(agents.len());
         for agent in agents {
             let unit = unit_name(agent);
-            let shown = self
-                .systemctl(&[
-                    "show",
-                    "--timestamp=unix",
-                    "-p",
-                    "ActiveState",
-                    "-p",
-                    "SubState",
-                    "-p",
-                    "StateChangeTimestamp",
-                    &unit,
-                ])
-                .await
-                .unwrap_or_default();
+            let props = [
+                "-p",
+                "ActiveState",
+                "-p",
+                "SubState",
+                "-p",
+                "StateChangeTimestamp",
+                &unit,
+            ];
+            let mut with_ts = vec!["show", "--timestamp=unix"];
+            with_ts.extend(props);
+            let mut plain = vec!["show"];
+            plain.extend(props);
+            // `--timestamp=unix` needs systemd >= 247; older ones still
+            // report the state (and `since` falls back to the deploy time).
+            let shown = match self.systemctl(&with_ts).await {
+                Ok(out) => out,
+                Err(_) => self.systemctl(&plain).await.unwrap_or_default(),
+            };
             let (state, since) = parse_show(&shown);
             let since = since.unwrap_or_else(|| {
                 store::load_agent(&self.paths, agent)
@@ -258,6 +263,17 @@ pub(crate) mod tests {
                 .lock()
                 .map(|mut c| std::mem::take(&mut *c))
                 .unwrap_or_default()
+        }
+    }
+
+    #[test]
+    fn user_manager_probe_table() {
+        use crate::supervisor::user_manager_usable;
+        for ok in ["running", "degraded\n", "starting"] {
+            assert!(user_manager_usable(ok), "{ok}");
+        }
+        for bad in ["", "offline", "unknown", "stopping"] {
+            assert!(!user_manager_usable(bad), "{bad}");
         }
     }
 
