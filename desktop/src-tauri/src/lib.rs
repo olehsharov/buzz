@@ -1,4 +1,5 @@
 #![recursion_limit = "256"] // Deep Tauri command futures exceed the default layout query depth.
+mod agent_hosts;
 mod app_menu;
 mod app_state;
 mod archive;
@@ -242,6 +243,7 @@ pub fn run() {
         .manage(BuilderlabSession::default())
         .manage(BuilderlabLogin::default())
         .manage(commands::pairing::PairingHandle::new())
+        .manage(agent_hosts::HostOps::default())
         .manage(terminal_runtime::TerminalSessions::default())
         .manage(archive::sync::ArchiveSyncState::default())
         .manage(native_relay_client::NativeRelayClient::default())
@@ -854,6 +856,14 @@ pub fn run() {
             get_audio_output_device,
             start_pairing,
             start_identity_recovery_pairing,
+            start_host_pairing,
+            get_host_install_info,
+            list_agent_hosts,
+            deploy_to_host,
+            undeploy_from_host,
+            request_host_status,
+            forget_host,
+            ingest_host_telemetry,
             confirm_pairing_sas,
             cancel_pairing,
             apply_workspace,

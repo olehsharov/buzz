@@ -1,4 +1,5 @@
 import * as React from "react";
+import { useAgentRunsOnText } from "../hosts/AgentRunsOnLabel";
 
 import { AlertTriangle, ChevronDown, ChevronRight } from "lucide-react";
 
@@ -53,8 +54,11 @@ export function ManagedAgentRow({
   onSelectLogAgent: (pubkey: string | null) => void;
 }) {
   const isLocal = agent.backend.type === "local";
+  const runsOnText = useAgentRunsOnText(agent.backend);
   const runtimeSource =
-    agent.backend.type === "provider" ? `Remote (${agent.backend.id})` : null;
+    agent.backend.type === "provider"
+      ? `Remote (${agent.backend.id})`
+      : runsOnText;
   const personaLabel = agent.personaId
     ? (personaLabelsById[agent.personaId] ?? null)
     : null;
@@ -423,7 +427,11 @@ function RuntimeBlock({
 function AgentOriginBadge({ agent }: { agent: ManagedAgent }) {
   return (
     <Badge variant="outline">
-      {agent.backend.type === "local" ? "Local" : "Remote"}
+      {agent.backend.type === "local"
+        ? "Local"
+        : agent.backend.type === "host"
+          ? "Machine"
+          : "Remote"}
     </Badge>
   );
 }

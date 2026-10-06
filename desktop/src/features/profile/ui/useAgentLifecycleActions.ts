@@ -59,7 +59,7 @@ export function useAgentLifecycleActions({
         startManagedAgent,
       });
       toast.success(
-        managedAgent.backend.type === "provider"
+        managedAgent.backend.type !== "local"
           ? `Deploying ${managedAgent.name}.`
           : `Started ${managedAgent.name}.`,
       );
@@ -94,7 +94,7 @@ export function useAgentLifecycleActions({
         onStopped: () => clearActiveTurnsForAgentOnStop(managedAgent.pubkey),
       });
       toast.success(
-        managedAgent.backend.type === "provider"
+        managedAgent.backend.type !== "local"
           ? `Redeploying ${managedAgent.name}.`
           : `Restarted ${managedAgent.name}.`,
       );

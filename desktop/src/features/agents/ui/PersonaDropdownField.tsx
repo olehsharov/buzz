@@ -5,8 +5,10 @@ import { cn } from "@/shared/lib/cn";
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuItem,
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/shared/ui/dropdown-menu";
 import {
@@ -20,6 +22,7 @@ export function PersonaDropdownField({
   ariaDescribedBy,
   contentClassName,
   disabled,
+  footerAction,
   id,
   onValueChange,
   options,
@@ -29,6 +32,8 @@ export function PersonaDropdownField({
   ariaDescribedBy?: string;
   contentClassName?: string;
   disabled?: boolean;
+  /** A command after the options (e.g. "Add machine…"); never a value. */
+  footerAction?: { label: string; onSelect: () => void; testId?: string };
   id: string;
   onValueChange: (value: string) => void;
   options: readonly PersonaDropdownOption[];
@@ -97,6 +102,20 @@ export function PersonaDropdownField({
               ))}
             </DropdownMenuRadioGroup>
           </div>
+          {footerAction ? (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                data-testid={footerAction.testId}
+                onSelect={() => {
+                  setOpen(false);
+                  footerAction.onSelect();
+                }}
+              >
+                {footerAction.label}
+              </DropdownMenuItem>
+            </>
+          ) : null}
         </DropdownMenuContent>
       </DropdownMenu>
     </div>

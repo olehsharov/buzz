@@ -185,7 +185,8 @@ export function isManagedAgentRunning(agent: ManagedAgent) {
 }
 
 export function isProviderBackedAgent(agent: ManagedAgent) {
-  return agent.backend.type === "provider";
+  // Machine agents deploy over the relay too: same "deployed" semantics.
+  return agent.backend.type === "provider" || agent.backend.type === "host";
 }
 
 /** Carry captured recipient identity through composer clearing and uploads. */

@@ -10,6 +10,9 @@ pub enum BackendKind {
         id: String,
         config: serde_json::Value,
     },
+    /// Runs on an approved agent host (`buzz host`), addressed by the host's
+    /// pubkey. Deploy and undeploy go over NIP-44 observer control frames.
+    Host { host_pubkey: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

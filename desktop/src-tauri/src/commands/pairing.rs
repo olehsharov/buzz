@@ -37,6 +37,20 @@ struct PairingErrorPayload {
 enum PairingMode {
     SendIdentity,
     RecoverIdentity,
+    /// Approve an agent host (`buzz host`): receive `buzz-host-hello`, reply
+    /// with `buzz-host-grant`.
+    ApproveHost,
+}
+
+/// Emitted when an approving host's hello arrives (after SAS approval), so
+/// the dialog can show which machine is being added.
+#[derive(Serialize, Clone)]
+struct HostPairingHelloPayload {
+    host_pubkey: String,
+    name: String,
+    os: String,
+    arch: String,
+    version: Option<String>,
 }
 
 #[derive(Clone)]
@@ -45,6 +59,9 @@ struct PairingTaskContext {
     generation: Arc<AtomicU64>,
     generation_fence: Arc<std::sync::Mutex<()>>,
     task_generation: u64,
+    /// Community relay the host is approved on (ApproveHost only), captured
+    /// at session start so a community switch cannot retarget the grant.
+    host_relay_url: Option<String>,
 }
 
 /// Managed Tauri state for an active pairing session.
@@ -107,6 +124,17 @@ pub async fn start_identity_recovery_pairing(
     start_pairing_session(app, state, pairing, PairingMode::RecoverIdentity).await
 }
 
+/// Start a session that approves a new agent host. The desktop shows the
+/// code; the machine runs `buzz host pair <uri>` and shows the same SAS.
+#[tauri::command]
+pub async fn start_host_pairing(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    pairing: State<'_, PairingHandle>,
+) -> Result<String, String> {
+    start_pairing_session(app, state, pairing, PairingMode::ApproveHost).await
+}
+
 async fn start_pairing_session(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -135,6 +163,7 @@ async fn start_pairing_session(
     if mode == PairingMode::RecoverIdentity {
         qr_uri.push_str("&mode=recover");
     }
+    let host_relay_url = (mode == PairingMode::ApproveHost).then(|| ws_url.clone());
 
     if mode == PairingMode::SendIdentity {
         let keys = state.signing_keys()?;
@@ -169,6 +198,7 @@ async fn start_pairing_session(
             generation: Arc::clone(&pairing.generation),
             generation_fence: Arc::clone(&pairing.generation_fence),
             task_generation,
+            host_relay_url,
         },
         cancel,
         outbound_rx,
@@ -327,6 +357,9 @@ async fn pairing_ws_task_inner(
 
     let hard_timeout = tokio::time::sleep(Duration::from_secs(130));
     tokio::pin!(hard_timeout);
+    // ApproveHost: the hello we answered with a grant, held until the
+    // machine's `complete` confirms it stored the grant.
+    let mut pending_host: Option<crate::agent_hosts::frames::HostHello> = None;
 
     loop {
         if !pairing_task_is_current(&context.generation, context.task_generation) {
@@ -379,7 +412,87 @@ async fn pairing_ws_task_inner(
                         continue;
                     }
 
-                    if context.mode == PairingMode::RecoverIdentity {
+                    if context.mode == PairingMode::ApproveHost {
+                        if s.state() == buzz_core_pkg::pairing::session::SessionState::Transferring {
+                            let Ok((payload_type, payload)) = s.handle_return_payload(&event) else {
+                                continue;
+                            };
+                            let owner_keys = app.state::<AppState>().signing_keys()?;
+                            let relay = context.host_relay_url.clone().ok_or("no host relay")?;
+                            match host_hello_reply(s, payload_type, &payload, &owner_keys, &relay) {
+                                Ok((hello, reply)) => {
+                                    write
+                                        .send(Message::Text(event_to_relay_json(&reply).into()))
+                                        .await
+                                        .map_err(|e| format!("publish grant failed: {e}"))?;
+                                    if pairing_task_is_current(&context.generation, context.task_generation) {
+                                        let _ = app.emit("host-pairing-hello", HostPairingHelloPayload {
+                                            host_pubkey: hello.host_pubkey.clone(),
+                                            name: hello.name.clone(),
+                                            os: hello.os.clone(),
+                                            arch: hello.arch.clone(),
+                                            version: hello.version.clone(),
+                                        });
+                                    }
+                                    pending_host = Some(hello);
+                                }
+                                Err(message) => {
+                                    let complete = s
+                                        .send_source_complete(false)
+                                        .map_err(|e| e.to_string())?;
+                                    let _ = write
+                                        .send(Message::Text(event_to_relay_json(&complete).into()))
+                                        .await;
+                                    if pairing_task_is_current(&context.generation, context.task_generation) {
+                                        let _ = app.emit("pairing-error", PairingErrorPayload { message });
+                                    }
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+                        match s.handle_complete(&event) {
+                            Ok(()) => {
+                                let hello = pending_host.take().ok_or("machine completed before saying hello")?;
+                                drop(guard);
+                                let relay = context.host_relay_url.clone().ok_or("no host relay")?;
+                                let committed = commit_recovery_if_current(
+                                    &context.generation,
+                                    &context.generation_fence,
+                                    context.task_generation,
+                                    || {
+                                        crate::agent_hosts::ops::add_approved_host(
+                                            app,
+                                            &app.state::<crate::agent_hosts::HostOps>(),
+                                            approved_host_record(&hello, &relay),
+                                        )
+                                    },
+                                );
+                                match committed {
+                                    Ok(()) => {
+                                        let _ = app.emit("pairing-complete", serde_json::json!({
+                                            "host_pubkey": hello.host_pubkey,
+                                        }));
+                                    }
+                                    Err(message) => {
+                                        if pairing_task_is_current(&context.generation, context.task_generation) {
+                                            let _ = app.emit("pairing-error", PairingErrorPayload { message });
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+                            Err(ref e) if format!("{e}").contains("success=false") => {
+                                if pairing_task_is_current(&context.generation, context.task_generation) {
+                                    let _ = app.emit("pairing-error", PairingErrorPayload {
+                                        message: "The machine could not save the approval.".into(),
+                                    });
+                                }
+                                break;
+                            }
+                            Err(_) => {}
+                        }
+                    } else if context.mode == PairingMode::RecoverIdentity {
                         if let Ok((payload_type, payload)) = s.handle_return_payload(&event) {
                             if let Err(message) = validate_recovery_payload_type(payload_type) {
                                 let complete = s
@@ -457,6 +570,44 @@ async fn pairing_ws_task_inner(
     }
 
     Ok(())
+}
+
+/// ApproveHost: validate the machine's `buzz-host-hello` return payload and
+/// build the `buzz-host-grant` reply (owner-signed NIP-OA tag for the host
+/// key, empty conditions).
+fn host_hello_reply(
+    session: &mut PairingSession,
+    payload_type: PayloadType,
+    payload: &str,
+    owner_keys: &nostr::Keys,
+    relay_url: &str,
+) -> Result<(crate::agent_hosts::frames::HostHello, nostr::Event), String> {
+    if payload_type != PayloadType::Custom {
+        return Err("The machine sent an unsupported pairing payload.".into());
+    }
+    let hello = crate::agent_hosts::frames::parse_host_hello(payload)?;
+    let host = nostr::PublicKey::from_hex(&hello.host_pubkey)
+        .map_err(|_| "The machine sent an invalid host key.".to_string())?;
+    let grant = crate::agent_hosts::frames::build_host_grant(owner_keys, &host, relay_url)?;
+    let reply = session
+        .send_reply_payload(PayloadType::Custom, Zeroizing::new(grant.to_string()))
+        .map_err(|e| e.to_string())?;
+    Ok((hello, reply))
+}
+
+fn approved_host_record(
+    hello: &crate::agent_hosts::frames::HostHello,
+    relay_url: &str,
+) -> crate::agent_hosts::store::AgentHostRecord {
+    crate::agent_hosts::store::AgentHostRecord {
+        pubkey: hello.host_pubkey.clone(),
+        name: hello.name.clone(),
+        os: hello.os.clone(),
+        arch: hello.arch.clone(),
+        relay_url: relay_url.to_string(),
+        added_at: crate::util::now_iso(),
+        status: None,
+    }
 }
 
 async fn import_recovered_identity(
@@ -791,3 +942,7 @@ mod pairing_generation_tests;
 #[cfg(test)]
 #[path = "pairing_relay_tests.rs"]
 mod pairing_relay_tests;
+
+#[cfg(test)]
+#[path = "pairing_host_tests.rs"]
+mod pairing_host_tests;

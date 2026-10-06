@@ -51,6 +51,7 @@ import { useManagedAgentRuntimeReconciliation } from "@/features/agents/useManag
 import { useAutoRestartPolicy } from "@/features/agents/lib/useAutoRestartPolicy";
 import { usePersonaSync } from "@/features/agents/lib/usePersonaSync";
 import { useAgentObserverIngestion } from "@/features/agents/useAgentObserverIngestion";
+import { useAgentHostTelemetry } from "@/features/agents/hosts/useAgentHosts";
 import { AgentManagementDialogs } from "@/features/agents/ui/AgentManagementDialogs";
 import { RequestedAgentCreateDialogs } from "@/features/agents/ui/RequestedAgentCreateDialogs";
 import {
@@ -233,6 +234,7 @@ export function AppShell() {
   // relay-owned agents join automatically once identity arrives. Adding a
   // guard here would drop managed-agent coverage during startup.
   useAgentObserverIngestion();
+  useAgentHostTelemetry();
   // Kind 24200 is relay-ephemeral, so reconciliation runs eagerly (not
   // deferred): seeds kind 24200 for fresh identities, no-ops for explicit
   // opt-outs. Frames before the listener opens are permanently lost.

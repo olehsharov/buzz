@@ -292,7 +292,9 @@ export type ManagedAgentRuntimeStatus = {
 
 export type ManagedAgentBackend =
   | { type: "local" }
-  | { type: "provider"; id: string; config: Record<string, unknown> };
+  | { type: "provider"; id: string; config: Record<string, unknown> }
+  /** An approved agent host (`buzz host`). Wire field name kept as-is. */
+  | { type: "host"; host_pubkey: string };
 
 /** ACP conversation boundary configured on an agent definition. */
 export type AcpSessionPolicy = "channel" | "thread";

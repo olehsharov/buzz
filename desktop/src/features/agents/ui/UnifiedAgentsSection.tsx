@@ -22,6 +22,7 @@ import {
   useProtectedBestiePubkey,
 } from "@protected-feature-components";
 import { IdentityCardSkeleton } from "@/shared/ui/identity-card-skeleton";
+import { AgentRunsOnLabel } from "../hosts/AgentRunsOnLabel";
 import { AgentIdentityCard } from "./AgentIdentityCard";
 import { AgentRuntimeAvatarControl } from "./AgentRuntimeAvatarControl";
 import { CreateIdentityCard } from "./CreateIdentityCard";
@@ -342,6 +343,9 @@ function AgentPersonaCard({
         ) : null
       }
       label={title}
+      locationLabel={
+        agent ? <AgentRunsOnLabel backend={agent.backend} /> : null
+      }
       subtitle={subtitle}
       onClick={() => {
         // The card's main click always opens the PERSONA target, never an
@@ -433,6 +437,7 @@ function StandaloneAgentCard({
         <ProtectedBestieCardBadge agent={agent} isBestie={isBestie} />
       }
       label={title}
+      locationLabel={<AgentRunsOnLabel backend={agent.backend} />}
       subtitle={
         // Definition-less instance: no authored description exists, so fall
         // back to the model label.

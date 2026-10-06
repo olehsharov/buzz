@@ -1008,7 +1008,7 @@ export function AgentInstanceEditDialog({
               onAllowlistChange={setRespondToAllowlist}
               onModeChange={setRespondTo}
             />
-            <RunOnSummarySection backend={agent.backend} />
+            <RunOnSummarySection agent={agent} />
 
             {/* Provider (runtime) */}
             <div className="space-y-1.5">

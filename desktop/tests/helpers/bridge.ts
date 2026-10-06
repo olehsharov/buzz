@@ -624,6 +624,18 @@ type MockBridgeOptions = {
    */
   backendProviders?: Array<{ id: string; binaryPath: string }>;
   /**
+   * Approved agent hosts returned by `list_agent_hosts`; `online` sets their
+   * kind:20001 presence, `lastSeenSecsAgo` their last status frame.
+   */
+  agentHosts?: Array<{
+    pubkey: string;
+    name: string;
+    os?: string;
+    arch?: string;
+    online?: boolean;
+    lastSeenSecsAgo?: number;
+  }>;
+  /**
    * Result returned by `probe_backend_provider`. Defaults to
    * `{ ok: false, error: "mock: no providers available" }`.
    */

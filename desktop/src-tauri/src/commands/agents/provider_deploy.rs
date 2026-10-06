@@ -78,7 +78,9 @@ pub(crate) async fn deploy_to_provider(
             .ok_or_else(|| format!("agent {pubkey} not found"))?;
         let (provider_id, config) = match &record.backend {
             BackendKind::Provider { id, config } => (id.clone(), config.clone()),
-            BackendKind::Local => return Err(format!("agent {pubkey} is not provider-backed")),
+            BackendKind::Local | BackendKind::Host { .. } => {
+                return Err(format!("agent {pubkey} is not provider-backed"))
+            }
         };
         (
             provider_id,

@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { HOST_UNDEPLOY_FAILED_PREFIX } from "../../../shared/api/agentHosts.ts";
 import {
+  deleteManagedAgentWithRules,
   getManagedAgentPrimaryActionLabel,
   getManagedAgentRestartLabel,
   startManagedAgentWithRules,
@@ -242,4 +244,88 @@ test("redeploying a remote agent deploys without a local stop", async () => {
     stopManagedAgent: async (pubkey) => calls.push(["stop", pubkey]),
   });
   assert.deepEqual(calls, [["start", "deadbeef".repeat(8)]]);
+});
+
+const HOST_AGENT = {
+  backend: { type: "host", host_pubkey: "ab".repeat(32) },
+  backendAgentId: "ab".repeat(32),
+  status: "deployed",
+};
+
+test("machine agents deploy, redeploy and stop like remote agents", () => {
+  assert.equal(
+    getManagedAgentPrimaryActionLabel(agent(HOST_AGENT)),
+    "Shutdown",
+  );
+  assert.equal(
+    getManagedAgentRestartLabel(agent(HOST_AGENT)),
+    "Redeploy agent",
+  );
+  assert.equal(
+    getManagedAgentPrimaryActionLabel(
+      agent({ ...HOST_AGENT, status: "not_deployed", backendAgentId: null }),
+    ),
+    "Deploy",
+  );
+});
+
+test("deleting a machine agent asks the machine first, and only forces after the user agrees", async () => {
+  const deleteContext = {
+    channels: [],
+    relayAgents: [],
+    getAvailability: () => "online",
+  };
+  const prefixed = `${HOST_UNDEPLOY_FAILED_PREFIX}The machine did not answer in time.`;
+
+  // Machine confirmed: one unforced call.
+  let calls = [];
+  await deleteManagedAgentWithRules({
+    ...deleteContext,
+    agent: agent(HOST_AGENT),
+    deleteManagedAgent: async (input) => calls.push(input),
+  });
+  assert.deepEqual(calls, [{ pubkey: "deadbeef".repeat(8) }]);
+
+  // Machine unreachable, user declines: no forced delete.
+  calls = [];
+  globalThis.window = { confirm: () => false };
+  const declined = await deleteManagedAgentWithRules({
+    ...deleteContext,
+    agent: agent(HOST_AGENT),
+    deleteManagedAgent: async (input) => {
+      calls.push(input);
+      throw new Error(prefixed);
+    },
+  });
+  assert.equal(declined.cancelled, true);
+  assert.equal(calls.length, 1);
+
+  // Machine unreachable, user agrees: retried with force.
+  calls = [];
+  globalThis.window = { confirm: () => true };
+  await deleteManagedAgentWithRules({
+    ...deleteContext,
+    agent: agent(HOST_AGENT),
+    deleteManagedAgent: async (input) => {
+      calls.push(input);
+      if (!input.forceRemoteDelete) throw new Error(prefixed);
+    },
+  });
+  assert.deepEqual(calls, [
+    { pubkey: "deadbeef".repeat(8) },
+    { pubkey: "deadbeef".repeat(8), forceRemoteDelete: true },
+  ]);
+
+  // Any other failure propagates instead of offering a forced delete.
+  await assert.rejects(
+    deleteManagedAgentWithRules({
+      ...deleteContext,
+      agent: agent(HOST_AGENT),
+      deleteManagedAgent: async () => {
+        throw new Error("agent not found");
+      },
+    }),
+    /agent not found/,
+  );
+  delete globalThis.window;
 });

@@ -53,8 +53,23 @@ export function applyProbeResult(
   };
 }
 
+/** `runOn` values for approved machines are `host:<pubkey>`. */
+export const HOST_RUN_ON_PREFIX = "host:";
+
+export function hostRunOnValue(hostPubkey: string): string {
+  return `${HOST_RUN_ON_PREFIX}${hostPubkey}`;
+}
+
+/** The machine pubkey a `runOn` value targets, or null for local/provider. */
+export function hostPubkeyFromRunOn(runOn: string): string | null {
+  return runOn.startsWith(HOST_RUN_ON_PREFIX)
+    ? runOn.slice(HOST_RUN_ON_PREFIX.length) || null
+    : null;
+}
+
 export function providerConfigComplete(draft: WhereToRunDraft): boolean {
   if (draft.runOn === "local") return true;
+  if (hostPubkeyFromRunOn(draft.runOn)) return true;
   if (!draft.probedProvider) return false;
   const schema = draft.probedProvider.config_schema as
     | Record<string, unknown>
@@ -73,6 +88,8 @@ export function resolveBackendIntent(
   draft: WhereToRunDraft,
 ): BackendIntent | null {
   if (draft.runOn === "local") return null;
+  const hostPubkey = hostPubkeyFromRunOn(draft.runOn);
+  if (hostPubkey) return { type: "host", hostPubkey };
   return {
     type: "provider",
     id: draft.runOn,

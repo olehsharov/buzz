@@ -14,6 +14,13 @@ import {
   handleSaveCustomHarness,
   handleDeleteCustomHarness,
 } from "./e2eBridgeCustomHarnesses.ts";
+import {
+  handleMockHostCommand,
+  initMockAgentHosts,
+  markMockAgentOnHost,
+  type MockAgentHostConfig,
+  mockHostPairingOffer,
+} from "./e2eBridgeHosts.ts";
 
 import type {
   ObservedUnreadProjection,
@@ -694,6 +701,8 @@ type E2eConfig = {
     backendProviders?: Array<{ id: string; binaryPath: string }>;
     backendProviderProbeResult?: Record<string, unknown>;
     backendProviderProbeDelayMs?: number;
+    /** Approved agent hosts (`list_agent_hosts`) and their presence. */
+    agentHosts?: MockAgentHostConfig[];
   };
   relayHttpUrl?: string;
   relayWsUrl?: string;
@@ -996,7 +1005,8 @@ type RawManagedAgent = {
   auto_restart_on_config_change?: boolean;
   backend:
     | { type: "local" }
-    | { type: "provider"; id: string; config: Record<string, unknown> };
+    | { type: "provider"; id: string; config: Record<string, unknown> }
+    | { type: "host"; host_pubkey: string };
   backend_agent_id: string | null;
   respond_to: "owner-only" | "allowlist" | "anyone";
   respond_to_allowlist: string[];
@@ -2578,7 +2588,10 @@ function buildSeededManagedAgent(seed: MockManagedAgentSeed): MockManagedAgent {
     start_on_app_launch: true,
     auto_restart_on_config_change: seed.autoRestartOnConfigChange ?? true,
     backend: seed.backend ?? { type: "local" },
-    backend_agent_id: null,
+    backend_agent_id:
+      seed.backend?.type === "host" && status === "deployed"
+        ? seed.backend.host_pubkey
+        : null,
     respond_to: seed.respondTo ?? "owner-only",
     respond_to_allowlist: seed.respondToAllowlist ?? [],
     private_key_nsec: `nsec1mock${seed.pubkey.slice(0, 20)}`,
@@ -9635,7 +9648,8 @@ async function handleCreateManagedAgent(
       startOnAppLaunch?: boolean;
       backend?:
         | { type: "local" }
-        | { type: "provider"; id: string; config: Record<string, unknown> };
+        | { type: "provider"; id: string; config: Record<string, unknown> }
+        | { type: "host"; host_pubkey: string };
       respondTo?: "owner-only" | "allowlist" | "anyone";
       respondToAllowlist?: string[];
     };
@@ -9737,6 +9751,10 @@ async function handleCreateManagedAgent(
     ],
   };
 
+  if (args.input.spawnAfterCreate && managedAgent.backend.type === "host") {
+    markMockAgentOnHost(managedAgent, managedAgent.backend.host_pubkey);
+    managedAgent.pid = null;
+  }
   mockManagedAgents.unshift(managedAgent);
   if (args.input.spawnAfterCreate && managedAgent.backend.type === "local") {
     // The real create command spawns a pair runtime on the agent's effective
@@ -11512,6 +11530,12 @@ export function maybeInstallE2eTauriMocks() {
   resetMockRelayMembers(config);
   resetMockRelayAgents(config);
   resetMockManagedAgents(config);
+  initMockAgentHosts(config.mock?.agentHosts, {
+    setPresence: setMockPresenceStatus,
+    relayUrl: DEFAULT_RELAY_WS_URL,
+  });
+  window.__BUZZ_E2E_HOST_PAIRING_OFFER__ = (sas, hello) =>
+    mockHostPairingOffer({ emit }, sas, hello);
   resetMockPersonas(config);
   resetMockTeams(config);
   seedMockSearchProfiles(config);
@@ -12099,7 +12123,34 @@ export function maybeInstallE2eTauriMocks() {
     });
     window.__BUZZ_E2E_COMMAND_LOG__?.push({ command, payload });
 
+    const hostResult = await handleMockHostCommand(command, payload, {
+      emit,
+      setPresence: setMockPresenceStatus,
+      agents: () => mockManagedAgents,
+      relayUrl: DEFAULT_RELAY_WS_URL,
+    });
+    if (hostResult.handled) return hostResult.value;
+
     switch (command) {
+      case "deploy_to_host": {
+        const { pubkey, hostPubkey } = payload as {
+          pubkey: string;
+          hostPubkey: string;
+        };
+        const agent = getMockManagedAgent(pubkey);
+        markMockAgentOnHost(agent, hostPubkey);
+        agent.last_started_at = new Date().toISOString();
+        syncMockRelayAgentsFromManagedAgents();
+        return cloneManagedAgent(agent);
+      }
+      case "undeploy_from_host": {
+        const agent = getMockManagedAgent(
+          (payload as { pubkey: string }).pubkey,
+        );
+        agent.backend_agent_id = null;
+        agent.status = "not_deployed";
+        return cloneManagedAgent(agent);
+      }
       case "get_huddle_state": {
         const snapshot = mockHuddle ? structuredClone(mockHuddle.state) : null;
         const delayMs = activeConfig?.mock?.huddleStateReadDelayMs ?? 0;

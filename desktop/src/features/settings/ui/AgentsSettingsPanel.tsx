@@ -1,3 +1,4 @@
+import { MachinesSettingsGroup } from "@/features/agents/hosts/MachinesSettingsGroup";
 import { AgentDefaultsSettingsCard } from "./AgentDefaultsSettingsCard";
 import {
   setKeepMentionedAgentsPinned,
@@ -48,6 +49,7 @@ export function AgentsSettingsPanel() {
             />
           </SettingsOptionRow>
         </SettingsOptionGroup>
+        <MachinesSettingsGroup />
         <PreventSleepSettingsCard />
         <HarnessesSettingsPanel />
         <AgentDefaultsSettingsCard />

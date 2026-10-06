@@ -394,6 +394,11 @@ fn reconcile_inbound_persona_event_blocking<R: tauri::Runtime>(
                         });
                     }
                     crate::managed_agents::BackendKind::Provider { .. } => {}
+                    // Host agents pick up a changed policy on their next
+                    // deploy; a narrowing from another device is not pushed
+                    // to the host automatically (no provider-style pending
+                    // reconciliation for hosts yet).
+                    crate::managed_agents::BackendKind::Host { .. } => {}
                 }
             }
             save_managed_agents(&app, &agents)?;

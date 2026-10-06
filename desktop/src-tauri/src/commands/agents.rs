@@ -479,6 +479,16 @@ pub async fn create_managed_agent(
         // Validate via discovered candidates — not raw resolve_command.
         resolve_provider_binary(id)?;
     }
+    if let BackendKind::Host { ref host_pubkey } = input.backend {
+        // Only a machine approved in the active community can be targeted.
+        use tauri::Manager;
+        crate::agent_hosts::ops::approved_host(
+            &app,
+            &app.state::<crate::agent_hosts::HostOps>(),
+            &relay_ws_url_with_override(&state),
+            host_pubkey,
+        )?;
+    }
 
     let relay_mesh = normalize_relay_mesh(input.relay_mesh.as_ref(), &input.backend)?;
 
@@ -837,6 +847,11 @@ pub async fn create_managed_agent(
                 Ok(()) => spawn_error,
                 Err(e) => Some(e),
             }
+        } else if let BackendKind::Host { ref host_pubkey } = input.backend {
+            match deploy_host_agent(&app, &state, &pubkey, host_pubkey).await {
+                Ok(()) => spawn_error,
+                Err(e) => Some(e),
+            }
         } else {
             spawn_error
         }
@@ -912,6 +927,9 @@ pub async fn start_managed_agent(
     )?;
     enum StartTarget {
         Local,
+        Host {
+            host_pubkey: String,
+        },
         Provider {
             backend: BackendKind,
             cached_binary_path: Option<String>,
@@ -958,6 +976,10 @@ pub async fn start_managed_agent(
 
         let target = if record.backend == BackendKind::Local {
             StartTarget::Local
+        } else if let BackendKind::Host { host_pubkey } = &record.backend {
+            StartTarget::Host {
+                host_pubkey: host_pubkey.clone(),
+            }
         } else {
             StartTarget::Provider {
                 backend: record.backend.clone(),
@@ -1009,6 +1031,29 @@ pub async fn start_managed_agent(
             .await?;
 
             // Return updated summary.
+            let _store_guard = state
+                .managed_agents_store_lock
+                .lock()
+                .map_err(|e| e.to_string())?;
+            let records = load_managed_agents(&app)?;
+            let runtimes = state
+                .managed_agent_processes
+                .lock()
+                .map_err(|e| e.to_string())?;
+            let record = records
+                .iter()
+                .find(|r| r.pubkey == pubkey)
+                .ok_or_else(|| format!("agent {pubkey} not found"))?;
+            summarize_from_disk(&app, record, &runtimes)
+        }
+        StartTarget::Host { host_pubkey } => {
+            // Same tenant-scope contract as the provider path: a stale scoped
+            // callback must not deploy into a different community.
+            crate::relay::assert_expected_relay_scope(
+                expected_relay_url.as_deref(),
+                &crate::relay::relay_api_base_url_with_override(&state),
+            )?;
+            deploy_host_agent(&app, &state, &pubkey, &host_pubkey).await?;
             let _store_guard = state
                 .managed_agents_store_lock
                 .lock()
@@ -1125,6 +1170,36 @@ fn run_managed_agent_deletion<T>(
     with_agent_assignments_cleared(base_dir, pubkey, || delete(records))
 }
 
+/// Deploy `pubkey` onto `host_pubkey` over the relay, waiting for its ack.
+async fn deploy_host_agent(
+    app: &AppHandle,
+    state: &AppState,
+    pubkey: &str,
+    host_pubkey: &str,
+) -> Result<(), String> {
+    use tauri::Manager;
+    let relay = relay_ws_url_with_override(state);
+    let channel = crate::agent_hosts::channel::RelayHostChannel {
+        relay_url: relay.clone(),
+        owner_keys: state.signing_keys()?,
+    };
+    crate::agent_hosts::ops::deploy_agent_to_host(
+        app,
+        state,
+        &app.state::<crate::agent_hosts::HostOps>(),
+        &channel,
+        pubkey,
+        host_pubkey,
+        &relay,
+        |record| build_deploy_payload(app, state, record),
+    )
+    .await
+}
+
+/// Prefix of the delete error when the agent's machine did not confirm the
+/// undeploy. The UI offers "delete anyway" (`force_remote_delete: true`).
+pub const HOST_UNDEPLOY_FAILED_PREFIX: &str = "host-undeploy-failed: ";
+
 #[tauri::command]
 pub async fn delete_managed_agent(
     pubkey: String,
@@ -1132,6 +1207,36 @@ pub async fn delete_managed_agent(
     app: AppHandle,
 ) -> Result<(), String> {
     use tauri::Manager;
+    // A host agent is removed from its machine first, and the machine must
+    // acknowledge it. Forcing skips the machine (it may be gone for good) —
+    // the user confirmed that in the UI after this failed once.
+    {
+        let state = app.state::<AppState>();
+        let hosts = app.state::<crate::agent_hosts::HostOps>();
+        let on_host = {
+            let _store_guard = state
+                .managed_agents_store_lock
+                .lock()
+                .map_err(|error| error.to_string())?;
+            load_managed_agents(&app)?
+                .iter()
+                .find(|record| record.pubkey == pubkey)
+                .and_then(crate::agent_hosts::ops::deployed_host)
+                .is_some()
+        };
+        if on_host && !force_remote_delete.unwrap_or(false) {
+            let channel = crate::agent_hosts::channel::RelayHostChannel {
+                relay_url: relay_ws_url_with_override(&state),
+                owner_keys: state.signing_keys()?,
+            };
+            crate::agent_hosts::ops::undeploy_agent_from_host(
+                &app, &state, &hosts, &channel, &pubkey,
+            )
+            .await
+            .map_err(|error| format!("{HOST_UNDEPLOY_FAILED_PREFIX}{error}"))?;
+        }
+        hosts.invalidate(&pubkey)?;
+    }
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
         {

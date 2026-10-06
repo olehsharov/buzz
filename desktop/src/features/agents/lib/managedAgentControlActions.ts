@@ -1,4 +1,5 @@
 import { captureRelayRemovals } from "@/features/agents/managedAgentRelayCleanup";
+import { HOST_UNDEPLOY_FAILED_PREFIX } from "@/shared/api/agentHosts";
 import { sendChannelMessage } from "@/shared/api/tauri";
 import type { Channel, ManagedAgent, RelayAgent } from "@/shared/api/types";
 import type { AgentAvailabilityReader } from "./useAgentAvailability";
@@ -28,13 +29,19 @@ export type ManagedAgentActionResult = {
   noticeMessage?: string;
 };
 
+/** Agents that run somewhere else: a provider deployment or an approved
+ * machine. Both deploy instead of starting, and stop via `!shutdown`. */
+export function isRemoteManagedAgent(agent: Pick<ManagedAgent, "backend">) {
+  return agent.backend.type === "provider" || agent.backend.type === "host";
+}
+
 /** Lifecycle action routing only; deployed is a retained receipt, not presence. */
 export function isManagedAgentActive(agent: Pick<ManagedAgent, "status">) {
   return agent.status === "running" || agent.status === "deployed";
 }
 
 export function getManagedAgentPrimaryActionLabel(agent: ManagedAgent) {
-  if (agent.backend.type === "provider") {
+  if (isRemoteManagedAgent(agent)) {
     return isManagedAgentActive(agent) ? "Shutdown" : "Deploy";
   }
 
@@ -58,7 +65,7 @@ export function getManagedAgentPrimaryActionLabel(agent: ManagedAgent) {
 export function getManagedAgentRestartLabel(
   agent: Pick<ManagedAgent, "backend" | "status">,
 ): string | null {
-  if (agent.backend.type === "provider") {
+  if (isRemoteManagedAgent(agent)) {
     return agent.status === "deployed" ? "Redeploy agent" : null;
   }
   return isManagedAgentActive(agent) ? "Restart agent" : null;
@@ -144,7 +151,7 @@ export async function stopManagedAgentWithRules({
   agent: ManagedAgent;
   stopManagedAgent: StopManagedAgent;
 } & ManagedAgentChannelContext): Promise<ManagedAgentActionResult> {
-  if (agent.backend.type === "provider") {
+  if (isRemoteManagedAgent(agent)) {
     const channelId = resolveManagedAgentChannelId(agent, {
       channels,
       preferredChannelId,
@@ -180,6 +187,9 @@ export async function deleteManagedAgentWithRules({
   deleteManagedAgent: DeleteManagedAgent;
   skipRemoteDeleteConfirm?: boolean;
 } & ManagedAgentActionContext): Promise<ManagedAgentActionResult> {
+  if (agent.backend.type === "host") {
+    return deleteHostAgent(agent, deleteManagedAgent, skipRemoteDeleteConfirm);
+  }
   if (agent.backend.type === "provider" && agent.backendAgentId) {
     const availability = getAvailability(agent.pubkey);
     const channelId = resolveManagedAgentChannelId(agent, {
@@ -241,4 +251,37 @@ export async function deleteManagedAgentWithRules({
   });
 
   return {};
+}
+
+/**
+ * A machine agent is removed from its machine first; the backend requires
+ * the machine's acknowledgement. When the machine cannot be reached the user
+ * can still delete the record (the agent may keep running there until the
+ * machine is forgotten), so a dead machine never strands the agent.
+ */
+async function deleteHostAgent(
+  agent: ManagedAgent,
+  deleteManagedAgent: DeleteManagedAgent,
+  skipConfirm: boolean,
+): Promise<ManagedAgentActionResult> {
+  try {
+    await deleteManagedAgent({ pubkey: agent.pubkey });
+    return {};
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!message.startsWith(HOST_UNDEPLOY_FAILED_PREFIX)) throw error;
+    const reason = message.slice(HOST_UNDEPLOY_FAILED_PREFIX.length);
+    if (
+      !skipConfirm &&
+      !window.confirm(
+        `The machine did not confirm removing this agent (${reason}). ` +
+          "Delete it here anyway? It may keep running on the machine until " +
+          "you forget the machine.",
+      )
+    ) {
+      return { cancelled: true };
+    }
+    await deleteManagedAgent({ pubkey: agent.pubkey, forceRemoteDelete: true });
+    return {};
+  }
 }

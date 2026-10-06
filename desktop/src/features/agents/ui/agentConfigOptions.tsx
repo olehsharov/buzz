@@ -1,6 +1,7 @@
 import type {
   AcpRuntimeCatalogEntry,
   GlobalAgentConfig,
+  PresenceStatus,
 } from "@/shared/api/types";
 import { BUZZ_AGENT_THINKING_EFFORT } from "./buzzAgentConfig";
 import type { RuntimeFileConfigSubset } from "@/shared/api/tauri";
@@ -63,6 +64,8 @@ export type PersonaDropdownOption = {
   disabled?: boolean;
   label: string;
   description?: string;
+  /** Decorative presence dot; the state itself must be in `description`. */
+  presence?: PresenceStatus;
   value: string;
 };
 
