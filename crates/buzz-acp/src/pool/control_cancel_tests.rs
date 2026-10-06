@@ -6,7 +6,7 @@ use crate::acp::AcpClient;
 use nostr::{EventBuilder, Keys, Kind};
 use tests::make_prompt_context_no_owner;
 
-fn conv(channel_id: Uuid) -> SessionScope {
+pub(super) fn conv(channel_id: Uuid) -> SessionScope {
     SessionScope::Conversation { channel_id }
 }
 
@@ -51,7 +51,7 @@ done"#
 const CANCEL_CLEAN: &str =
     r#"printf '%s\n' '{"jsonrpc":"2.0","id":'"$pending"',"result":{"stopReason":"cancelled"}}'"#;
 
-fn captured_requests(capture: &std::path::Path) -> Vec<serde_json::Value> {
+pub(super) fn captured_requests(capture: &std::path::Path) -> Vec<serde_json::Value> {
     std::fs::read_to_string(capture)
         .unwrap_or_default()
         .lines()
@@ -59,11 +59,14 @@ fn captured_requests(capture: &std::path::Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn requests_for<'a>(requests: &'a [serde_json::Value], method: &str) -> Vec<&'a serde_json::Value> {
+pub(super) fn requests_for<'a>(
+    requests: &'a [serde_json::Value],
+    method: &str,
+) -> Vec<&'a serde_json::Value> {
     requests.iter().filter(|r| r["method"] == method).collect()
 }
 
-fn prompt_request_text(request: &serde_json::Value) -> String {
+pub(super) fn prompt_request_text(request: &serde_json::Value) -> String {
     request["params"]["prompt"]
         .as_array()
         .expect("prompt blocks")
@@ -73,7 +76,7 @@ fn prompt_request_text(request: &serde_json::Value) -> String {
         .join("\n\n")
 }
 
-fn cancel_test_agent(acp: AcpClient) -> OwnedAgent {
+pub(super) fn cancel_test_agent(acp: AcpClient) -> OwnedAgent {
     OwnedAgent {
         index: 0,
         acp,
@@ -90,7 +93,7 @@ fn cancel_test_agent(acp: AcpClient) -> OwnedAgent {
     }
 }
 
-fn single_event_batch(channel_id: Uuid, content: &str) -> FlushBatch {
+pub(super) fn single_event_batch(channel_id: Uuid, content: &str) -> FlushBatch {
     FlushBatch {
         channel_id,
         scope: conv(channel_id),
@@ -109,7 +112,7 @@ fn single_event_batch(channel_id: Uuid, content: &str) -> FlushBatch {
 
 /// Prompt context whose relay is `relay` and that already knows
 /// `channel_id` as a stream channel, so turns reach the agent promptly.
-fn cancel_test_ctx(
+pub(super) fn cancel_test_ctx(
     relay: &crate::stream_draft::test_relay::FakeRelay,
     channel_id: Uuid,
 ) -> PromptContext {
@@ -292,16 +295,71 @@ async fn clean_steer_cancel_keeps_session_and_reprompts_it() {
     );
 }
 
-/// Every cancel outcome other than a clean `cancelled` answer to a steer
-/// or interrupt still drops the session, as before.
+/// An explicit `!cancel` that the adapter settles cleanly keeps the session
+/// too: the batch is dropped (nothing re-prompts), and the next message goes
+/// to the same session without a `session/new`.
 #[tokio::test]
-async fn control_cancel_invalidates_session_unless_clean_mid_turn_cancel() {
+async fn clean_explicit_cancel_keeps_session_for_the_next_message() {
+    let (acp, capture) = spawn_cancel_acp(CANCEL_CLEAN).await;
+    let channel_id = Uuid::new_v4();
+    let scope = conv(channel_id);
+    let relay = crate::stream_draft::test_relay::FakeRelay::spawn().await;
+    let ctx = Arc::new(cancel_test_ctx(&relay, channel_id));
+    let result = run_turn_and_signal(
+        cancel_test_agent(acp),
+        single_event_batch(channel_id, "the original task"),
+        &ctx,
+        &capture,
+        ControlSignal::Cancel,
+    )
+    .await;
+    assert!(matches!(result.outcome, PromptOutcome::Cancelled));
+    assert!(result.batch.is_none(), "!cancel drops the batch");
+    assert_eq!(
+        result.agent.state.sessions.get(&scope).map(String::as_str),
+        Some("new-0"),
+        "a clean !cancel keeps the session"
+    );
+
+    let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+    run_prompt_task(
+        result.agent,
+        Some(single_event_batch(channel_id, "the next message")),
+        None,
+        Arc::clone(&ctx),
+        result_tx,
+        None,
+        "next-turn".into(),
+    )
+    .await;
+    let mut result = result_rx.recv().await.expect("prompt result");
+    assert!(matches!(
+        result.outcome,
+        PromptOutcome::Ok(StopReason::EndTurn)
+    ));
+    result.agent.acp.shutdown().await;
+    let requests = captured_requests(&capture);
+    let _ = std::fs::remove_file(&capture);
+    assert_eq!(requests_for(&requests, "session/new").len(), 1);
+    let prompts = requests_for(&requests, "session/prompt");
+    assert_eq!(prompts.len(), 2);
+    assert_eq!(prompts[1]["params"]["sessionId"], "new-0");
+}
+
+/// Every cancel outcome other than a clean `cancelled` answer to a steer,
+/// interrupt or explicit stop still drops the session, as before.
+#[tokio::test]
+async fn control_cancel_invalidates_session_unless_clean_cancel() {
     const CANCEL_ENDS_TURN: &str =
         r#"printf '%s\n' '{"jsonrpc":"2.0","id":'"$pending"',"result":{"stopReason":"end_turn"}}'"#;
     let cases: [(&str, ControlSignal, &str); 4] = [
         ("non-clean stop", ControlSignal::Steer, CANCEL_ENDS_TURN),
         ("agent exit", ControlSignal::Steer, "exit 0"),
-        ("explicit stop", ControlSignal::Cancel, CANCEL_CLEAN),
+        (
+            "non-clean explicit stop",
+            ControlSignal::Cancel,
+            CANCEL_ENDS_TURN,
+        ),
         ("rotate", ControlSignal::Rotate, CANCEL_CLEAN),
     ];
     for (label, signal, on_cancel) in cases {
@@ -332,7 +390,7 @@ async fn control_cancel_invalidates_session_unless_clean_mid_turn_cancel() {
 }
 
 #[test]
-fn control_cancel_keeps_session_only_for_clean_mid_turn_cancels() {
+fn control_cancel_keeps_session_only_for_clean_cancels() {
     let channel = PromptSource::Channel(conv(Uuid::new_v4()));
     let switch = ControlSignal::SwitchModel {
         model_id: "m".into(),
@@ -353,12 +411,8 @@ fn control_cancel_keeps_session_only_for_clean_mid_turn_cancels() {
             &channel,
             false,
         ),
-        (
-            ControlSignal::Cancel,
-            StopReason::Cancelled,
-            &channel,
-            false,
-        ),
+        (ControlSignal::Cancel, StopReason::Cancelled, &channel, true),
+        (ControlSignal::Cancel, StopReason::EndTurn, &channel, false),
         (
             ControlSignal::Rotate,
             StopReason::Cancelled,

@@ -167,6 +167,10 @@ pub enum CancelReason {
     /// and incorporate the message if relevant
     /// (`MultipleEventHandling::Steer`, the default mid-turn path).
     Steer,
+    /// The harness shut down (or crashed) mid-turn and restored the turn
+    /// from its journal on start: the agent resumes the same provider session
+    /// and should continue that turn, not start it over.
+    Restart,
 }
 
 /// A batch of events to prompt the agent with.
@@ -2373,6 +2377,9 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     //      should *continue* its work and weave the message in if relevant.
     let has_cancelled = !batch.cancelled_events.is_empty();
     let framing = MergeFraming::for_reason(batch.cancel_reason, args.cancelled_turn_in_session);
+    // A restored turn with nothing new merged in: its events are the
+    // interrupted turn itself.
+    let restart_only = !has_cancelled && batch.cancel_reason == Some(CancelReason::Restart);
 
     // 4a. Cancelled events section.
     if has_cancelled {
@@ -2394,12 +2401,18 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
         ));
     }
 
-    // 4b. Event block(s).
+    // 4b. Event block(s). A restart-only batch is the interrupted turn
+    // itself, so it carries the prior (interrupted) tag.
+    let framed_tag = if restart_only {
+        framing.prior_tag
+    } else {
+        framing.new_tag
+    };
     let event_section = if batch.events.len() == 1 {
         let be = &batch.events[0];
-        if has_cancelled {
+        if has_cancelled || restart_only {
             crate::prompt_framing::semantic_section(
-                framing.new_tag,
+                framed_tag,
                 &format!(
                     "--- Event 1 ({}) ---\n{}",
                     be.prompt_tag,
@@ -2433,8 +2446,8 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
         }
         let count = batch.events.len().to_string();
         crate::prompt_framing::semantic_section_with_attributes(
-            if has_cancelled {
-                framing.new_tag
+            if has_cancelled || restart_only {
+                framed_tag
             } else {
                 "buzz-events"
             },
@@ -2445,7 +2458,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     sections.push(event_section);
 
     // 4c. Closing note for cancel + re-prompt.
-    if has_cancelled {
+    if has_cancelled || restart_only {
         sections.push(framing.closing_note.to_string());
     }
 
@@ -2508,6 +2521,13 @@ impl MergeFraming {
                      in-progress work and incorporate the new message if it's relevant; if it's \
                      unrelated, you may briefly acknowledge it and carry on.",
             },
+            // A restored turn always runs in its resumed session, so
+            // `in_session` does not change the wording.
+            (Some(CancelReason::Restart), _) => MergeFraming {
+                prior_tag: "your-interrupted-turn-was-handling",
+                new_tag: "new-message-arrived-while-you-were-working",
+                closing_note: RESTART_CLOSING_NOTE,
+            },
             (Some(CancelReason::Interrupt), false) => MergeFraming {
                 prior_tag: "previous-request-interrupted-before-completion",
                 new_tag: "new-request-supersedes-previous",
@@ -2518,6 +2538,12 @@ impl MergeFraming {
         }
     }
 }
+
+/// Closing instruction for a turn restored after a harness restart.
+const RESTART_CLOSING_NOTE: &str = "Note: Your previous turn on this was interrupted because \
+     the harness restarted. This is the same session, so it should still hold that turn and the \
+     work you did in it: continue from where you stopped instead of starting over. If a new \
+     message is included, incorporate it if it's relevant.";
 
 /// Framing strings for the goose-native steer path (lib.rs mode-gate),
 /// pulled from the same source-of-truth as the cancel+merge fallback
@@ -3165,6 +3191,34 @@ mod tests {
                 "{reason:?}: a fresh session keeps the restating framing: {fresh}"
             );
         }
+    }
+
+    /// A turn restored after a restart says it was interrupted by the restart
+    /// and to continue, whether it is re-run alone or merged with a message
+    /// that arrived meanwhile.
+    #[test]
+    fn test_format_prompt_restart_framing() {
+        let mut alone = make_merged_batch(Some(CancelReason::Restart));
+        alone.events = std::mem::take(&mut alone.cancelled_events);
+        let alone = format_prompt(&alone, &FormatPromptArgs::default()).join("\n\n");
+        assert!(
+            alone.contains("<your-interrupted-turn-was-handling>")
+                && alone.contains("the original task")
+                && alone.contains("the harness restarted")
+                && alone.contains("continue from where you stopped"),
+            "a restored turn re-run alone: {alone}"
+        );
+        assert!(!alone.contains("<buzz-event"), "{alone}");
+
+        let merged = make_merged_batch(Some(CancelReason::Restart));
+        let merged = format_prompt(&merged, &FormatPromptArgs::default()).join("\n\n");
+        assert!(
+            merged.contains("<your-interrupted-turn-was-handling>")
+                && merged.contains("<new-message-arrived-while-you-were-working>")
+                && merged.contains("the harness restarted")
+                && merged.contains("the new message"),
+            "a restored turn merged with a new message: {merged}"
+        );
     }
 
     #[test]

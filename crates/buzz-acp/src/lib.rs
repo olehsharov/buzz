@@ -25,6 +25,7 @@ use runtime::{AgentRuntime, PoolStartup, SessionMode};
 mod scope;
 mod setup_mode;
 mod stream_draft;
+mod turn_journal;
 mod usage;
 
 pub use usage::TurnUsage;
@@ -2853,7 +2854,25 @@ async fn run_harness(
         relay.event_publisher(),
         config.keys.clone(),
     );
+    match resume_store::state_root_from_env(|key| std::env::var_os(key)) {
+        Some(root) => {
+            let store = turn_journal::TurnJournalStore::new(&root, &pubkey_hex);
+            tracing::info!(
+                "turn journal directory {} (interrupted turns resume after a restart)",
+                store.dir().display()
+            );
+            prompt_context.turn_journal =
+                turn_journal::TurnJournal::new(store, shutdown_tx.subscribe());
+        }
+        None => tracing::warn!(
+            "no state directory (set an absolute XDG_STATE_HOME or HOME): turns interrupted \
+             by a restart will not resume"
+        ),
+    }
     let ctx = Arc::new(prompt_context);
+    // Turns a previous run could not finish re-run once, in their own
+    // sessions. Their events are skipped if the relay replays them.
+    let restored_event_ids = restore_interrupted_turns(&ctx, &mut queue);
 
     if !config.memory_enabled {
         tracing::info!(
@@ -3016,6 +3035,20 @@ async fn run_harness(
         Wake(u32, Result<AgentPool, String>),
         HoldDeadline,
         Recovery(recovery_wake::RecoveryWake),
+    }
+
+    // Restored turns wait for no relay event: dispatch them now (a lazy pool
+    // wakes for them at the top of the loop).
+    if pool_ready && queue.has_flushable_work() {
+        for (scope, thread_tags) in dispatch_pending(
+            &mut pool,
+            &mut queue,
+            &ctx,
+            &mut last_activity,
+            observer.as_ref(),
+        ) {
+            typing_channels.insert(scope, thread_tags);
+        }
     }
 
     loop {
@@ -3467,6 +3500,14 @@ async fn run_harness(
                                     // session: a resume binding on this scope
                                     // must not re-apply the fork.
                                     ctx.resume_session.release(&scope);
+                                    // `!rotate` is the one way out of a dead
+                                    // session: the next message starts fresh.
+                                    if ctx.dead_sessions.clear(&scope) {
+                                        tracing::info!(
+                                            scope = %scope.telemetry_label(),
+                                            "!rotate cleared a dead session — next message starts a fresh session"
+                                        );
+                                    }
                                     let fired = signal_in_flight_task_for_scope(
                                         &mut pool,
                                         &scope,
@@ -3504,6 +3545,13 @@ async fn run_harness(
                             // launched by the same human). Allowlist adds the
                             // explicit pubkey list on top, for external people;
                             // it never revokes same-owner team bots.
+                            if is_restored_replay(&restored_event_ids, &buzz_event.event) {
+                                tracing::info!(
+                                    event_id = %buzz_event.event.id,
+                                    "relay replayed an event the restored turn already carries — skipping"
+                                );
+                                continue;
+                            }
                             let Some(authorized_event) = authorize_normal_listener_event(
                                 &mut author_gate_ctx,
                                 buzz_event,
@@ -5016,6 +5064,61 @@ fn spawn_failure_notice(
     });
 }
 
+/// Whether `event` is a relay replay of an event a restored turn already
+/// carries. The restored turn runs it once; queuing the replay as well would
+/// run it twice.
+fn is_restored_replay(restored: &HashSet<String>, event: &nostr::Event) -> bool {
+    restored.contains(&event.id.to_hex())
+}
+
+/// Requeue the turns the previous run journaled but could not finish, each
+/// once and in its own provider session, and post a notice for the ones that
+/// will not resume (too old, already resumed once, other cwd, unreadable fork
+/// record). Returns the ids of the events now queued again, so a relay replay
+/// of them is not queued a second time.
+fn restore_interrupted_turns(ctx: &PromptContext, queue: &mut EventQueue) -> HashSet<String> {
+    let Some(store) = ctx.turn_journal.store() else {
+        return HashSet::new();
+    };
+    let mut restored = HashSet::new();
+    for action in turn_journal::plan_restore(store, &ctx.cwd, turn_journal::now_unix()) {
+        match action {
+            turn_journal::RestoreAction::Notice { batch, message } => {
+                spawn_failure_notice(Some(&ctx.rest_client), &batch, message);
+            }
+            turn_journal::RestoreAction::Resume { batch, session_id } => {
+                // A turn that ran in the bound fork must take the binding, so
+                // no other scope continues that fork first.
+                if let Err(error) =
+                    ctx.resume_session
+                        .reserve_for_restored(&batch.scope, &session_id, &ctx.cwd)
+                {
+                    tracing::error!(
+                        scope = %batch.scope.telemetry_label(),
+                        "cannot tell whether the restored turn ran in the resumed fork, \
+                         not resuming it: {error}"
+                    );
+                    ctx.turn_journal.discard(&batch.scope);
+                    spawn_failure_notice(
+                        Some(&ctx.rest_client),
+                        &batch,
+                        format!(
+                            "⚠️ My work on this was interrupted by a restart and I couldn't \
+                             resume it ({error}). Please re-send if it's still needed."
+                        ),
+                    );
+                    continue;
+                }
+                restored.extend(batch.events.iter().map(|e| e.event.id.to_hex()));
+                ctx.turn_journal
+                    .register_restart(batch.scope.clone(), session_id);
+                queue.requeue_as_cancelled(batch, CancelReason::Restart);
+            }
+        }
+    }
+    restored
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_prompt_result(
     pool: &mut AgentPool,
@@ -5076,7 +5179,21 @@ fn handle_prompt_result(
         // Don't requeue batches for channels the agent was removed from —
         // those events are stale and should be silently dropped.
         if !removed_channels.contains(&batch.channel_id) {
-            if matches!(
+            if let PromptOutcome::SessionDead(reason) = &result.outcome {
+                // Fail fast: retrying cannot revive the session and must not
+                // burn the retry budget against it. Post the full reason in
+                // the thread; the scope stays dead until `!rotate`.
+                tracing::error!(
+                    channel_id = %batch.channel_id,
+                    events = batch.events.len(),
+                    "dead-lettering batch immediately — provider session is gone: {reason}"
+                );
+                spawn_failure_notice(
+                    rest_client,
+                    &batch,
+                    format!("⚠️ I couldn't process the last request: {reason}"),
+                );
+            } else if matches!(
                 result.outcome,
                 PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
             ) {
@@ -5214,6 +5331,7 @@ fn handle_prompt_result(
         PromptOutcome::AgentExited => "exited",
         PromptOutcome::Cancelled => "cancelled",
         PromptOutcome::CancelDrainTimeout(_) => "cancel_drain_timeout",
+        PromptOutcome::SessionDead(_) => "session_dead",
     };
     let agent_index = result.agent.index;
     // Capture the spawn-time configured model and our PID before the agent is
@@ -5365,6 +5483,18 @@ fn handle_prompt_result(
                 pid = harness_pid,
                 "agent_returned (cancelled)"
             );
+            pool.return_agent(result.agent);
+        }
+        // The scope's provider session is gone. The agent process is fine;
+        // the batch was dead-lettered with a notice above.
+        PromptOutcome::SessionDead(reason) => {
+            tracing::error!(
+                agent = agent_index,
+                outcome = outcome_label,
+                reason,
+                "agent_returned (provider session gone — scope fails until !rotate)"
+            );
+            emit_turn_error(&reason, None);
             pool.return_agent(result.agent);
         }
         PromptOutcome::ProjectContextIndeterminate(reason) => {
@@ -11855,6 +11985,184 @@ mod error_outcome_emission_tests {
             0,
             "auth error must dead-letter immediately — no events should be pending"
         );
+    }
+
+    /// A dead provider session dead-letters its batch at once (no requeue, no
+    /// retry budget spent), posts the full reason in the thread, and emits
+    /// exactly one `turn_error` with it.
+    #[tokio::test]
+    async fn session_dead_dead_letters_with_the_reason_and_one_turn_error() {
+        let relay = crate::stream_draft::test_relay::FakeRelay::spawn().await;
+        let rest = relay.rest(&Keys::generate());
+        let channel_id = uuid::Uuid::new_v4();
+        let scope = scope::SessionScope::Conversation { channel_id };
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "test")
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+        let batch = FlushBatch {
+            channel_id,
+            scope: scope.clone(),
+            events: vec![BatchEvent {
+                edit: None,
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                scope: None,
+                turn_id: "test-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = std::collections::HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let observer = ObserverHandle::in_process();
+        let reason = "my session s-1 for this conversation is gone (code -32603): Internal error: Session not found";
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(scope),
+            turn_id: "test-turn-id".to_string(),
+            outcome: PromptOutcome::SessionDead(reason.to_string()),
+            batch: Some(batch),
+        };
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            Some(observer.clone()),
+            Some(&rest),
+        );
+        assert_eq!(queue.queued_event_count(channel_id), 0, "never requeued");
+        assert_eq!(queue.pending_channels(), 0);
+        assert!(pool.any_idle(), "the healthy agent returns to the pool");
+        let turn_errors: Vec<_> = observer
+            .snapshot()
+            .into_iter()
+            .filter(|e| e.kind == "turn_error")
+            .collect();
+        assert_eq!(turn_errors.len(), 1);
+        assert_eq!(turn_errors[0].payload["error"], reason);
+        assert_eq!(turn_errors[0].payload["outcome"], "session_dead");
+        let posted = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let posted = relay.posted_messages();
+                if !posted.is_empty() {
+                    return posted;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("notice posted");
+        assert_eq!(posted.len(), 1);
+        let content = posted[0]["content"].as_str().unwrap_or_default();
+        assert!(content.contains(reason), "{content}");
+    }
+
+    /// Startup re-queues each resumable journaled turn once, marks its scope
+    /// to resume the recorded session, posts a notice for a record it will
+    /// not resume, and reports the restored event ids so relay replays of
+    /// them are skipped.
+    #[tokio::test]
+    async fn restore_interrupted_turns_requeues_once_and_skips_replays() {
+        let relay = crate::stream_draft::test_relay::FakeRelay::spawn().await;
+        let state = tempfile::tempdir().expect("state dir");
+        let store = turn_journal::TurnJournalStore::new(state.path(), "agent-hex");
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let mut ctx = pool::tests::make_prompt_context_no_owner();
+        ctx.rest_client = relay.rest(&Keys::generate());
+        ctx.turn_journal = turn_journal::TurnJournal::new(store.clone(), shutdown_rx);
+        let batch_for = |content: &str| {
+            let channel_id = uuid::Uuid::new_v4();
+            FlushBatch {
+                channel_id,
+                scope: scope::SessionScope::Conversation { channel_id },
+                events: vec![BatchEvent {
+                    edit: None,
+                    event: nostr::EventBuilder::new(nostr::Kind::Custom(9), content)
+                        .sign_with_keys(&nostr::Keys::generate())
+                        .unwrap(),
+                    prompt_tag: "test".into(),
+                    received_at: std::time::Instant::now(),
+                }],
+                cancelled_events: vec![],
+                cancel_reason: None,
+            }
+        };
+        let resumable = batch_for("resume me");
+        let stale = batch_for("too old");
+        let now = turn_journal::now_unix();
+        store
+            .save(&turn_journal::TurnRecord::for_turn(
+                &resumable, "s-1", &ctx.cwd, now,
+            ))
+            .unwrap();
+        store
+            .save(&turn_journal::TurnRecord::for_turn(
+                &stale, "s-2", &ctx.cwd, 0,
+            ))
+            .unwrap();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+
+        let restored = restore_interrupted_turns(&ctx, &mut queue);
+        let resumed_event = &resumable.events[0].event;
+        assert!(is_restored_replay(&restored, resumed_event));
+        assert!(!is_restored_replay(&restored, &stale.events[0].event));
+        assert_eq!(
+            ctx.turn_journal
+                .restart_session(&resumable.scope)
+                .as_deref(),
+            Some("s-1")
+        );
+        assert_eq!(ctx.turn_journal.restart_session(&stale.scope), None);
+        let flushed = queue.flush_next().expect("the restored turn is queued");
+        assert_eq!(flushed.scope, resumable.scope);
+        assert_eq!(flushed.cancel_reason, Some(CancelReason::Restart));
+        assert_eq!(flushed.events[0].event.id, resumed_event.id);
+        assert!(queue.flush_next().is_none(), "the stale turn is not queued");
+        let posted = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let posted = relay.posted_messages();
+                if !posted.is_empty() {
+                    return posted;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("notice posted for the stale record");
+        assert!(posted[0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("24 hours"));
     }
 
     /// Run a model-not-found turn failure for `event` through

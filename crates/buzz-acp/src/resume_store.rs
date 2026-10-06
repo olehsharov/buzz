@@ -141,7 +141,7 @@ fn with_path(error: io::Error, action: &str, path: &Path) -> io::Error {
 }
 
 #[cfg(unix)]
-fn create_private_dir_all(dir: &Path) -> io::Result<()> {
+pub(crate) fn create_private_dir_all(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt as _;
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -150,17 +150,17 @@ fn create_private_dir_all(dir: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn create_private_dir_all(dir: &Path) -> io::Result<()> {
+pub(crate) fn create_private_dir_all(dir: &Path) -> io::Result<()> {
     std::fs::create_dir_all(dir)
 }
 
 #[cfg(unix)]
-fn sync_dir(dir: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
     std::fs::File::open(dir)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_dir(_dir: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir(_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 

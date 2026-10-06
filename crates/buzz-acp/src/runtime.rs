@@ -127,6 +127,10 @@ fn make_prompt_context(
         resume_session: pool::ResumeSessionSlot::new(pending_resume(config, |key| {
             std::env::var_os(key)
         })?),
+        dead_sessions: pool::DeadSessions::default(),
+        // Conversation mode attaches the store and shutdown signal; isolated
+        // tasks never journal.
+        turn_journal: crate::turn_journal::TurnJournal::default(),
         // Needs the live relay publisher; conversation startup attaches it.
         // Isolated tasks never stream.
         stream: None,
