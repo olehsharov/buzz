@@ -251,6 +251,8 @@ pub struct AcpClient {
     /// `sessionCapabilities.resume` in its `initialize` response. Gates
     /// [`session_fork`](Self::session_fork) for `BUZZ_ACP_RESUME_SESSION`.
     fork_resume_supported: bool,
+    /// Whether `initialize` advertised `sessionCapabilities.resume`.
+    resume_supported: bool,
     /// Per-turn channel for receiving goose-native non-cancelling steer
     /// requests from the main loop. Installed by
     /// [`install_steer_rx`](Self::install_steer_rx) at dispatch and
@@ -677,6 +679,7 @@ impl AcpClient {
             active_run_id: None,
             steering_supported: false,
             fork_resume_supported: false,
+            resume_supported: false,
             steer_rx: None,
             stream_sink: None,
             goose_usage: UsageTracker::default(),
@@ -737,6 +740,9 @@ impl AcpClient {
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        self.resume_supported = result
+            .pointer("/agentCapabilities/sessionCapabilities/resume")
+            .is_some_and(|v| !v.is_null());
         self.fork_resume_supported = ["fork", "resume"].iter().all(|cap| {
             result
                 .pointer(&format!("/agentCapabilities/sessionCapabilities/{cap}"))
@@ -1083,6 +1089,12 @@ impl AcpClient {
     /// at `initialize` time.
     pub fn fork_resume_supported(&self) -> bool {
         self.fork_resume_supported
+    }
+
+    /// Whether the agent advertised `sessionCapabilities.resume` at
+    /// `initialize` time.
+    pub fn resume_supported(&self) -> bool {
+        self.resume_supported
     }
 
     /// Consume per-turn usage for NIP-AM publishing. Goose/buzz-agent is an

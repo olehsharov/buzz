@@ -124,10 +124,14 @@ fn make_prompt_context(
         memory_enabled: config.memory_enabled,
         harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
         relay_url: config.relay_url.clone(),
-        resume_session: std::sync::Arc::new(std::sync::Mutex::new(pending_resume(
-            config,
-            |key| std::env::var_os(key),
-        )?)),
+        resume_session: pool::ResumeSessionSlot::new(pending_resume(config, |key| {
+            std::env::var_os(key)
+        })?),
+        dead_sessions: pool::DeadSessions::default(),
+        // Conversation mode attaches the store and shutdown signal; isolated
+        // tasks never journal.
+        turn_journal: crate::turn_journal::TurnJournal::default(),
+        scope_sessions: crate::scope_sessions::ScopeSessions::default(),
         // Needs the live relay publisher; conversation startup attaches it.
         // Isolated tasks never stream.
         stream: None,
