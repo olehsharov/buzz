@@ -76,22 +76,32 @@ export function fromRawAgentHost(raw: RawAgentHost): AgentHost {
   };
 }
 
+/** The "Add machine" commands for one pairing session. */
 export type HostInstallInfo = {
-  installUrl: string;
+  /** `https://<community relay>/host`, where the relay serves the installer. */
+  baseUrl: string;
+  /** Install from the relay and pair, in one `curl … | bash` line. */
   command: string;
-  relayUrl: string;
+  /** For machines that already have `buzz host`. */
+  upCommand: string;
+  /** How long the pairing code stays valid. */
+  sessionTtlSecs: number;
 };
 
-export async function getHostInstallInfo(): Promise<HostInstallInfo> {
+export async function getHostInstallInfo(
+  pairingUri: string,
+): Promise<HostInstallInfo> {
   const raw = await invokeTauri<{
-    install_url: string;
+    base_url: string;
     command: string;
-    relay_url: string;
-  }>("get_host_install_info");
+    up_command: string;
+    session_ttl_secs: number;
+  }>("get_host_install_info", { pairingUri });
   return {
-    installUrl: raw.install_url,
+    baseUrl: raw.base_url,
     command: raw.command,
-    relayUrl: raw.relay_url,
+    upCommand: raw.up_command,
+    sessionTtlSecs: raw.session_ttl_secs,
   };
 }
 

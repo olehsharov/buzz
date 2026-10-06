@@ -16,6 +16,10 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 use crate::app_state::AppState;
+
+/// How long a pairing session waits for the other device before it times out
+/// (shown as the code's expiry in "Add machine").
+pub(crate) const PAIRING_SESSION_TIMEOUT: Duration = Duration::from_secs(130);
 use crate::relay::{relay_api_base_url_with_override, relay_ws_url_with_override};
 
 #[derive(Serialize, Clone)]
@@ -355,7 +359,7 @@ async fn pairing_ws_task_inner<R: Runtime>(
 
     wait_for_eose(&mut read, "pair", Duration::from_secs(10)).await?;
 
-    let hard_timeout = tokio::time::sleep(Duration::from_secs(130));
+    let hard_timeout = tokio::time::sleep(PAIRING_SESSION_TIMEOUT);
     tokio::pin!(hard_timeout);
     // ApproveHost: the hello we answered with a grant, held until the
     // machine's `complete` confirms it stored the grant.

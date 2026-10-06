@@ -27,8 +27,8 @@ type MachineHello = {
 
 type Step =
   | { kind: "starting" }
-  | { kind: "waiting"; uri: string }
-  | { kind: "sas"; uri: string; sas: string }
+  | { kind: "waiting"; uri: string; startedAt: number }
+  | { kind: "sas"; uri: string; startedAt: number; sas: string }
   | { kind: "approving"; hello: MachineHello | null }
   | { kind: "done"; hello: MachineHello }
   | { kind: "error"; message: string };
@@ -37,8 +37,27 @@ function formatSas(sas: string) {
   return sas.length === 6 ? `${sas.slice(0, 3)} ${sas.slice(3)}` : sas;
 }
 
+function formatRemaining(secs: number) {
+  const s = Math.max(0, Math.ceil(secs));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+/** Seconds left on the pairing code, ticking once a second. */
+function useSecondsLeft(startedAt: number | null, ttlSecs: number | null) {
+  const [now, setNow] = React.useState(() => Date.now());
+  React.useEffect(() => {
+    if (startedAt === null) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [startedAt]);
+  if (startedAt === null || ttlSecs === null) return null;
+  return Math.max(0, ttlSecs - (now - startedAt) / 1000);
+}
+
 /**
- * "Add machine": install `buzz host` on the machine, pair it once over
+ * "Add machine": one command installs `buzz host` from the community relay
+ * (`<relay>/host/install.sh`) and pairs the machine once over
  * NIP-AB, confirm the six-digit code, and the machine is approved for this
  * community. Approve confirms the code; the machine's details arrive next
  * and the grant is sent automatically.
@@ -62,11 +81,21 @@ export function AddMachineDialog({
   const notifyAdded = React.useEffectEvent((hostPubkey: string) => {
     onAdded?.(hostPubkey);
   });
+  const pairingUri =
+    step.kind === "waiting" || step.kind === "sas" ? step.uri : null;
+  const startedAt =
+    step.kind === "waiting" || step.kind === "sas" ? step.startedAt : null;
   const installQuery = useQuery({
-    queryKey: ["agent-host-install-info"],
-    queryFn: getHostInstallInfo,
-    enabled: open,
+    queryKey: ["agent-host-install-info", pairingUri],
+    queryFn: () => getHostInstallInfo(pairingUri ?? ""),
+    enabled: open && pairingUri !== null,
   });
+  const install = pairingUri ? installQuery.data : undefined;
+  const secondsLeft = useSecondsLeft(
+    startedAt,
+    install?.sessionTtlSecs ?? null,
+  );
+  const expired = secondsLeft !== null && secondsLeft <= 0;
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: `attempt` restarts the session on retry.
   React.useEffect(() => {
@@ -87,7 +116,7 @@ export function AddMachineDialog({
         if (cancelled) return;
         setStep((current) =>
           current.kind === "waiting"
-            ? { kind: "sas", uri: current.uri, sas: event.payload.sas }
+            ? { ...current, kind: "sas", sas: event.payload.sas }
             : current,
         );
       }),
@@ -132,7 +161,9 @@ export function AddMachineDialog({
 
     startHostPairing().then(
       (uri) => {
-        if (!cancelled) setStep({ kind: "waiting", uri });
+        if (!cancelled) {
+          setStep({ kind: "waiting", uri, startedAt: Date.now() });
+        }
       },
       (error: unknown) => {
         if (!cancelled) {
@@ -175,7 +206,7 @@ export function AddMachineDialog({
     });
   };
 
-  const install = installQuery.data;
+  const newCode = () => setAttempt((value) => value + 1);
 
   return (
     <Dialog onOpenChange={onOpenChange} open={open}>
@@ -210,26 +241,38 @@ export function AddMachineDialog({
             <li className="space-y-2">
               <p className="font-medium">1. On the machine, run</p>
               {install ? (
-                <div className="flex items-start gap-2">
-                  <code
-                    className="min-w-0 flex-1 break-all rounded-xl bg-muted px-3 py-2 font-mono text-xs"
-                    data-testid="add-machine-install-command"
-                  >
-                    {install.command}
-                  </code>
-                  <CopyButton
-                    iconOnly
-                    label="Copy install command"
-                    value={install.command}
-                  />
-                </div>
+                <>
+                  <div className="flex items-start gap-2">
+                    <code
+                      className="min-w-0 flex-1 break-all rounded-xl bg-muted px-3 py-2 font-mono text-xs"
+                      data-testid="add-machine-install-command"
+                    >
+                      {install.command}
+                    </code>
+                    <CopyButton
+                      iconOnly
+                      label="Copy install command"
+                      value={install.command}
+                    />
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Already installed? Run
+                  </p>
+                  <div className="flex items-start gap-2">
+                    <code
+                      className="min-w-0 flex-1 break-all rounded-xl bg-muted/50 px-3 py-1.5 font-mono text-xs text-muted-foreground"
+                      data-testid="add-machine-up-command"
+                    >
+                      {install.upCommand}
+                    </code>
+                    <CopyButton
+                      iconOnly
+                      label="Copy buzz host up command"
+                      value={install.upCommand}
+                    />
+                  </div>
+                </>
               ) : (
-                <p className="text-muted-foreground">Loading…</p>
-              )}
-            </li>
-            <li className="space-y-2">
-              <p className="font-medium">2. Pair it with this code</p>
-              {step.kind === "starting" ? (
                 <p className="flex items-center gap-2 text-muted-foreground">
                   <LoaderCircle
                     aria-hidden="true"
@@ -237,27 +280,28 @@ export function AddMachineDialog({
                   />
                   Creating a pairing code…
                 </p>
-              ) : (
-                <div className="flex items-start gap-2">
-                  <code
-                    className="min-w-0 flex-1 break-all rounded-xl bg-muted px-3 py-2 font-mono text-xs"
-                    data-testid="add-machine-pairing-uri"
-                  >
-                    {`buzz host pair '${step.uri}'`}
-                  </code>
-                  <CopyButton
-                    iconOnly
-                    label="Copy pairing command"
-                    value={`buzz host pair '${step.uri}'`}
-                  />
-                </div>
               )}
-              <p className="text-xs text-muted-foreground">
-                The installer starts pairing for you; paste this if it asks.
-              </p>
+              {secondsLeft !== null ? (
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <span data-testid="add-machine-expiry">
+                    {expired
+                      ? "This code has expired."
+                      : `Code expires in ${formatRemaining(secondsLeft)}.`}
+                  </span>
+                  <Button
+                    data-testid="add-machine-new-code"
+                    onClick={newCode}
+                    size="sm"
+                    type="button"
+                    variant="outline"
+                  >
+                    New code
+                  </Button>
+                </div>
+              ) : null}
             </li>
             <li className="space-y-2">
-              <p className="font-medium">3. Check the code matches</p>
+              <p className="font-medium">2. Check the code matches</p>
               {step.kind === "sas" ? (
                 <p
                   className="font-mono text-2xl font-semibold tracking-widest"
@@ -358,7 +402,7 @@ export function AddMachineDialog({
               </Button>
               <Button
                 data-testid="add-machine-retry"
-                onClick={() => setAttempt((value) => value + 1)}
+                onClick={newCode}
                 type="button"
               >
                 Try again

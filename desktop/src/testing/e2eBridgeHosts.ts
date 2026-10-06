@@ -110,15 +110,21 @@ export async function handleMockHostCommand(
 ): Promise<{ handled: boolean; value?: unknown }> {
   const args = (payload ?? {}) as Record<string, unknown>;
   switch (command) {
-    case "get_host_install_info":
+    case "get_host_install_info": {
+      // Mirrors commands/hosts.rs: the installer is served by the community
+      // relay itself, under /host on the relay's http(s) origin.
+      const uri = String(args.pairingUri ?? "");
+      const base = `${new URL(ctx.relayUrl.replace(/^ws/, "http")).origin}/host`;
       return {
         handled: true,
         value: {
-          install_url: "https://example.invalid/buzz-host/install.sh",
-          command: `curl -fsSL 'https://example.invalid/buzz-host/install.sh' | sh -s -- --relay '${ctx.relayUrl}'`,
-          relay_url: ctx.relayUrl,
+          base_url: base,
+          command: `curl -fsSL '${base}/install.sh' | bash -s -- --base '${base}' --uri '${uri}'`,
+          up_command: `buzz host up --uri '${uri}'`,
+          session_ttl_secs: 130,
         },
       };
+    }
     case "list_agent_hosts":
       return { handled: true, value: structuredClone(hosts) };
     case "start_host_pairing":

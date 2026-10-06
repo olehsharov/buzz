@@ -5,15 +5,7 @@ use tauri::{AppHandle, State};
 use crate::{
     agent_hosts::{channel::RelayHostChannel, frames, ops, store::AgentHostRecord, HostOps},
     app_state::AppState,
-    relay::relay_ws_url_with_override,
-};
-
-/// Install script for `buzz host`. Set `BUZZ_HOST_INSTALL_URL` at build time
-/// to point desktop builds at your distribution; the default placeholder
-/// below is deliberately unroutable so a misconfigured build is obvious.
-pub const HOST_INSTALL_URL: &str = match option_env!("BUZZ_HOST_INSTALL_URL") {
-    Some(url) => url,
-    None => "https://example.invalid/buzz-host/install.sh",
+    relay::{relay_http_base_url, relay_ws_url_with_override},
 };
 
 fn community_relay(state: &AppState) -> String {
@@ -27,30 +19,58 @@ fn relay_channel(state: &AppState) -> Result<RelayHostChannel, String> {
     })
 }
 
-/// The one-liner shown in "Add machine".
-pub(crate) fn host_install_command(install_url: &str, relay_url: &str) -> String {
-    let quote = |value: &str| format!("'{}'", value.replace('\'', r"'\''"));
+/// Where the community relay serves the agent-host installer: the relay
+/// image bundles `install.sh`, the Sprig tarballs and `SHA256SUMS` under
+/// `/host/` on the same origin as the relay (`ws` → `http`, `wss` → `https`).
+pub(crate) fn host_install_base(relay_ws_url: &str) -> String {
+    let http = relay_http_base_url(relay_ws_url);
+    let origin = url::Url::parse(&http)
+        .ok()
+        .filter(|url| url.has_host())
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or(http);
+    format!("{origin}/host")
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// The one command shown in "Add machine": download the installer from the
+/// relay, install `buzz host`, then pair with `pairing_uri`. It never passes
+/// `--relay` — that would override the pairing relay in the URI.
+/// The machine names itself (its hostname) unless the user passes `--name`.
+pub(crate) fn host_install_command(base: &str, pairing_uri: &str) -> String {
     format!(
-        "curl -fsSL {} | sh -s -- --relay {}",
-        quote(install_url),
-        quote(relay_url)
+        "curl -fsSL {} | bash -s -- --base {} --uri {}",
+        shell_quote(&format!("{base}/install.sh")),
+        shell_quote(base),
+        shell_quote(pairing_uri),
     )
+}
+
+/// For machines that already have `buzz host`.
+pub(crate) fn host_up_command(pairing_uri: &str) -> String {
+    format!("buzz host up --uri {}", shell_quote(pairing_uri))
 }
 
 #[derive(serde::Serialize)]
 pub struct HostInstallInfo {
-    pub install_url: String,
+    pub base_url: String,
     pub command: String,
-    pub relay_url: String,
+    pub up_command: String,
+    pub session_ttl_secs: u64,
 }
 
+/// The "Add machine" commands for one pairing session.
 #[tauri::command]
-pub fn get_host_install_info(state: State<'_, AppState>) -> HostInstallInfo {
-    let relay_url = community_relay(&state);
+pub fn get_host_install_info(state: State<'_, AppState>, pairing_uri: String) -> HostInstallInfo {
+    let base_url = host_install_base(&community_relay(&state));
     HostInstallInfo {
-        install_url: HOST_INSTALL_URL.to_string(),
-        command: host_install_command(HOST_INSTALL_URL, &relay_url),
-        relay_url,
+        command: host_install_command(&base_url, &pairing_uri),
+        up_command: host_up_command(&pairing_uri),
+        base_url,
+        session_ttl_secs: super::pairing::PAIRING_SESSION_TIMEOUT.as_secs(),
     }
 }
 
@@ -189,14 +209,55 @@ fn summary_for(
 
 #[cfg(test)]
 mod tests {
-    use super::host_install_command;
+    use super::{host_install_base, host_install_command, host_up_command};
+
+    const URI: &str = "nostrpair://abc?relay=wss%3A%2F%2Fpair.example&secret=s&v=1";
 
     #[test]
-    fn install_command_quotes_relay_and_url() {
+    fn install_base_is_the_relay_origin_over_http() {
         assert_eq!(
-            host_install_command("https://get.example/install.sh", "wss://relay.example"),
-            "curl -fsSL 'https://get.example/install.sh' | sh -s -- --relay 'wss://relay.example'"
+            host_install_base("wss://relay.example"),
+            "https://relay.example/host"
         );
-        assert!(host_install_command("u", "wss://x'; rm -rf ~").contains(r"'\''"));
+        assert_eq!(
+            host_install_base("wss://relay.example/"),
+            "https://relay.example/host"
+        );
+        assert_eq!(
+            host_install_base("ws://localhost:3000"),
+            "http://localhost:3000/host"
+        );
+        // Only the origin: a path on the relay URL never leaks into the base.
+        assert_eq!(
+            host_install_base("wss://relay.example/ws?x=1"),
+            "https://relay.example/host"
+        );
+    }
+
+    #[test]
+    fn install_command_is_one_bash_pipeline_from_the_relay() {
+        let base = host_install_base("wss://buzz.example");
+        assert_eq!(
+            host_install_command(&base, URI),
+            format!(
+                "curl -fsSL 'https://buzz.example/host/install.sh' | bash -s -- \
+                 --base 'https://buzz.example/host' --uri '{URI}'"
+            )
+        );
+        let command = host_install_command(&base, URI);
+        assert!(!command.contains("--relay"), "{command}");
+        assert!(!command.contains("| sh "), "{command}");
+    }
+
+    #[test]
+    fn commands_quote_hostile_values() {
+        let hostile = "x'; rm -rf ~";
+        assert!(
+            host_install_command("https://r/host", hostile).ends_with(r"--uri 'x'\''; rm -rf ~'")
+        );
+        assert_eq!(
+            host_up_command(hostile),
+            r"buzz host up --uri 'x'\''; rm -rf ~'"
+        );
     }
 }

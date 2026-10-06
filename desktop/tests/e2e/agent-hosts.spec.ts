@@ -6,8 +6,9 @@
  *  - "Where to run" lists This computer + only the approved machines, with
  *    presence; an offline machine is listed, described with last-seen, and
  *    cannot be picked; selection works from the keyboard
- *  - "Add machine…" (dropdown footer, keyboard) shows the install one-liner
- *    and pairing command, then the code; Approve confirms the code, and the
+ *  - "Add machine…" (dropdown footer, keyboard) shows one install-and-pair
+ *    command served by the community relay, the code's expiry and "New
+ *    code", then the code; Approve confirms the code, and the
  *    machine's details are shown once it is added (grant sent)
  *  - Settings → Machines lists machines with agents on them; Forget machine
  *    confirms, calls forget, and removes the row
@@ -152,13 +153,36 @@ test("add machine: install command, code, approve sends the grant", async ({
 
   const dialog = page.getByTestId("add-machine-dialog");
   await expect(dialog).toBeVisible();
-  await expect(dialog.getByTestId("add-machine-install-command")).toHaveText(
-    /^curl -fsSL '.+' \| sh -s -- --relay '.+'$/,
+  // One command: install from the community relay's /host, then pair with
+  // this session's URI. Never `--relay` (it would override the pairing relay).
+  const install = dialog.getByTestId("add-machine-install-command");
+  await expect(install).toHaveText(
+    /^curl -fsSL 'https?:\/\/[^/']+\/host\/install\.sh' \| bash -s -- --base 'https?:\/\/[^/']+\/host' --uri 'nostrpair:\/\/[^']+'$/,
   );
-  await expect(dialog.getByTestId("add-machine-pairing-uri")).toContainText(
-    "buzz host pair 'nostrpair://",
+  await expect(install).not.toContainText("--relay");
+  await expect(install).not.toContainText("example.invalid");
+  await expect(dialog.getByTestId("add-machine-up-command")).toHaveText(
+    /^buzz host up --uri 'nostrpair:\/\/[^']+'$/,
+  );
+  // The commands carry the URI of the session this dialog started.
+  const [pairingUri] = (await commandPayloads(page, "get_host_install_info"))
+    .map((payload) => (payload as { pairingUri?: string }).pairingUri)
+    .filter(Boolean);
+  expect(pairingUri).toMatch(/^nostrpair:\/\//);
+  await expect(install).toContainText(`--uri '${pairingUri}'`);
+  await expect(dialog.getByTestId("add-machine-expiry")).toHaveText(
+    /^Code expires in 2:(0\d|10)\.$/,
   );
   expect(await commandPayloads(page, "start_host_pairing")).toHaveLength(1);
+
+  // "New code" starts a fresh session.
+  await dialog.getByTestId("add-machine-new-code").click();
+  await expect
+    .poll(
+      async () => (await commandPayloads(page, "start_host_pairing")).length,
+    )
+    .toBe(2);
+  await expect(install).toBeVisible();
 
   // The machine scans the code: the six-digit code appears.
   await page.evaluate(
