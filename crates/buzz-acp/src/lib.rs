@@ -3463,6 +3463,10 @@ async fn run_harness(
                                             .await,
                                         &buzz_event.event,
                                     );
+                                    // A deliberate rotate wants a fresh
+                                    // session: a resume binding on this scope
+                                    // must not re-apply the fork.
+                                    ctx.resume_session.release(&scope);
                                     let fired = signal_in_flight_task_for_scope(
                                         &mut pool,
                                         &scope,

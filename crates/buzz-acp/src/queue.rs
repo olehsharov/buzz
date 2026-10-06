@@ -2176,6 +2176,12 @@ pub struct FormatPromptArgs<'a> {
     /// Defaults to `false` so a caller that never sets it behaves as if this
     /// were the session's first message.
     pub standing_context_sent: bool,
+    /// The batch's cancelled events were already delivered to this live
+    /// session: the interrupted turn ran in it and the session was kept. The
+    /// merged prompt then says that turn was interrupted rather than
+    /// restating the original request as if it were new. Defaults to `false`
+    /// (a fresh session, which needs the full restatement).
+    pub cancelled_turn_in_session: bool,
     /// The harness autoposts this turn's response text as the reply
     /// (`--stream draft+autopost`), so `<context>` names that delivery instead
     /// of a `buzz messages send --reply-to` instruction. Defaults to `false`
@@ -2366,7 +2372,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     //    - `Steer` (default): a message arrived while the agent was working; it
     //      should *continue* its work and weave the message in if relevant.
     let has_cancelled = !batch.cancelled_events.is_empty();
-    let framing = MergeFraming::for_reason(batch.cancel_reason);
+    let framing = MergeFraming::for_reason(batch.cancel_reason, args.cancelled_turn_in_session);
 
     // 4a. Cancelled events section.
     if has_cancelled {
@@ -2461,22 +2467,48 @@ struct MergeFraming {
 }
 
 impl MergeFraming {
-    fn for_reason(reason: Option<CancelReason>) -> Self {
-        match reason {
+    /// `in_session`: the interrupted turn ran in the session receiving this
+    /// prompt, which kept it, so the agent still has that turn's context and
+    /// work. Otherwise the prompt goes to a fresh session that knows nothing
+    /// of the interrupted turn.
+    fn for_reason(reason: Option<CancelReason>, in_session: bool) -> Self {
+        match (reason, in_session) {
+            // The session holds the interrupted turn: name it as interrupted
+            // and point at the work already in context, rather than restating
+            // the request as a new task.
+            (None | Some(CancelReason::Steer), true) => MergeFraming {
+                prior_tag: "your-interrupted-turn-was-handling",
+                new_tag: "new-message-arrived-while-you-were-working",
+                closing_note: "Note: Your previous turn was interrupted because a new message \
+                     arrived. Your session still holds that turn and the work you did in it, so \
+                     continue from where you stopped instead of starting over. Incorporate the new \
+                     message if it's relevant; if it's unrelated, you may briefly acknowledge it \
+                     and carry on.",
+            },
+            (Some(CancelReason::Interrupt), true) => MergeFraming {
+                prior_tag: "your-interrupted-turn-was-handling",
+                new_tag: "new-request-supersedes-previous",
+                closing_note:
+                    "Note: Your previous turn was interrupted by a new request before it \
+                     finished; your session still holds that turn. Please address the new \
+                     request.\nIf the new request is unrelated to the previous one, you may \
+                     briefly acknowledge the interruption.",
+            },
             // Default to steer framing if a merge somehow lacks a reason: the
             // gentler "continue your work" wording is the safer fallback.
-            None | Some(CancelReason::Steer) => MergeFraming {
-                // We never capture the agent's partial work — session/cancel is
-                // terminal and returns nothing — so this section holds the
-                // *original request*, not a transcript. The header must not
-                // overclaim preserved state (per Dawn's framing review).
+            (None | Some(CancelReason::Steer), false) => MergeFraming {
+                // A fresh session never saw the interrupted turn, and the
+                // harness captures none of its partial work, so this section
+                // holds the *original request*, not a transcript. The header
+                // must not overclaim preserved state (per Dawn's framing
+                // review).
                 prior_tag: "what-you-were-working-on",
                 new_tag: "new-message-arrived-while-you-were-working",
                 closing_note: "Note: A new message arrived while you were working. Continue your \
                      in-progress work and incorporate the new message if it's relevant; if it's \
                      unrelated, you may briefly acknowledge it and carry on.",
             },
-            Some(CancelReason::Interrupt) => MergeFraming {
+            (Some(CancelReason::Interrupt), false) => MergeFraming {
                 prior_tag: "previous-request-interrupted-before-completion",
                 new_tag: "new-request-supersedes-previous",
                 closing_note: "Note: The previous request was interrupted. Please address the new \
@@ -2489,7 +2521,7 @@ impl MergeFraming {
 
 /// Framing strings for the goose-native steer path (lib.rs mode-gate),
 /// pulled from the same source-of-truth as the cancel+merge fallback
-/// (`MergeFraming::for_reason(Some(CancelReason::Steer))`).
+/// (`MergeFraming::for_reason(Some(CancelReason::Steer), false)`).
 ///
 /// Returns `(new_tag, closing_note)`. Native-steer renders only
 /// the new-message header + the single event block + the closing note —
@@ -2499,7 +2531,8 @@ impl MergeFraming {
 /// "weave it in, don't abandon your work" orientation (Eva's drift-proof
 /// requirement: native and fallback must not diverge in UX).
 pub(crate) fn native_steer_framing() -> (&'static str, &'static str) {
-    let framing = MergeFraming::for_reason(Some(CancelReason::Steer));
+    // The in-flight turn is still running, so there is no interrupted turn.
+    let framing = MergeFraming::for_reason(Some(CancelReason::Steer), false);
     (framing.new_tag, framing.closing_note)
 }
 
@@ -3065,7 +3098,7 @@ mod tests {
     fn test_format_prompt_interrupt_framing() {
         let batch = make_merged_batch(Some(CancelReason::Interrupt));
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
-        let framing = MergeFraming::for_reason(Some(CancelReason::Interrupt));
+        let framing = MergeFraming::for_reason(Some(CancelReason::Interrupt), false);
         let new_section_tag = format!("<{}>", framing.new_tag);
 
         // Interrupt framing: the new request supersedes the previous one.
@@ -3085,6 +3118,53 @@ mod tests {
             !prompt.contains("arrived while you were working"),
             "interrupt prompt must NOT use steer framing: {prompt}"
         );
+    }
+
+    #[test]
+    fn test_format_prompt_kept_session_says_turn_was_interrupted() {
+        for reason in [
+            Some(CancelReason::Steer),
+            Some(CancelReason::Interrupt),
+            None,
+        ] {
+            let batch = make_merged_batch(reason);
+            let render = |in_session| {
+                format_prompt(
+                    &batch,
+                    &FormatPromptArgs {
+                        cancelled_turn_in_session: in_session,
+                        ..Default::default()
+                    },
+                )
+                .join("\n\n")
+            };
+
+            let kept = render(true);
+            assert!(
+                kept.contains("<your-interrupted-turn-was-handling>"),
+                "{reason:?}: kept session labels the prior section as its interrupted turn: {kept}"
+            );
+            assert!(
+                kept.contains("Your previous turn was interrupted")
+                    && kept
+                        .to_lowercase()
+                        .contains("your session still holds that turn"),
+                "{reason:?}: kept session says the turn was interrupted and is still held: {kept}"
+            );
+            assert!(
+                !kept.contains("<what-you-were-working-on>")
+                    && !kept.contains("<previous-request-interrupted-before-completion>"),
+                "{reason:?}: kept session must not restate the request as fresh: {kept}"
+            );
+            assert!(kept.contains("the new message"), "{reason:?}: {kept}");
+
+            let fresh = render(false);
+            assert!(
+                !fresh.contains("<your-interrupted-turn-was-handling>")
+                    && !fresh.contains("Your previous turn was interrupted"),
+                "{reason:?}: a fresh session keeps the restating framing: {fresh}"
+            );
+        }
     }
 
     #[test]
@@ -6729,7 +6809,7 @@ mod tests {
         assert_eq!(merged.cancelled_events[0].edit, Some(resolved));
 
         let prompt = format_prompt(&merged, &FormatPromptArgs::default()).join("\n");
-        let framing = MergeFraming::for_reason(Some(CancelReason::Interrupt));
+        let framing = MergeFraming::for_reason(Some(CancelReason::Interrupt), false);
         let prior = prompt
             .find(&format!("<{}>", framing.prior_tag))
             .expect("interrupted edit is labelled as prior work");

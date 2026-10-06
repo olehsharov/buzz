@@ -1596,18 +1596,130 @@ pub struct PendingResume {
     pub store: ResumeForkStore,
 }
 
-/// One-shot pending resume shared by every worker so exactly one channel/DM
-/// session per process consumes it.
-pub type ResumeSessionSlot = Arc<Mutex<Option<PendingResume>>>;
+/// The `BUZZ_ACP_RESUME_SESSION` continuation shared by every worker.
+///
+/// The first channel/DM session created in the process claims it, and once
+/// continuing the source succeeds the continuation is *bound* to that scope
+/// on that worker. Exactly one `(scope, worker)` pair ever owns the binding.
+/// When that scope's session is lost to a failure (agent exit, transport or
+/// protocol error, timeout), the next session that worker creates for the
+/// same scope continues the recorded fork again instead of starting fresh.
+/// A deliberate rotation [releases](Self::release) the binding instead. Every
+/// other scope, and the same scope on another worker, starts fresh: a second
+/// live holder of the fork would race the first on its transcript.
+#[derive(Debug, Clone, Default)]
+pub struct ResumeSessionSlot(Arc<Mutex<ResumeSlotState>>);
 
-fn take_resume_session(slot: &ResumeSessionSlot) -> Option<PendingResume> {
-    slot.lock().unwrap_or_else(|e| e.into_inner()).take()
+#[derive(Debug, Default)]
+struct ResumeSlotState {
+    /// Not yet claimed. `None` once claimed, or while the first claim is in
+    /// flight, so concurrent workers never both continue the source.
+    pending: Option<PendingResume>,
+    /// The scope and worker whose live session continues the source.
+    bound: Option<BoundResume>,
 }
 
-fn restore_resume_session(slot: &ResumeSessionSlot, pending: PendingResume) {
-    let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
-    if slot.is_none() {
-        *slot = Some(pending);
+#[derive(Debug)]
+struct BoundResume {
+    scope: SessionScope,
+    agent_index: usize,
+    pending: PendingResume,
+}
+
+/// A continuation claimed for one session creation; settle it with
+/// [`ResumeSessionSlot::settle`].
+enum ResumeClaim {
+    /// First claim in this process: binds on success, returns on failure.
+    First(PendingResume),
+    /// The owning scope lost its session; continue the recorded fork again.
+    Rebind(PendingResume),
+}
+
+impl ResumeClaim {
+    fn pending(&self) -> &PendingResume {
+        match self {
+            Self::First(pending) | Self::Rebind(pending) => pending,
+        }
+    }
+}
+
+impl ResumeSessionSlot {
+    /// Slot holding `pending` until the first channel/DM session claims it.
+    pub fn new(pending: Option<PendingResume>) -> Self {
+        Self(Arc::new(Mutex::new(ResumeSlotState {
+            pending,
+            bound: None,
+        })))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ResumeSlotState> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The continuation `agent_index` must use for a new session of `scope`,
+    /// if any: the bound one for the owning `(scope, worker)`, else the
+    /// unclaimed one.
+    fn claim(&self, scope: &SessionScope, agent_index: usize) -> Option<ResumeClaim> {
+        let mut state = self.lock();
+        if let Some(bound) = &state.bound {
+            return (bound.scope == *scope && bound.agent_index == agent_index)
+                .then(|| ResumeClaim::Rebind(bound.pending.clone()));
+        }
+        state.pending.take().map(ResumeClaim::First)
+    }
+
+    /// Record the outcome of continuing `claim`. A successful first claim
+    /// binds the continuation to `(scope, agent_index)`; a failed one returns
+    /// it so the next new session retries rather than silently starting
+    /// fresh. A rebind stays bound either way.
+    fn settle(&self, claim: ResumeClaim, scope: &SessionScope, agent_index: usize, ok: bool) {
+        let ResumeClaim::First(pending) = claim else {
+            return;
+        };
+        let mut state = self.lock();
+        if ok {
+            state.bound = Some(BoundResume {
+                scope: scope.clone(),
+                agent_index,
+                pending,
+            });
+        } else if state.pending.is_none() && state.bound.is_none() {
+            state.pending = Some(pending);
+        }
+    }
+
+    /// Drop the binding if `scope` owns it: the scope's session is being
+    /// rotated on purpose (`!rotate`, context or turn limit), so later sessions
+    /// for it start fresh instead of continuing the fork again. Re-applying
+    /// after a limit-driven rotation would land straight back in the context
+    /// that triggered it. The fork record stays on disk for the next process.
+    pub(crate) fn release(&self, scope: &SessionScope) {
+        let mut state = self.lock();
+        if state.bound.as_ref().is_some_and(|b| b.scope == *scope) {
+            if let Some(bound) = state.bound.take() {
+                tracing::info!(
+                    target: "pool::session",
+                    "scope {} rotated; provider session {} is no longer continued",
+                    scope.telemetry_label(),
+                    bound.pending.source
+                );
+            }
+        }
+    }
+
+    /// Source of the unclaimed continuation, for tests.
+    #[cfg(test)]
+    fn pending_source(&self) -> Option<String> {
+        self.lock().pending.as_ref().map(|p| p.source.clone())
+    }
+
+    /// Scope and worker owning the binding, for tests.
+    #[cfg(test)]
+    fn bound_owner(&self) -> Option<(SessionScope, usize)> {
+        self.lock()
+            .bound
+            .as_ref()
+            .map(|b| (b.scope.clone(), b.agent_index))
     }
 }
 
@@ -1755,31 +1867,31 @@ async fn create_session_and_apply_model(
     );
     // Only channel/DM sessions continue a configured provider session;
     // heartbeat and isolated-task sessions always start fresh.
-    let resume_source = if channel.scope.is_some() {
-        take_resume_session(&ctx.resume_session)
-    } else {
-        None
-    };
-    let resp = match resume_source {
-        Some(pending) => {
-            match continue_provider_session(
+    let resume_claim = channel
+        .scope
+        .and_then(|scope| Some((scope, ctx.resume_session.claim(scope, agent.index)?)));
+    let resp = match resume_claim {
+        Some((scope, claim)) => {
+            if matches!(claim, ResumeClaim::Rebind(_)) {
+                tracing::info!(
+                    target: "pool::session",
+                    "scope {} lost its session; continuing provider session {} again",
+                    scope.telemetry_label(),
+                    claim.pending().source
+                );
+            }
+            let result = continue_provider_session(
                 agent,
-                &pending,
+                claim.pending(),
                 &ctx.cwd,
                 mcp_servers,
                 system_prompt,
                 session_title.as_deref(),
             )
-            .await
-            {
-                Ok(resp) => resp,
-                Err(error) => {
-                    // Keep the source pending so the next new session retries
-                    // instead of silently starting fresh.
-                    restore_resume_session(&ctx.resume_session, pending);
-                    return Err(error);
-                }
-            }
+            .await;
+            ctx.resume_session
+                .settle(claim, scope, agent.index, result.is_ok());
+            result?
         }
         None => {
             agent
@@ -3216,6 +3328,16 @@ pub async fn run_prompt_task(
             .map(|delivery| &delivery.delivered_event_ids)
             .cloned()
             .unwrap_or_default();
+        // A merged re-prompt whose cancelled events this live session already
+        // received: the interrupted turn ran here and the session kept it (see
+        // `control_cancel_keeps_session`), so the prompt says it was
+        // interrupted instead of restating the original request as new. A
+        // replacement session starts with empty deliveries, so it gets the
+        // full restatement.
+        let cancelled_turn_in_session = !b.cancelled_events.is_empty()
+            && b.cancelled_events
+                .iter()
+                .all(|event| delivered_ids.contains(&event.event.id.to_hex()));
         let conversation_context = if ctx.context_message_limit > 0 {
             fetch_conversation_context_for_target(
                 b.channel_id,
@@ -3287,6 +3409,7 @@ pub async fn run_prompt_task(
                 team_instructions: standing.team_instructions,
                 agent_canvas: standing.agent_canvas,
                 standing_context_sent,
+                cancelled_turn_in_session,
                 reply_autopost: ctx
                     .stream
                     .as_ref()
@@ -3421,7 +3544,37 @@ pub async fn run_prompt_task(
                         {
                             Ok(stop_reason) => {
                                 log_stop_reason(&source, &stop_reason);
-                                agent.state.invalidate(&source);
+                                if control_cancel_keeps_session(
+                                    &control_signal,
+                                    &stop_reason,
+                                    &source,
+                                ) {
+                                    // The adapter settled the turn cleanly and
+                                    // still holds the session, including what
+                                    // the agent did in this turn. Keep it so the
+                                    // requeued batch continues there instead of
+                                    // in a fresh session. The prompt reached the
+                                    // session, so its delivery is committed: the
+                                    // re-prompt must not resend standing context
+                                    // or context events the session already has.
+                                    if let PromptSource::Channel(scope) = &source {
+                                        tracing::info!(
+                                            target: "pool::session",
+                                            "keeping session {session_id} for scope {} after a clean control cancel",
+                                            scope.telemetry_label()
+                                        );
+                                        let standing_sent = !agent.has_system_prompt_support();
+                                        record_scope_delivery_success(
+                                            &mut agent,
+                                            scope.clone(),
+                                            standing_sent,
+                                            &pending_delivered_event_ids,
+                                            &pending_hydrated_thread_roots,
+                                        );
+                                    }
+                                } else {
+                                    agent.state.invalidate(&source);
+                                }
                                 let retry_batch =
                                     requeue_cancelled_batch(&ctx, control_signal, batch);
 
@@ -3608,6 +3761,9 @@ pub async fn run_prompt_task(
                     "rotating session for {source:?} after {stop_reason:?}",
                 );
                 agent.state.invalidate(&source);
+                if let PromptSource::Channel(scope) = &source {
+                    ctx.resume_session.release(scope);
+                }
             }
 
             let core_stop = acp_stop_to_core(&stop_reason);
@@ -5076,6 +5232,26 @@ fn requeue_batch_if_queue(ctx: &PromptContext, batch: Option<FlushBatch>) -> Opt
 /// that reason stamped onto [`FlushBatch::cancel_reason`]. `Cancel`/`Rotate`
 /// drop the batch entirely. The reason is consumed by the main loop at requeue
 /// time (`requeue_as_cancelled`) and ultimately by `format_prompt`.
+/// Whether a control-signal cancel that the adapter settled with
+/// `stop_reason` leaves the channel scope's provider session in place.
+///
+/// Only a mid-turn delivery (`Steer`/`Interrupt`) that the adapter answered
+/// with a clean `cancelled` keeps it: the adapter interrupted the turn but kept
+/// the session, so the requeued batch re-prompts that same session. Every
+/// other outcome — an explicit stop or rotate, a model switch (which needs a
+/// fresh session under the new model), or a turn that ended any other way —
+/// invalidates as before. Cancel failures never reach this check; they
+/// invalidate in [`classify_control_cancel_failure`]'s arm.
+fn control_cancel_keeps_session(
+    signal: &ControlSignal,
+    stop_reason: &StopReason,
+    source: &PromptSource,
+) -> bool {
+    matches!(source, PromptSource::Channel(_))
+        && matches!(signal, ControlSignal::Steer | ControlSignal::Interrupt)
+        && *stop_reason == StopReason::Cancelled
+}
+
 #[inline]
 fn requeue_cancelled_batch(
     ctx: &PromptContext,
@@ -10638,7 +10814,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             memory_enabled: false,
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
-            resume_session: Arc::new(Mutex::new(None)),
+            resume_session: ResumeSessionSlot::default(),
             stream: None,
         }
     }
@@ -12021,6 +12197,147 @@ done"#
         );
     }
 
+    /// The scope that consumed the resume owns it: when its session is lost
+    /// (invalidated for a failure), the next session for that scope on that
+    /// worker continues the recorded fork again — no new fork, no fresh
+    /// session. Other scopes, and the same scope on another worker, stay fresh.
+    #[tokio::test]
+    async fn resume_binding_reapplies_recorded_fork_after_owner_scope_loses_session() {
+        let (mut agent, observer) = spawn_resume_agent(RESUME_CAPS, FORK_OK).await;
+        let mut ctx = make_prompt_context_no_owner();
+        let state = tempfile::tempdir().expect("state dir");
+        ctx.resume_session = pending_slot("src-1", state.path());
+        let bound = conversation();
+        let other = conversation();
+
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&bound))
+            .await
+            .expect("first session continues the source");
+        assert_eq!(sid, "fork-1");
+        assert_eq!(
+            ctx.resume_session.bound_owner(),
+            Some((bound.clone(), agent.index)),
+            "the consuming scope and worker own the binding"
+        );
+        agent.state.sessions.insert(bound.clone(), sid);
+
+        // A real failure drops the bound scope's session.
+        assert!(agent.state.invalidate_scope(&bound));
+
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&bound))
+            .await
+            .expect("the bound scope continues its fork again");
+        assert_eq!(sid, "fork-1");
+        assert_eq!(
+            acp_writes(&observer, "session/fork"),
+            1,
+            "never forks twice"
+        );
+        assert_eq!(acp_writes(&observer, "session/resume"), 2);
+        assert!(acp_write(&observer, "session/new").is_none());
+
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&other))
+            .await
+            .expect("an unbound scope starts fresh");
+        assert!(sid.starts_with("new-"), "unbound scope got {sid}");
+
+        agent.index = 1;
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&bound))
+            .await
+            .expect("another worker starts the bound scope fresh");
+        assert!(sid.starts_with("new-"), "other worker got {sid}");
+        assert_eq!(acp_writes(&observer, "session/fork"), 1);
+        assert_eq!(acp_writes(&observer, "session/resume"), 2);
+    }
+
+    /// A bound scope re-applied in a respawned process (same worker): a
+    /// failing resume of the recorded fork propagates and keeps the binding;
+    /// a fork that is gone re-forks the source, as on first use.
+    /// A deliberate rotation releases the binding: the rotated scope then
+    /// starts fresh rather than landing back in the fork, and no other scope
+    /// picks the continuation up.
+    #[tokio::test]
+    async fn resume_binding_release_makes_owner_scope_start_fresh() {
+        let (mut agent, observer) = spawn_resume_agent(RESUME_CAPS, FORK_OK).await;
+        let mut ctx = make_prompt_context_no_owner();
+        let state = tempfile::tempdir().expect("state dir");
+        ctx.resume_session = pending_slot("src-1", state.path());
+        let bound = conversation();
+        create_session_and_apply_model(&mut agent, &ctx, None, scoped(&bound))
+            .await
+            .expect("binds");
+
+        ctx.resume_session.release(&conversation());
+        assert!(
+            ctx.resume_session.bound_owner().is_some(),
+            "another scope cannot release the binding"
+        );
+        ctx.resume_session.release(&bound);
+        assert_eq!(ctx.resume_session.bound_owner(), None);
+        assert_eq!(pending_source(&ctx), None, "nothing is pending again");
+
+        for scope in [&bound, &conversation()] {
+            let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(scope))
+                .await
+                .expect("fresh session");
+            assert!(sid.starts_with("new-"), "got {sid}");
+        }
+        assert_eq!(acp_writes(&observer, "session/fork"), 1);
+        assert_eq!(acp_writes(&observer, "session/resume"), 1);
+        assert_eq!(
+            recorded_fork(&ctx, state.path(), "src-1").as_deref(),
+            Some("fork-1"),
+            "the record survives for the next process"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_binding_reapply_failures_propagate_and_missing_fork_reforks() {
+        let state = tempfile::tempdir().expect("state dir");
+        let mut ctx = make_prompt_context_no_owner();
+        ResumeForkStore::new(state.path(), "agent-hex")
+            .save("src-1", &ctx.cwd, "fork-0")
+            .expect("seed record");
+        ctx.resume_session = pending_slot("src-1", state.path());
+        let scope = conversation();
+
+        let (mut agent, _observer) = spawn_resume_agent(RESUME_CAPS, FORK_OK).await;
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&scope))
+            .await
+            .expect("binds the recorded fork");
+        assert_eq!(sid, "fork-0");
+
+        let (mut agent, observer) =
+            spawn_resume_agent_failing(RESUME_CAPS, FORK_OK, "fork-0", RESUME_BROKEN).await;
+        let err = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&scope))
+            .await
+            .expect_err("a failed re-apply must not fall back to a fresh session");
+        assert!(
+            matches!(err, AcpError::AgentError { code: -32603, .. }),
+            "{err:?}"
+        );
+        assert!(acp_write(&observer, "session/new").is_none());
+        assert!(acp_write(&observer, "session/fork").is_none());
+        assert_eq!(
+            ctx.resume_session.bound_owner(),
+            Some((scope.clone(), 0)),
+            "a failed re-apply keeps the binding for the retry"
+        );
+
+        let (mut agent, observer) =
+            spawn_resume_agent_failing(RESUME_CAPS, FORK_OK, "fork-0", SESSION_MISSING).await;
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&scope))
+            .await
+            .expect("a gone fork re-forks the source");
+        assert_eq!(sid, "fork-1");
+        assert_eq!(acp_writes(&observer, "session/fork"), 1);
+        assert!(acp_write(&observer, "session/new").is_none());
+        assert_eq!(
+            recorded_fork(&ctx, state.path(), "src-1").as_deref(),
+            Some("fork-1")
+        );
+    }
+
     #[tokio::test]
     async fn resume_session_is_not_consumed_by_unscoped_sessions() {
         let (mut agent, observer) = spawn_resume_agent(RESUME_CAPS, FORK_OK).await;
@@ -12110,18 +12427,14 @@ done"#
     }
 
     fn pending_slot(source: &str, state_root: &std::path::Path) -> ResumeSessionSlot {
-        Arc::new(Mutex::new(Some(PendingResume {
+        ResumeSessionSlot::new(Some(PendingResume {
             source: source.into(),
             store: ResumeForkStore::new(state_root, "agent-hex"),
-        })))
+        }))
     }
 
     fn pending_source(ctx: &PromptContext) -> Option<String> {
-        ctx.resume_session
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|p| p.source.clone())
+        ctx.resume_session.pending_source()
     }
 
     fn recorded_fork(
@@ -13075,3 +13388,7 @@ mod pi_prompt_tests;
 #[cfg(all(test, unix))]
 #[path = "pool/stream_draft_tests.rs"]
 mod stream_draft_tests;
+
+#[cfg(all(test, unix))]
+#[path = "pool/control_cancel_tests.rs"]
+mod control_cancel_tests;
