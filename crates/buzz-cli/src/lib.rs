@@ -331,7 +331,7 @@ pub enum AgentsCmd {
         /// Avatar background color as #RRGGBB; requires --avatar-emoji
         #[arg(long)]
         avatar_color: Option<String>,
-        /// Compute provider id to run the agent on, e.g. remote-host
+        /// Compute provider id to run the agent on, e.g. my-ssh-host
         #[arg(long)]
         run_on: Option<String>,
         /// Provider setting key=value (repeatable, max 20), e.g. host=... or workdir=...;

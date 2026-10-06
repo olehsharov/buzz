@@ -142,8 +142,8 @@ test("validateLinkedAgentRuntimeEdit allows unchanged or unlinked runtime prefer
 test("submitProfilePersonaDialog starts a duplicated definition where the dialog chose", async () => {
   const backendIntent = {
     type: "provider",
-    id: "remote-host",
-    config: { host: "remote-host" },
+    id: "ssh-host",
+    config: { host: "ssh-host" },
   };
   const persona = { id: "persona-2", displayName: "Fizz copy" };
   const calls = [];

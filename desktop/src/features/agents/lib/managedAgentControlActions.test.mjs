@@ -208,7 +208,7 @@ test("a shut-down remote agent keeps a redeploy action", () => {
   // After `!shutdown` the provider record stays "deployed", so the primary
   // action stays "Shutdown"; redeploy must remain the way back.
   const remote = agent({
-    backend: { type: "provider", id: "remote-host", config: {} },
+    backend: { type: "provider", id: "ssh-host", config: {} },
     backendAgentId: "buzz-agent@abc.service",
     status: "deployed",
   });
@@ -233,7 +233,7 @@ test("redeploying a remote agent deploys without a local stop", async () => {
   const calls = [];
   await respawnManagedAgentWithRules({
     agent: agent({
-      backend: { type: "provider", id: "remote-host", config: {} },
+      backend: { type: "provider", id: "ssh-host", config: {} },
       backendAgentId: "buzz-agent@abc.service",
       status: "deployed",
     }),
