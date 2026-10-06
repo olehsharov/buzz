@@ -1,0 +1,6 @@
+#!/usr/bin/python3
+import json, os, sys
+spec = json.load(open(os.path.expanduser("~/.config/buzz/agents/%s.json" % sys.argv[1])))
+os.chdir(spec["workdir"])
+env = dict(os.environ); env.update(spec["env"])
+os.execvpe("buzz-acp", ["buzz-acp"], env)
