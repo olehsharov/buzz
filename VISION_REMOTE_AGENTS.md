@@ -22,6 +22,16 @@ Remote-execution systems accumulate control planes. An agent runner, a status po
 
 Buzz's answer is an axiom: **after deploy, the desktop retains no substrate control channel.** Launch is a single one-way handoff — the desktop resolves the provider through one narrow path, stages one exact artifact for negotiation and deploy, refuses a protocol version it does not understand, and hands over a launch payload it never persists. From that moment, everything flows through the relay: you read the agent's messages to know how it's doing, you mention it to steer it, you tell a healthy agent to stop and it exits on its own. Presence means what it means for everyone else on the relay — *available for conversation* — not substrate telemetry. And if you press Start again, from this machine or another, the deploy converges: one agent identity, one live instance.
 
+> **Intentional tension: agent hosts.** A paired agent host
+> ([docs/agent-hosts.md](docs/agent-hosts.md)) does give the desktop a channel
+> to the substrate, but a deliberately narrow one. It carries four encrypted,
+> owner-signed commands on the relay (`host.deploy`, `host.undeploy`,
+> `host.status`, `host.forget`) and nothing else. It is a provisioning surface,
+> not a lifecycle control plane: stopping an agent is still the relay
+> `!shutdown`, the host reports state rather than steering turns, and there is
+> no shell, log stream or kill switch into the agent. The relay stays the only
+> tether; the host is just a substrate that listens on it.
+
 This is not asceticism. It is what makes the body replaceable. A management plane you never build is a management plane you never have to port — and conversation, coordination, and ordinary lifecycle control already have a home on the relay, for every agent, local or remote.
 
 ---
