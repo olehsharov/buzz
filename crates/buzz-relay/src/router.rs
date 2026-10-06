@@ -139,6 +139,9 @@ const NIP_FI_EXEMPT_PREFIXES: &[&str] = &[
     // Static assets served by the SPA fallback; subtree
     "/assets/",
     "/favicon.svg",
+    // Agent-host installer + binaries bundled into the web dir — public so a
+    // machine with no Buzz identity yet can `curl | bash` it; subtree
+    "/host/",
     // Invite landing page (SPA) — subtree
     "/invite/",
     // Git web GUI (SPA) — exact + subtree
@@ -431,7 +434,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                 }
 
                 if let (Some(index), Some(files)) = (web_index, web_files) {
-                    if path.starts_with("/assets/") {
+                    if is_public_static_path(path) {
                         return files.oneshot(req).await.map(IntoResponse::into_response);
                     }
                     if should_serve_spa(path, serve_git_web_gui) {
@@ -481,6 +484,15 @@ fn is_admin_spa_path(path: &str) -> bool {
 /// the directory is not browsable.
 fn is_admin_static_path(path: &str) -> bool {
     path.starts_with("/assets/") || path == "/favicon.svg"
+}
+
+/// Files served from the public web bundle verbatim. `/assets/*` is the
+/// hashed Vite output; `/host/*` is the agent-host installer (`install.sh`,
+/// Sprig tarballs, `SHA256SUMS`) the relay image bundles beside it. Both are
+/// public — a machine being paired has no relay identity yet — and a missing
+/// file is a 404, never the SPA index.
+fn is_public_static_path(path: &str) -> bool {
+    path.starts_with("/assets/") || path.starts_with("/host/")
 }
 
 fn is_invite_landing_path(path: &str) -> bool {
@@ -1076,6 +1088,15 @@ mod tests {
     /// Relay state serving both bundles: the admin SPA on `admin.example` and
     /// the public SPA on any other host.
     async fn spa_state(admin_dir: &std::path::Path, web_dir: &std::path::Path) -> Arc<AppState> {
+        spa_state_with(admin_dir, web_dir, |_| {}).await
+    }
+
+    /// [`spa_state`] with a final config tweak (e.g. a closed relay).
+    async fn spa_state_with(
+        admin_dir: &std::path::Path,
+        web_dir: &std::path::Path,
+        configure: impl FnOnce(&mut crate::config::Config),
+    ) -> Arc<AppState> {
         let mut config = crate::config::Config::for_test(); // [FI-TRACE-ENV-RACE]
         config.require_relay_membership = false;
         config.redis_url = "redis://127.0.0.1:1".to_string();
@@ -1085,6 +1106,7 @@ mod tests {
             auth: crate::config::AdminAuth::Disabled,
             web_dir: Some(admin_dir.to_path_buf()),
         });
+        configure(&mut config);
         let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
         let db = buzz_db::Db::from_pool(pool.clone());
         let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
@@ -1893,6 +1915,91 @@ mod tests {
                 "{path} on the public host must keep its own headers"
             );
         }
+    }
+
+    /// The relay image bundles the agent-host installer under `<web>/host/`.
+    /// A machine being paired has no relay identity, so on a closed relay
+    /// with NIP-FI enforced the installer and tarballs must still be served
+    /// verbatim — never gated, and never swallowed by the SPA index.
+    #[tokio::test]
+    async fn host_installer_is_public_on_a_closed_relay_and_never_the_spa_index() {
+        let admin_dir = tempfile::tempdir().expect("admin bundle dir");
+        let web_dir = tempfile::tempdir().expect("public bundle dir");
+        write_admin_bundle(admin_dir.path());
+        write_bundle(web_dir.path());
+        let host_dir = web_dir.path().join("host");
+        std::fs::create_dir_all(&host_dir).expect("host dir");
+        let script = "#!/usr/bin/env bash\necho install\n";
+        let tarball: &[u8] = &[0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad];
+        std::fs::write(host_dir.join("install.sh"), script).expect("install.sh");
+        std::fs::write(
+            host_dir.join("sprig-aarch64-unknown-linux-musl.tar.gz"),
+            tarball,
+        )
+        .expect("tarball");
+        let state = spa_state_with(admin_dir.path(), web_dir.path(), |config| {
+            config.require_relay_membership = true;
+            config.nip_fi = crate::nip_fi_config::NipFiRelayConfig {
+                mode: buzz_auth::NipFiMode::Enforce,
+                registry: buzz_auth::IssuerRegistry::new(),
+                jwks_configs: vec![],
+                max_connection_lifetime_secs: 3600,
+                command_configs: Vec::new(),
+                communities: crate::nip_fi_core::test_support::any_host("https://relay.example"),
+            };
+        })
+        .await;
+
+        // Control: the same relay gates an ordinary protected path, so the
+        // installer passing below is the exemption, not an open relay.
+        let gated = spa_response(state.clone(), "public.example", "/query").await;
+        assert_eq!(gated.status(), StatusCode::UNAUTHORIZED);
+
+        let response = spa_response(state.clone(), "public.example", "/host/install.sh").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            content_type.starts_with("application/x-sh") || content_type.starts_with("text/plain"),
+            "install.sh content type: {content_type}"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(&body[..], script.as_bytes());
+
+        let response = spa_response(
+            state.clone(),
+            "public.example",
+            "/host/sprig-aarch64-unknown-linux-musl.tar.gz",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/gzip")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(&body[..], tarball);
+
+        // A missing artifact is a 404, not the SPA document.
+        for path in ["/host/missing.tar.gz", "/host/"] {
+            let response = spa_response(state.clone(), "public.example", path).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+
+        // The admin authority never serves the public bundle's installer.
+        let response = spa_response(state, "admin.example", "/host/install.sh").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[test]
@@ -2842,6 +2949,8 @@ mod tests {
 
         // SPA / assets
         assert!(is_exempt("/assets/main.js"));
+        assert!(is_exempt("/host/install.sh"));
+        assert!(!is_exempt("/hostile"), "/hostile must not match /host/");
         assert!(is_exempt("/invite/abc"));
         assert!(is_exempt("/repos"));
         assert!(is_exempt("/repos/owner/name"));
