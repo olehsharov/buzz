@@ -2186,6 +2186,10 @@ pub struct FormatPromptArgs<'a> {
     /// restating the original request as if it were new. Defaults to `false`
     /// (a fresh session, which needs the full restatement).
     pub cancelled_turn_in_session: bool,
+    /// A turn in this live session was cancelled since the agent last heard
+    /// so, which also stopped every background subagent and task it started.
+    /// Renders a `<background-work-cancelled>` notice. Defaults to `false`.
+    pub background_work_cancelled: bool,
     /// The harness autoposts this turn's response text as the reply
     /// (`--stream draft+autopost`), so `<context>` names that delivery instead
     /// of a `buzz messages send --reply-to` instruction. Defaults to `false`
@@ -2462,6 +2466,16 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
         sections.push(framing.closing_note.to_string());
     }
 
+    // 4d. A cancel in this session also stopped its background work. The
+    // session's history still shows those subagents being launched, so say
+    // plainly that they are gone.
+    if args.background_work_cancelled {
+        sections.push(crate::prompt_framing::semantic_section(
+            "background-work-cancelled",
+            BACKGROUND_WORK_CANCELLED_NOTE,
+        ));
+    }
+
     sections
 }
 
@@ -2539,11 +2553,19 @@ impl MergeFraming {
     }
 }
 
+/// Notice that a cancelled turn's background subagents and tasks are gone.
+pub(crate) const BACKGROUND_WORK_CANCELLED_NOTE: &str = "Your earlier turn in this session was \
+     cancelled, and the cancel also stopped every background subagent and background task that \
+     turn had started. None of them is still running, whatever your earlier tool output says. \
+     Do not tell anyone they are still running; if you still need their work, start them again.";
+
 /// Closing instruction for a turn restored after a harness restart.
 const RESTART_CLOSING_NOTE: &str = "Note: Your previous turn on this was interrupted because \
      the harness restarted. This is the same session, so it should still hold that turn and the \
-     work you did in it: continue from where you stopped instead of starting over. If a new \
-     message is included, incorporate it if it's relevant.";
+     work you did in it: continue from where you stopped instead of starting over. The restart \
+     stopped every background subagent and background task you had started — none of them is \
+     still running; start them again if you still need their work. If a new message is \
+     included, incorporate it if it's relevant.";
 
 /// Framing strings for the goose-native steer path (lib.rs mode-gate),
 /// pulled from the same source-of-truth as the cancel+merge fallback
@@ -3191,6 +3213,30 @@ mod tests {
                 "{reason:?}: a fresh session keeps the restating framing: {fresh}"
             );
         }
+    }
+
+    /// The background-work notice renders only when a cancel stopped it.
+    #[test]
+    fn test_format_prompt_background_work_cancelled_notice() {
+        let batch = make_merged_batch(Some(CancelReason::Steer));
+        let render = |cancelled| {
+            format_prompt(
+                &batch,
+                &FormatPromptArgs {
+                    background_work_cancelled: cancelled,
+                    ..Default::default()
+                },
+            )
+            .join("\n\n")
+        };
+        let with = render(true);
+        assert!(
+            with.contains("<background-work-cancelled>")
+                && with.contains("stopped every background subagent")
+                && with.contains("start them again"),
+            "{with}"
+        );
+        assert!(!render(false).contains("<background-work-cancelled>"));
     }
 
     /// A turn restored after a restart says it was interrupted by the restart

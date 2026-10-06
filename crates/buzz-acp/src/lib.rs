@@ -639,6 +639,9 @@ struct QueuedNormalListenerEvent {
     /// The admitted event as a native steer would render it, including an
     /// edit's resolved original-message routing.
     steer_event: queue::BatchEvent,
+    /// Whether the event's channel is a DM (decides how a steered message
+    /// from another thread is told to reply).
+    is_dm: bool,
 }
 
 impl QueuedNormalListenerEvent {
@@ -657,6 +660,7 @@ impl QueuedNormalListenerEvent {
         self,
         handling: MultipleEventHandling,
         owner: Option<&str>,
+        autopost: bool,
         pool: &mut AgentPool,
         queue: &mut EventQueue,
         steer_ack_tx: &mpsc::UnboundedSender<SteerAckEvent>,
@@ -667,19 +671,25 @@ impl QueuedNormalListenerEvent {
         let Some(signal) = mode_gate_signal(handling, &self.effective_author, owner) else {
             return;
         };
-        // A native steer keeps the running turn's `<context>`, so it may only
-        // carry a message that replies in the same thread. Under the channel
-        // policy one session spans threads; a message for another thread takes
-        // the cancel+merge path, whose re-prompt carries its own `<context>`.
+        // Steer natively whenever the adapter can: cancelling the running turn
+        // instead also kills every background subagent it started
+        // (claude-agent-acp's `session/cancel` finishes them all). A native
+        // steer keeps the running turn's `<context>`, so a message for another
+        // thread carries its own reply routing in the steer body (#6132 sent it
+        // to cancel+merge instead). Only when the harness autoposts the turn's
+        // response text must the message share the turn's thread: the reply
+        // would be posted where the running turn's draft goes.
         let same_reply_thread = queue.in_flight_reply_thread(&self.scope)
             == Some(self.steer_event.reply_thread().as_str());
+        let own_routing = (!same_reply_thread).then_some(SteerReplyRouting { is_dm: self.is_dm });
         let native_attempted = matches!(signal, ControlSignal::Steer)
-            && same_reply_thread
+            && (same_reply_thread || !autopost)
             && try_native_steer(
                 pool,
                 queue,
                 self.scope.clone(),
                 self.steer_event,
+                own_routing,
                 steer_ack_tx,
             );
         if !native_attempted {
@@ -718,6 +728,7 @@ impl NormalListenerIngress {
         self,
         queue: &mut EventQueue,
         session_scope: scope::SessionScope,
+        is_dm: bool,
     ) -> QueuedNormalListenerEvent {
         let Self {
             buzz_event,
@@ -748,6 +759,7 @@ impl NormalListenerIngress {
             effective_author,
             reaction_target_id,
             steer_event,
+            is_dm,
         }
     }
 }
@@ -3609,14 +3621,11 @@ async fn run_harness(
                             // channel-keyed routing. Telemetry only for now —
                             // queue/pool partitioning by scope lands in a
                             // follow-up (see ticket outline steps 2–4).
-                            let session_scope = ingress.session_scope(
-                                config.session_policy,
-                                is_dm_channel(
-                                    ingress.buzz_event.channel_id,
-                                    &ctx.channel_info,
-                                )
-                                .await,
-                            );
+                            let is_dm =
+                                is_dm_channel(ingress.buzz_event.channel_id, &ctx.channel_info)
+                                    .await;
+                            let session_scope =
+                                ingress.session_scope(config.session_policy, is_dm);
                             tracing::debug!(
                                 channel_id = %session_scope.channel_id(),
                                 scope = %session_scope.telemetry_label(),
@@ -3625,7 +3634,7 @@ async fn run_harness(
                                 policy = %config.session_policy,
                                 "admitted event — resolved session scope"
                             );
-                            let queued = ingress.push(&mut queue, session_scope);
+                            let queued = ingress.push(&mut queue, session_scope, is_dm);
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
                             // Fire-and-forget: on rare fast-failure paths the
@@ -3639,6 +3648,7 @@ async fn run_harness(
                             queued.steer_or_interrupt(
                                 config.multiple_event_handling,
                                 owner_cache.get(),
+                                config.stream_mode == stream_draft::StreamMode::DraftAutopost,
                                 &mut pool,
                                 &mut queue,
                                 &steer_ack_tx,
@@ -4422,6 +4432,7 @@ fn try_native_steer(
     queue: &mut EventQueue,
     scope: scope::SessionScope,
     be: queue::BatchEvent,
+    own_routing: Option<SteerReplyRouting>,
     steer_ack_tx: &mpsc::UnboundedSender<SteerAckEvent>,
 ) -> bool {
     let channel_id = scope.channel_id();
@@ -4438,11 +4449,15 @@ fn try_native_steer(
     // channel context and the actor's profile in the original prompt,
     // duplicating it here would defeat the point of non-cancelling
     // steering (which is to inject only what's new).
-    // The caller steers natively only a message in the running turn's reply
-    // thread, so the turn's own `<context>` still routes the reply. An edit's
+    // A message in the running turn's reply thread is routed by the turn's own
+    // `<context>`; one from another thread carries `own_routing`. An edit's
     // block names its original (`Edit of:`) and the original's thread root.
     let event_id_hex = be.event.id.to_hex();
-    let body = native_steer_body(channel_id, &be);
+    let mut body = native_steer_body(channel_id, &be);
+    if let Some(routing) = own_routing {
+        body.push_str("\n\n");
+        body.push_str(&steer_reply_routing_note(&be, routing));
+    }
 
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<pool::SteerAck>();
     let request = pool::SteerRequest {
@@ -4506,6 +4521,39 @@ fn try_native_steer(
             );
             false
         }
+    }
+}
+
+/// How to route the reply to a steered message that is not in the running
+/// turn's reply thread.
+#[derive(Debug, Clone, Copy)]
+struct SteerReplyRouting {
+    is_dm: bool,
+}
+
+/// The reply instruction for a steered message from another thread: the
+/// running turn's `<context>` names its own thread, so this message must say
+/// where its reply goes — the same destination its own turn's `<context>`
+/// would name.
+fn steer_reply_routing_note(be: &queue::BatchEvent, routing: SteerReplyRouting) -> String {
+    let event_id = be.routing_event_id();
+    if be.routing_thread_tags().root_event_id.is_some() {
+        format!(
+            "IMPORTANT: This message is in a different thread from the work you are doing. \
+             Reply to it with `--reply-to {event_id}` on `buzz messages send`, not into the \
+             thread of your current work."
+        )
+    } else if routing.is_dm {
+        "IMPORTANT: This is a new top-level message in the DM, not part of the thread you are \
+         working in. Reply to it top-level (`buzz messages send` without `--reply-to`), not into \
+         the thread of your current work."
+            .to_string()
+    } else {
+        format!(
+            "IMPORTANT: This is a new top-level message, not part of the thread you are working \
+             in. Reply to it with `--reply-to {event_id}` on `buzz messages send` — it is the \
+             root of its own thread. Do NOT reply into the thread of your current work."
+        )
     }
 }
 
@@ -4696,6 +4744,7 @@ mod try_native_steer_fallback_log_tests {
                     received_at: std::time::Instant::now(),
                     edit: None,
                 },
+                None,
                 &steer_ack_tx,
             )
         });
@@ -10196,18 +10245,37 @@ mod edit_native_steer_tests {
         };
         let scope = ingress.session_scope(scope::SessionPolicy::Channel, false);
         let mut queue = EventQueue::new(config::DedupMode::Queue);
-        let queued = ingress.push(&mut queue, scope);
+        let queued = ingress.push(&mut queue, scope, false);
         assert_eq!(queued.steer_event.edit, Some(resolved));
         assert_eq!(queued.reaction_target_id, original.id.to_hex());
     }
 
     /// Drive a routed edit of `original` through the listener's steer decision
-    /// while a turn for `running_event` is in flight under the channel policy.
-    /// Returns the native steer request, if any, and the control signal sent
-    /// to the running turn, if any.
+    /// while a turn for `running_event` is in flight under the channel policy
+    /// (draft mode: the agent replies with the CLI). Returns the native steer
+    /// request, if any, and the control signal sent to the running turn, if
+    /// any.
     fn steer_edit_into_running_turn(
         running_event: nostr::Event,
         original: &nostr::Event,
+    ) -> (Option<pool::SteerRequest>, Option<ControlSignal>) {
+        let edit = edit_event(&original.id.to_hex(), &[]);
+        let resolved = queue::ResolvedEdit {
+            target_event_id: original.id.to_hex(),
+            target_thread_tags: queue::parse_thread_tags(original),
+        };
+        steer_into_running_turn(running_event, edit, Some(resolved), false, false)
+    }
+
+    /// Drive `new_event` (with its resolved edit route, if any) through the
+    /// listener's steer decision while a turn for `running_event` is in flight
+    /// in the same session scope.
+    fn steer_into_running_turn(
+        running_event: nostr::Event,
+        new_event: nostr::Event,
+        new_edit: Option<queue::ResolvedEdit>,
+        is_dm: bool,
+        autopost: bool,
     ) -> (Option<pool::SteerRequest>, Option<ControlSignal>) {
         let channel_id = Uuid::new_v4();
         let ingress =
@@ -10224,8 +10292,8 @@ mod edit_native_steer_tests {
 
         let mut queue = EventQueue::new(config::DedupMode::Queue);
         let running = ingress(running_event, None);
-        let scope = running.session_scope(scope::SessionPolicy::Channel, false);
-        running.push(&mut queue, scope.clone());
+        let scope = running.session_scope(scope::SessionPolicy::Channel, is_dm);
+        running.push(&mut queue, scope.clone(), is_dm);
         queue.flush_next().expect("running turn");
         assert!(queue.is_scope_in_flight(&scope));
 
@@ -10247,23 +10315,19 @@ mod edit_native_steer_tests {
             },
         );
 
-        let edit = edit_event(&original.id.to_hex(), &[]);
-        let resolved = queue::ResolvedEdit {
-            target_event_id: original.id.to_hex(),
-            target_thread_tags: queue::parse_thread_tags(original),
-        };
-        let edit_ingress = ingress(edit, Some(resolved));
+        let new_ingress = ingress(new_event, new_edit);
         assert_eq!(
-            edit_ingress.session_scope(scope::SessionPolicy::Channel, false),
+            new_ingress.session_scope(scope::SessionPolicy::Channel, is_dm),
             scope,
             "channel policy: one session spans every thread"
         );
         let (ack_tx, _ack_rx) = mpsc::unbounded_channel();
-        edit_ingress
-            .push(&mut queue, scope.clone())
+        new_ingress
+            .push(&mut queue, scope.clone(), is_dm)
             .steer_or_interrupt(
                 MultipleEventHandling::Steer,
                 None,
+                autopost,
                 &mut pool,
                 &mut queue,
                 &ack_tx,
@@ -10308,27 +10372,82 @@ mod edit_native_steer_tests {
     }
 
     /// Under the channel policy a turn started from thread A can be running
-    /// when an edit whose original is in thread B arrives. A native steer
-    /// would leave the turn's `<context>` replying to A, so the edit takes the
-    /// cancel+merge path instead; its re-prompt routes replies to B.
+    /// when an edit whose original is in thread B arrives. It is steered
+    /// natively (cancelling would kill the turn's background subagents), and
+    /// the steer carries its own reply routing to B, because the running
+    /// turn's `<context>` still points at A.
     #[tokio::test]
-    async fn routed_edit_for_another_thread_cancels_and_merges() {
+    async fn routed_edit_for_another_thread_steers_with_its_own_routing() {
         let thread_b = "ab".repeat(32);
         let original = message(Some(&thread_b));
         let (steer, control) = steer_edit_into_running_turn(message(None), &original);
 
-        assert!(steer.is_none(), "no native steer into thread A's turn");
-        assert_eq!(control, Some(ControlSignal::Steer));
+        let body = steer.expect("native steer").prompt_blocks.join("\n");
+        assert_eq!(control, None, "the running turn is not cancelled");
+        assert!(
+            body.contains(&format!("`--reply-to {}`", original.id.to_hex()))
+                && body.contains("different thread"),
+            "{body}"
+        );
     }
 
-    /// The same rule covers a top-level original: replies to it open a thread
-    /// rooted at the original, not at the running turn's top-level trigger.
+    /// A top-level original from another thread is steered too: its reply
+    /// opens a thread rooted at the original.
     #[tokio::test]
-    async fn routed_edit_for_another_top_level_message_cancels_and_merges() {
+    async fn routed_edit_for_another_top_level_message_steers_with_its_own_routing() {
         let original = message(None);
         let (steer, control) = steer_edit_into_running_turn(message(None), &original);
 
-        assert!(steer.is_none(), "no native steer across top-level threads");
+        let body = steer.expect("native steer").prompt_blocks.join("\n");
+        assert_eq!(control, None, "the running turn is not cancelled");
+        assert!(
+            body.contains(&format!("`--reply-to {}`", original.id.to_hex()))
+                && body.contains("root of its own thread"),
+            "{body}"
+        );
+    }
+
+    /// The reported bug: in a DM every new top-level message is its own reply
+    /// thread. It must be steered into the running turn — never cancel it, so
+    /// the turn's background subagents keep running — and told to reply
+    /// top-level.
+    #[tokio::test]
+    async fn dm_top_level_message_mid_turn_steers_without_cancelling() {
+        let (steer, control) =
+            steer_into_running_turn(message(None), message(None), None, true, false);
+
+        let body = steer.expect("native steer").prompt_blocks.join("\n");
+        assert_eq!(control, None, "a new DM message must not cancel the turn");
+        assert!(
+            body.contains("new top-level message in the DM")
+                && body.contains("without `--reply-to`"),
+            "{body}"
+        );
+    }
+
+    /// A message in the running turn's own thread needs no extra routing.
+    #[tokio::test]
+    async fn same_thread_steer_carries_no_extra_routing() {
+        let running = message(None);
+        let root = running.id.to_hex();
+        let (steer, control) =
+            steer_into_running_turn(running, message(Some(&root)), None, false, false);
+        let body = steer.expect("native steer").prompt_blocks.join("\n");
+        assert_eq!(control, None);
+        assert!(!body.contains("IMPORTANT"), "{body}");
+    }
+
+    /// When the harness autoposts the turn's response text, a message for
+    /// another thread still cancels and merges: an autoposted reply would land
+    /// in the running turn's thread.
+    #[tokio::test]
+    async fn autopost_mode_keeps_the_same_thread_gate() {
+        let (steer, control) =
+            steer_into_running_turn(message(None), message(None), None, true, true);
+        assert!(
+            steer.is_none(),
+            "no native steer across threads when autoposting"
+        );
         assert_eq!(control, Some(ControlSignal::Steer));
     }
 }

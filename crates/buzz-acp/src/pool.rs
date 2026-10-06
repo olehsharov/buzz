@@ -122,6 +122,10 @@ pub struct ChannelDeliveryState {
     /// this ACP session. Hydrated threads use bounded overfetch so exact event-ID
     /// deduplication does not unnecessarily shrink the new-context window.
     pub hydrated_thread_roots: VecDeque<String>,
+    /// A turn in this live session was cancelled. The adapter's cancel also
+    /// stops every background subagent/task the turn started, so the next
+    /// prompt must say so; cleared once a prompt carrying that notice succeeds.
+    pub background_work_cancelled: bool,
 }
 
 /// Per-channel session IDs, turn counters, and delivery state.
@@ -3597,6 +3601,9 @@ pub async fn run_prompt_task(
     // failed or cancelled first turn must not make its retry assume that the
     // provider retained any of that thread's context.
     let mut pending_hydrated_thread_roots = HashSet::new();
+    // Whether this prompt tells the agent a cancel stopped its background
+    // work; cleared from the session's delivery state once it succeeds.
+    let mut background_work_notice = false;
     // Live reply draft for channel turns (NIP-SD). Dropping it on any exit
     // path below abandons the stream; only a returned prompt finishes it.
     let mut reply_stream: Option<crate::stream_draft::ReplyStream> = None;
@@ -3663,6 +3670,11 @@ pub async fn run_prompt_task(
         // interrupted instead of restating the original request as new. A
         // replacement session starts with empty deliveries, so it gets the
         // full restatement.
+        background_work_notice = agent
+            .state
+            .deliveries
+            .get(&b.scope)
+            .is_some_and(|delivery| delivery.background_work_cancelled);
         let cancelled_turn_in_session = !b.cancelled_events.is_empty()
             && b.cancelled_events
                 .iter()
@@ -3739,6 +3751,7 @@ pub async fn run_prompt_task(
                 agent_canvas: standing.agent_canvas,
                 standing_context_sent,
                 cancelled_turn_in_session,
+                background_work_cancelled: background_work_notice,
                 reply_autopost: ctx
                     .stream
                     .as_ref()
@@ -3930,6 +3943,16 @@ pub async fn run_prompt_task(
                                             &pending_delivered_event_ids,
                                             &pending_hydrated_thread_roots,
                                         );
+                                        // The cancel stopped every background
+                                        // subagent the turn started; the kept
+                                        // session still remembers launching
+                                        // them, so the next prompt says so.
+                                        agent
+                                            .state
+                                            .deliveries
+                                            .entry(scope.clone())
+                                            .or_default()
+                                            .background_work_cancelled = true;
                                     }
                                 } else {
                                     agent.state.invalidate(&source);
@@ -4131,6 +4154,11 @@ pub async fn run_prompt_task(
                     &pending_delivered_event_ids,
                     &pending_hydrated_thread_roots,
                 );
+                if background_work_notice {
+                    if let Some(delivery) = agent.state.deliveries.get_mut(scope) {
+                        delivery.background_work_cancelled = false;
+                    }
+                }
             } else if !agent.has_system_prompt_support() {
                 agent.state.heartbeat_standing_context_sent = true;
             }
@@ -9087,6 +9115,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 standing_context_sent: true,
                 delivered_event_ids: HashSet::from(["event-a".into()]),
                 hydrated_thread_roots: VecDeque::from(["root-a".into()]),
+                background_work_cancelled: false,
             },
         );
         s.deliveries.insert(
@@ -9095,6 +9124,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 standing_context_sent: true,
                 delivered_event_ids: HashSet::from(["event-b".into()]),
                 hydrated_thread_roots: VecDeque::from(["root-b".into()]),
+                background_work_cancelled: false,
             },
         );
         s.heartbeat_session = Some("sess-hb".into());
