@@ -223,6 +223,8 @@ type MockBridgeOptions = {
     mcp?: MockCommandAvailability;
   };
   managedAgents?: MockManagedAgentSeed[];
+  /** List only the applied community's agents, as the native list does. */
+  scopeManagedAgentsToCommunity?: boolean;
   /** Result returned by the mocked `add_agent_to_huddle` command. */
   addAgentToHuddleResult?: {
     ephemeral_added: boolean;

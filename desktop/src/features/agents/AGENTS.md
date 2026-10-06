@@ -330,6 +330,47 @@ with a TypeScript lookup table or an id comparison in a component.
     for resets; owner replay of a redacted head preserves only a nonportable
     local override. That local path is not synchronized through catalog heads.
 
+20. **Every agent belongs to ONE community (narrows #2122 "agents
+    everywhere").** The record's `relay_url` is its community — the single
+    source of truth, resolved by `relay::effective_agent_relay_url` (an
+    unassigned record resolves to the active workspace relay). An agent runs,
+    publishes, and is listed only there and is hidden from every other
+    community; its own community never hides or blocks it.
+    - **Create** always assigns the active community (`create_managed_agent`
+      binds the active relay; a captured `relayUrl` that no longer matches
+      refuses the create). There is no community picker in create or edit,
+      and `update_managed_agent` never moves an agent: it ignores `relayUrl`.
+    - **Legacy records** are assigned once by
+      `managed_agents::community_scope::assign_legacy_agent_communities`,
+      run from `apply_workspace` before the relay override changes: every
+      unassigned record goes to the FIRST saved community
+      (`firstCommunityRelayUrl`, the one the user started from); existing pins
+      are kept. It backs up `managed-agents.json` once
+      (`managed-agents.json.bak-community-scope`) and is idempotent behind
+      `community-scope.v1.json`. After that, a record a creation path saves
+      without a community is stamped with the active one at write time.
+    - **Definitions** (key-less records) are scoped the same way; built-in
+      definitions are global templates. The persona view (`AgentDefinition`)
+      does not carry the community, so `save_agent_definitions` keeps the
+      stored community of the same slug. Teams are global templates.
+    - **Runtime:** reconcile fan-out and launch restore start each agent only
+      on its own relay; `start_pair`, `bound_runtime_key`, `start_managed_agent`
+      and host deploys refuse another community's relay with a clear error;
+      provider and host deploys carry the agent's own relay; reconcile stops
+      pairs left running on a relay their agent does not belong to.
+    - **Event sync / profiles:** a scope's 30177 and 30175 legs retain only
+      that community's records; `retain_managed_agent_pending` and pending
+      kind:0 reconciliation skip other communities' agents.
+    - **Hiding is native and central.** `list_managed_agents` and
+      `list_personas` return only the active community's records, so every UI
+      consumer (agents page, sidebar, pickers, mentions, tray, machines, DMs,
+      onboarding) inherits the scope — do not re-filter per surface. Relay
+      state readers (`list_relay_agents`, `revalidate_relay_agents`,
+      `get_channel_members`, `search_users`) drop this device's agents that
+      belong to another community, because a pre-scoping build may have left
+      their profiles and memberships on that relay. Nothing is deleted from
+      the other relay.
+
 ## Channel-only runtime controls
 
 Desktop observer controls identify a channel, not a thread session. The harness
@@ -356,6 +397,18 @@ buzz messages send --channel <channel-id> --reply-to <thread-root-id> \
 ```
 
 ## The tests that enforce this
+
+- Rust `managed_agents::community_scope::tests` — legacy assignment (first
+  community, pins kept, built-ins global, backup, idempotent marker), the
+  write-time stamp, persona saves keeping the definition's community, and the
+  list commands showing only the active community. Also
+  `runtime_commands::tests::fan_out_starts_each_agent_only_on_its_own_community`,
+  `restore::candidate_tests`, `runtime_commands::admission_tests::start_pair_refuses_a_relay_the_agent_does_not_belong_to`,
+  `runtime::spawn_key::tests`, `reconcile::tests::event_sync_reconciles_only_the_scopes_own_community_agents`,
+  `event_sync::tests::migrate_personas_retains_only_the_scopes_own_community_definitions`,
+  and `relay_directory::tests::directory_hides_this_devices_agents_from_other_communities`.
+- `desktop/tests/e2e/agent-community-scope.spec.ts` — two communities each
+  list only their own agents in @mention autocomplete; a switch flips it.
 
 - `lib/agentConfigCore.test.mjs` — field model per harness × scope, clearing
   policy. Update when the capability model changes.

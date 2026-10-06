@@ -140,6 +140,8 @@ export type MockManagedAgentSeed = {
   respondToAllowlist?: string[];
   /** Per-agent env vars seeded into the mock store. */
   envVars?: Record<string, string>;
+  /** Community relay the agent belongs to (default: the default relay). */
+  relayUrl?: string;
 };
 
 type MockManagedAgentRuntimeSeed = {
@@ -326,6 +328,9 @@ type E2eConfig = {
       mcp?: MockCommandAvailability;
     };
     managedAgents?: MockManagedAgentSeed[];
+    /** Mirror the native community scoping of `list_managed_agents`: list
+     *  only agents whose `relay_url` is the applied community's relay. */
+    scopeManagedAgentsToCommunity?: boolean;
     /** Result returned by the mocked `add_agent_to_huddle` command. */
     addAgentToHuddleResult?: {
       ephemeral_added: boolean;
@@ -2560,7 +2565,7 @@ function buildSeededManagedAgent(seed: MockManagedAgentSeed): MockManagedAgent {
     // Native serde always emits this key (`null` when unpinned) — the bridge
     // must mirror the wire shape, not omit the key.
     runtime: seed.runtime ?? null,
-    relay_url: DEFAULT_RELAY_WS_URL,
+    relay_url: seed.relayUrl ?? DEFAULT_RELAY_WS_URL,
     acp_command: "buzz-acp",
     agent_command: agentCommand,
     agent_args: agentArgs,
@@ -3387,6 +3392,14 @@ let mockWebsocketSendMutexWedged = false;
 let mockClosedChannelLiveSubscription = false;
 const realSockets = new Map<number, WebSocket>();
 let mockManagedAgents: MockManagedAgent[] = [];
+/** Relay of the last `apply_workspace` — the active community. */
+let mockAppliedRelayUrl: string | null = null;
+
+function sameMockRelay(left: string, right: string) {
+  const canonical = (url: string) =>
+    url.trim().replace(/\/+$/, "").toLowerCase();
+  return canonical(left) === canonical(right);
+}
 let mockManagedAgentRuntimes: MockManagedAgentRuntimeRow[] = [];
 let mockBestieAssignment: {
   agent_pubkey: string;
@@ -8909,7 +8922,15 @@ async function handleListManagedAgents(
   config: E2eConfig | undefined,
 ): Promise<RawManagedAgent[]> {
   await delayAgentList(config);
-  return mockManagedAgents.map(cloneManagedAgent);
+  const applied = mockAppliedRelayUrl;
+  const visible =
+    config?.mock?.scopeManagedAgentsToCommunity && applied !== null
+      ? mockManagedAgents.filter(
+          (agent) =>
+            !agent.relay_url || sameMockRelay(agent.relay_url, applied),
+        )
+      : mockManagedAgents;
+  return visible.map(cloneManagedAgent);
 }
 
 function isAgentMemoryListing(
@@ -9709,7 +9730,9 @@ async function handleCreateManagedAgent(
     persona_id: args.input.personaId ?? null,
     // Create never pins a harness id — the record inherits from the persona.
     runtime: null,
-    relay_url: args.input.relayUrl ?? DEFAULT_RELAY_WS_URL,
+    // Native create always assigns the active community.
+    relay_url:
+      args.input.relayUrl ?? mockAppliedRelayUrl ?? DEFAULT_RELAY_WS_URL,
     acp_command: args.input.acpCommand ?? "buzz-acp",
     agent_command: agentCommand,
     agent_args: agentArgs,
@@ -13018,6 +13041,8 @@ export function maybeInstallE2eTauriMocks() {
         return activeConfig?.mock?.linkPreviewMetadata ?? null;
       }
       case "apply_workspace": {
+        mockAppliedRelayUrl =
+          (payload as { relayUrl?: string } | undefined)?.relayUrl ?? null;
         const applyDelayMs = activeConfig?.mock?.applyCommunityDelayMs ?? 0;
         if (applyDelayMs > 0) {
           return new Promise((resolve) =>
