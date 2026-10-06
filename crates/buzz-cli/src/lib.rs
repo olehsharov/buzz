@@ -109,6 +109,7 @@ Configuration (flags override env vars):
   BUZZ_AUTH_TAG      NIP-OA auth tag JSON  [optional]
 
 The 'pack' subcommand runs locally and does not require a relay connection.
+The 'host' subcommand uses its own host key and the relay from pairing.
 
 Exit codes: 0=ok  1=bad input  2=relay/network error  3=auth error  4=other  5=write conflict
 Errors are JSON on stderr: {\"error\": \"<category>\", \"message\": \"<detail>\"}"
@@ -276,6 +277,9 @@ enum Cmd {
     /// Persona pack operations (local, no relay connection needed)
     #[command(subcommand)]
     Pack(PackCmd),
+    /// Run this machine as an agent host for your Buzz desktop (pair, run, status)
+    #[command(subcommand)]
+    Host(buzz_host::HostCmd),
     /// Community moderation — reports queue, bans, timeouts, audit trail
     #[command(subcommand)]
     Moderation(ModerationCmd),
@@ -2183,6 +2187,16 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         };
     }
 
+    // Host commands carry their own identity (the host key) and relay.
+    if let Cmd::Host(sub) = cli.command {
+        return buzz_host::run(sub).await.map_err(|e| match e {
+            buzz_host::HostError::Invalid(_) | buzz_host::HostError::NotPaired => {
+                CliError::Usage(e.to_string())
+            }
+            other => CliError::Other(other.to_string()),
+        });
+    }
+
     // Auth: private key is required for all relay operations.
     // The keypair IS the identity — no tokens, no other auth.
     let private_key_str = cli.private_key.ok_or_else(|| {
@@ -2243,7 +2257,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Upload(sub) => commands::upload::dispatch(sub, &client).await,
         Cmd::Mem(sub) => commands::mem::dispatch(sub, &client).await,
         Cmd::Moderation(sub) => commands::moderation::dispatch(sub, &client, &cli.format).await,
-        Cmd::Pack(_) => unreachable!("handled above"),
+        Cmd::Pack(_) | Cmd::Host(_) => unreachable!("handled above"),
     }
 }
 
@@ -2401,6 +2415,7 @@ mod tests {
             "emoji",
             "feed",
             "gifs",
+            "host",
             "issues",
             "media",
             "mem",

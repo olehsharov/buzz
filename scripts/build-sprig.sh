@@ -7,6 +7,10 @@
 #   buzz-agent     link to sprig (ACP-compliant agent)
 #   buzz-dev-mcp   link to sprig (developer MCP server; also dispatches
 #                    rg/tree/buzz)
+#   buzz           link to sprig (Buzz CLI, including `buzz host`)
+#   buzz-host      link to sprig (agent-host daemon, same as `buzz host`)
+#   git-credential-nostr, git-sign-nostr
+#                  links to sprig (Git helpers, via the buzz-acp personality)
 #
 # Usage:
 #   ./scripts/build-sprig.sh [version] [target]
@@ -35,6 +39,10 @@
 #   buzz-acp
 #   buzz-agent
 #   buzz-dev-mcp
+#   buzz
+#   buzz-host
+#   git-credential-nostr
+#   git-sign-nostr
 #   README.md
 #   sprig.json        { version, git_sha, target, binaries: [{name, sha256, size}] }
 
@@ -59,7 +67,9 @@ else
 fi
 
 BUNDLE_BIN="sprig"
-COMMANDS=(buzz-acp buzz-agent buzz-dev-mcp)
+# Matches the links Dockerfile.sprig creates, plus buzz-host. `buzz` (with
+# `buzz host`) and the Git helpers are needed by `scripts/install-buzz-host.sh`.
+COMMANDS=(buzz-acp buzz-agent buzz-dev-mcp buzz buzz-host git-credential-nostr git-sign-nostr)
 
 echo "==> Building Sprig v${VERSION} for ${TARGET}"
 echo "    git_sha=${GIT_SHA}"
@@ -146,6 +156,9 @@ Commands:
 - `buzz-agent` — ACP-compliant agent (spawns MCP servers, calls LLMs).
 - `buzz-dev-mcp` — Developer MCP server (shell, str_replace, todo) and
   multicall entrypoint for `rg`, `tree`, and `buzz`.
+- `buzz` — Buzz CLI, including `buzz host` (agent-host daemon).
+- `buzz-host` — the same as `buzz host`.
+- `git-credential-nostr`, `git-sign-nostr` — Git helpers.
 
 See `sprig.json` for SHA-256s, sizes, target, and source git SHA.
 
