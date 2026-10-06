@@ -339,8 +339,8 @@ pub(crate) fn prospective_spawn_config_snapshot(
     SpawnConfigSnapshot::from_inputs(SpawnConfigInputs {
         record,
         descriptor: &descriptor,
-        // Resolved, not stored: every record spawns on the workspace relay
-        // (legacy pins ignored), so a workspace relay change must badge.
+        // Resolved: a record spawns on its own community's relay (an
+        // unassigned one on the workspace relay).
         relay_url: &crate::relay::effective_agent_relay_url(&record.relay_url, workspace_relay),
         team_instructions: effective_team_instructions(record, teams).as_deref(),
         system_prompt: prompt.as_deref(),

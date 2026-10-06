@@ -246,6 +246,31 @@ pub async fn readd_community_relay(relay_url: String, app: AppHandle) -> Result<
     .map_err(|e| format!("readd_community_relay task failed: {e}"))?
 }
 
+/// Run [`crate::managed_agents::community_scope::assign_legacy_agent_communities`]
+/// under the agent store lock. Failures are logged; the missing marker makes
+/// the next workspace apply retry.
+fn assign_legacy_agent_communities<R: tauri::Runtime>(app: &AppHandle<R>, home_relay_url: &str) {
+    let state = app.state::<AppState>();
+    let result = (|| {
+        let _store = state
+            .managed_agents_store_lock
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let base_dir = crate::managed_agents::managed_agents_base_dir(app)?;
+        crate::managed_agents::community_scope::assign_legacy_agent_communities(
+            &base_dir,
+            home_relay_url.trim(),
+        )
+    })();
+    match result {
+        Ok(0) => {}
+        Ok(assigned) => {
+            eprintln!("buzz-desktop: assigned {assigned} agent record(s) to their home community")
+        }
+        Err(error) => eprintln!("buzz-desktop: agent community assignment failed: {error}"),
+    }
+}
+
 /// Apply a workspace's configuration to the backend session.
 ///
 /// Called by the frontend on app init (after reload) to configure the
@@ -265,6 +290,7 @@ pub async fn apply_workspace(
     nsec: Option<String>,
     repos_dir: Option<String>,
     agent_managed_profiles: Option<bool>,
+    first_community_relay_url: Option<String>,
     app: AppHandle,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
@@ -346,6 +372,16 @@ pub async fn apply_workspace(
         // generation before making its first mutation. Normal queued applies
         // cannot advance it until this transaction releases the guard.
         assert_current_apply_generation(&state.workspace_apply_generation, apply_generation)?;
+
+        // One-time community assignment of legacy agents, BEFORE the relay
+        // override changes: the write-time stamp net only engages once this
+        // has run, so legacy records go to the first saved community (the one
+        // the user started from), never to whichever community is active.
+        // Non-fatal: without the marker it simply retries on the next apply.
+        assign_legacy_agent_communities(
+            &app,
+            first_community_relay_url.as_deref().unwrap_or(&relay_url),
+        );
 
         // ── Apply all state changes (nothing below can fail) ──────────────────
         // Forget the previously applied workspace before mutating: until this
@@ -439,6 +475,7 @@ pub async fn apply_workspace(
                 restore_app.clone(),
                 scope.owner_keys,
                 scope.db_path,
+                scope.relay_url,
             )
             .await?;
         }

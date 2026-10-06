@@ -152,6 +152,10 @@ export function useCommunityInit(
   options: { popout?: boolean } = {},
 ): CommunityInitResult {
   const isPopout = options.popout === true;
+  // Read at apply time, not a dependency: the first saved community only
+  // decides the one-time home of legacy (unassigned) agents.
+  const communitiesRef = useRef(communities);
+  communitiesRef.current = communities;
   const communityRelaysKey = communityRelaySetKey(communities);
   const [result, setResult] = useState<CommunityInitResult>({
     isReady: false,
@@ -406,6 +410,7 @@ export function useCommunityInit(
             activeCommunity.token,
             activeCommunity.reposDir,
             getOverrides().agentManagedProfiles === true,
+            communitiesRef.current[0]?.relayUrl,
           );
         }
       } catch (error) {

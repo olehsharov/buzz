@@ -67,20 +67,63 @@ pub fn relay_api_base_url_with_override(state: &AppState) -> String {
     }
 }
 
-/// Selects the relay a managed agent should use for a relay operation.
+/// The community relay a managed agent belongs to.
 ///
-/// Always the active workspace relay. The legacy per-record `relay_url` pin is
-/// deliberately IGNORED (agents-everywhere, #2122): every agent is eligible on
-/// every community, and the pair the caller is acting on is identified by the
-/// workspace relay, never by a stored pin. The record field is still parsed
-/// and persisted untouched — old records need no migration and a rollback to a
-/// pin-honoring build reads the same file — so the parameter stays in the
-/// signature as documentation of what is being ignored at the one choke point
-/// all agent relay resolution flows through. Resolving at read-time also means
-/// a stale stored value can never leak into reconcile, spawn, or profile sync.
-/// Uniform for both Local and Provider backends.
-pub fn effective_agent_relay_url(_record_relay: &str, workspace_relay: &str) -> String {
-    workspace_relay.to_string()
+/// Every agent belongs to exactly ONE community: the relay stored on its
+/// record (`relay_url`), stamped with the active community at creation and
+/// assigned once for legacy records by
+/// [`crate::managed_agents::community_scope`]. This narrows #2122
+/// ("agents everywhere"): an agent runs, publishes, and is listed only on its
+/// own community's relay and is hidden from every other community.
+///
+/// A record that has not been assigned yet (empty `relay_url`, which only
+/// exists before the one-time assignment runs) resolves to the active
+/// workspace relay, so it is never stranded with no community at all.
+/// Uniform for Local, Provider, and Host backends; remote deploys therefore
+/// target the agent's own relay.
+pub fn effective_agent_relay_url(record_relay: &str, workspace_relay: &str) -> String {
+    let pinned = record_relay.trim();
+    if pinned.is_empty() {
+        workspace_relay.to_string()
+    } else {
+        pinned.to_string()
+    }
+}
+
+/// Canonical form of a relay URL for community-membership comparison. Falls
+/// back to a trimmed, lower-cased, slash-stripped spelling for a value
+/// `normalize_relay_url` rejects, so a malformed pin still compares
+/// deterministically (and never equal to a well-formed relay).
+pub fn community_relay_key(relay_url: &str) -> String {
+    buzz_core_pkg::relay::normalize_relay_url(relay_url)
+        .unwrap_or_else(|_| relay_url.trim().trim_end_matches('/').to_ascii_lowercase())
+}
+
+/// Whether a managed agent whose record carries `record_relay` belongs to the
+/// community on `relay_url`, given the active `workspace_relay` (which an
+/// unassigned record resolves to — see [`effective_agent_relay_url`]).
+pub fn agent_belongs_to_relay(record_relay: &str, workspace_relay: &str, relay_url: &str) -> bool {
+    community_relay_key(&effective_agent_relay_url(record_relay, workspace_relay))
+        == community_relay_key(relay_url)
+}
+
+/// Refuse a relay operation for an agent on a community it does not belong
+/// to. Returns the error string surfaced to the caller (UI or log) instead of
+/// spawning, deploying, or publishing on the wrong relay.
+pub fn ensure_agent_belongs_to_relay(
+    agent_name: &str,
+    record_relay: &str,
+    workspace_relay: &str,
+    relay_url: &str,
+) -> Result<(), String> {
+    if agent_belongs_to_relay(record_relay, workspace_relay, relay_url) {
+        return Ok(());
+    }
+    Err(format!(
+        "agent {agent_name} belongs to the community on {}, not {}",
+        effective_agent_relay_url(record_relay, workspace_relay).trim(),
+        relay_url.trim()
+    ))
 }
 
 pub fn relay_http_base_url(relay_url: &str) -> String {

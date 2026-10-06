@@ -85,11 +85,36 @@ pub async fn list_personas(app: AppHandle) -> Result<Vec<AgentDefinition>, Strin
             .lock()
             .map_err(|error| error.to_string())?;
         let mut personas = load_personas(&app)?;
+        retain_community_personas(&app, &mut personas)?;
         pending::project_active_persona_sharing(&app, &state, &mut personas);
         Ok(personas)
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
+}
+
+/// Definitions belong to ONE community like their agents (built-ins are
+/// global templates): keep only the active community's.
+pub(crate) fn retain_community_personas<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    personas: &mut Vec<AgentDefinition>,
+) -> Result<(), String> {
+    use tauri::Manager;
+    let workspace_relay = crate::relay::relay_ws_url_with_override(&app.state::<AppState>());
+    let hidden: std::collections::HashSet<String> =
+        crate::managed_agents::storage::load_agent_definitions(app)?
+            .into_iter()
+            .filter(|record| {
+                !crate::managed_agents::community_scope::record_in_community(
+                    record,
+                    &workspace_relay,
+                    &workspace_relay,
+                )
+            })
+            .filter_map(|record| record.slug)
+            .collect();
+    personas.retain(|persona| persona.is_builtin || !hidden.contains(&persona.id));
+    Ok(())
 }
 
 #[cfg(test)]

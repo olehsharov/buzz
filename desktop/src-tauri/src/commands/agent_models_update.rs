@@ -188,12 +188,9 @@ pub async fn update_managed_agent(
         // turn_timeout_seconds is intentionally not applied here —
         // BUZZ_ACP_TURN_TIMEOUT is deprecated and ignored by the harness.
         // Use idle_timeout_seconds or max_turn_duration_seconds instead.
-        // Store the relay override exactly as supplied (trimmed). An explicit
-        // value pins the agent; empty falls back to the workspace relay at
-        // read-time. A name-only edit (relay_url == None) leaves the pin intact.
-        if let Some(relay_url) = input.relay_url {
-            record.relay_url = relay_url.trim().to_string();
-        }
+        // `relay_url` is the agent's community, fixed when it is created: an
+        // edit never moves an agent to another community, so a supplied
+        // value is ignored (accepted only for wire compatibility).
         if let Some(acp_command) = input.acp_command {
             record.acp_command = acp_command;
         }

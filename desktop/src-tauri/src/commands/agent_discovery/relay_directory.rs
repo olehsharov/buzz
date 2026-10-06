@@ -305,9 +305,45 @@ async fn list_relay_agents_for_selection(
     Ok(agents)
 }
 
+/// Drop this device's managed agents that belong to another community.
+///
+/// An agent belongs to ONE community. One that ran here under a pre-scoping
+/// build can still have a profile, a 30177 record, and channel memberships on
+/// this relay; it must stay hidden from mentions, pickers, and directories
+/// here all the same. Agents operated by anyone else are untouched.
+fn retain_agents_of_community(
+    agents: &mut Vec<RelayAgentInfo>,
+    records: &[crate::managed_agents::ManagedAgentRecord],
+    workspace_relay: &str,
+) {
+    let hidden = crate::managed_agents::community_scope::other_community_agent_pubkeys(
+        records,
+        workspace_relay,
+    );
+    agents.retain(|agent| !hidden.contains(&agent.pubkey.to_ascii_lowercase()));
+}
+
+/// Apply [`retain_agents_of_community`] with this device's agent store and
+/// the relay the directory was read from.
+fn hide_other_community_agents(
+    app: &tauri::AppHandle,
+    workspace_relay: &str,
+    mut agents: Vec<RelayAgentInfo>,
+) -> Result<Vec<RelayAgentInfo>, String> {
+    let records = crate::managed_agents::community_scope::load_agent_records_without_keys(app)?;
+    retain_agents_of_community(&mut agents, &records, workspace_relay);
+    Ok(agents)
+}
+
 #[tauri::command]
-pub async fn list_relay_agents(state: State<'_, AppState>) -> Result<Vec<RelayAgentInfo>, String> {
-    list_relay_agents_for_state(&state).await
+pub async fn list_relay_agents(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<RelayAgentInfo>, String> {
+    // Read once, before the queries, so the filter matches the relay queried.
+    let workspace_relay = crate::relay::relay_ws_url_with_override(&state);
+    let agents = list_relay_agents_for_state(&state).await?;
+    hide_other_community_agents(&app, &workspace_relay, agents)
 }
 
 /// Revalidate only the selected relay agents in the target channel.
@@ -318,6 +354,7 @@ pub async fn list_relay_agents(state: State<'_, AppState>) -> Result<Vec<RelayAg
 pub async fn revalidate_relay_agents(
     pubkeys: Vec<String>,
     channel_id: Option<String>,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Vec<RelayAgentInfo>, String> {
     let requested_pubkeys = pubkeys
@@ -328,12 +365,64 @@ pub async fn revalidate_relay_agents(
     if requested_pubkeys.is_empty() {
         return Ok(Vec::new());
     }
-    list_relay_agents_for_selection(&state, Some(&requested_pubkeys), channel_id.as_deref()).await
+    let workspace_relay = crate::relay::relay_ws_url_with_override(&state);
+    let agents =
+        list_relay_agents_for_selection(&state, Some(&requested_pubkeys), channel_id.as_deref())
+            .await?;
+    // Send-time authorization: a hidden agent cannot be woken by a mention.
+    hide_other_community_agents(&app, &workspace_relay, agents)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn relay_agent(pubkey: &str) -> RelayAgentInfo {
+        serde_json::from_value(serde_json::json!({
+            "pubkey": pubkey,
+            "name": "agent",
+            "agent_type": "acp",
+            "channels": [],
+            "capabilities": [],
+            "status": "online",
+        }))
+        .expect("relay agent fixture")
+    }
+
+    fn managed(pubkey: &str, relay_url: &str) -> crate::managed_agents::ManagedAgentRecord {
+        serde_json::from_value(serde_json::json!({
+            "pubkey": pubkey,
+            "name": "managed",
+            "relay_url": relay_url,
+            "acp_command": "buzz-acp",
+            "agent_command": "goose",
+            "agent_args": [],
+            "mcp_command": "",
+            "turn_timeout_seconds": 320,
+            "created_at": "",
+            "updated_at": ""
+        }))
+        .expect("record fixture")
+    }
+
+    #[test]
+    fn directory_hides_this_devices_agents_from_other_communities() {
+        let own = "a".repeat(64);
+        let foreign = "b".repeat(64);
+        let stranger = "c".repeat(64);
+        let mut agents = vec![
+            relay_agent(&own),
+            relay_agent(&foreign),
+            relay_agent(&stranger),
+        ];
+        let records = [
+            managed(&own, "wss://here.example"),
+            managed(&foreign, "wss://elsewhere.example"),
+        ];
+        retain_agents_of_community(&mut agents, &records, "wss://here.example");
+        let kept: Vec<_> = agents.iter().map(|agent| agent.pubkey.clone()).collect();
+        assert_eq!(kept, vec![own, stranger]);
+    }
 
     #[test]
     fn marked_build_requires_verified_owner_without_requiring_viewer_ownership() {

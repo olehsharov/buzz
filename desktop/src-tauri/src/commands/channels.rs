@@ -147,8 +147,11 @@ fn profile_join_pubkeys(members: &[crate::models::ChannelMemberInfo], limit: usi
 pub async fn get_channel_members(
     channel_id: String,
     read_your_writes: Option<bool>,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<ChannelMembersResponse, String> {
+    // Read before the query so the filter matches the relay queried.
+    let workspace_relay = crate::relay::relay_ws_url_with_override(&state);
     let events = query_relay(
         &state,
         &[channel_members_filter(
@@ -163,6 +166,16 @@ pub async fn get_channel_members(
         .map(nostr_convert::channel_members_from_event)
         .transpose()?
         .ok_or_else(|| "channel members not found".to_string())?;
+    // An agent belongs to ONE community: this device's agents from another
+    // community stay hidden from this community's rosters even where an
+    // older build left them channel members here.
+    let hidden = crate::managed_agents::community_scope::load_other_community_agent_pubkeys(
+        &app,
+        &workspace_relay,
+    )?;
+    response
+        .members
+        .retain(|member| !hidden.contains(&member.pubkey.to_ascii_lowercase()));
 
     // Batch-fetch kind:0 profiles to populate display names, capped so the
     // query cost is bounded on large rosters (see MEMBER_PROFILE_JOIN_LIMIT).

@@ -341,51 +341,61 @@ pub(crate) use provider_deploy::deploy_to_provider;
 // and `std::sync::MutexGuard` is not `Send`.
 #[tauri::command]
 pub async fn list_managed_agents(app: AppHandle) -> Result<Vec<ManagedAgentSummary>, String> {
+    tokio::task::spawn_blocking(move || list_community_managed_agents(&app))
+        .await
+        .map_err(|e| format!("spawn_blocking failed: {e}"))?
+}
+
+/// Blocking body of [`list_managed_agents`]: summaries of the ACTIVE
+/// community's agents only.
+pub(crate) fn list_community_managed_agents<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+) -> Result<Vec<ManagedAgentSummary>, String> {
     use tauri::Manager;
-    tokio::task::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        let _store_guard = state
-            .managed_agents_store_lock
-            .lock()
-            .map_err(|error| error.to_string())?;
-        let mut records = load_managed_agents(&app)?;
-        let mut runtimes = state
-            .managed_agent_processes
-            .lock()
-            .map_err(|error| error.to_string())?;
+    let state = app.state::<AppState>();
+    let _store_guard = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let mut records = load_managed_agents(app)?;
+    let mut runtimes = state
+        .managed_agent_processes
+        .lock()
+        .map_err(|error| error.to_string())?;
 
-        let (sync_changed, exited_pubkeys) =
-            sync_managed_agent_processes(&mut records, &mut runtimes, &current_instance_id(&app));
-        if sync_changed {
-            save_managed_agents(&app, &records)?;
-        }
-        for pubkey in &exited_pubkeys {
-            state.clear_agent_session_caches(pubkey);
-        }
+    let (sync_changed, exited_pubkeys) =
+        sync_managed_agent_processes(&mut records, &mut runtimes, &current_instance_id(app));
+    if sync_changed {
+        save_managed_agents(app, &records)?;
+    }
+    for pubkey in &exited_pubkeys {
+        state.clear_agent_session_caches(pubkey);
+    }
 
-        let personas = load_personas(&app).unwrap_or_default();
-        // One disk read for the whole list — build_managed_agent_summary takes
-        // teams and config as parameters precisely so this poll-every-5s call
-        // does not re-read them per record.
-        let teams = load_teams(&app).unwrap_or_default();
-        let global_config =
-            crate::managed_agents::load_global_agent_config(&app).unwrap_or_default();
-        records
-            .iter()
-            .map(|record| {
-                build_managed_agent_summary(
-                    &app,
-                    record,
-                    &runtimes,
-                    &personas,
-                    &teams,
-                    &global_config,
-                )
-            })
-            .collect()
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking failed: {e}"))?
+    let personas = load_personas(app).unwrap_or_default();
+    // One disk read for the whole list — build_managed_agent_summary takes
+    // teams and config as parameters precisely so this poll-every-5s call
+    // does not re-read them per record.
+    let teams = load_teams(app).unwrap_or_default();
+    let global_config = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
+    // Agents belong to ONE community: list only the active community's.
+    // Every UI surface (agents page, pickers, mentions, tray, machines)
+    // reads this list, so this is the one place other communities' agents
+    // are hidden.
+    let workspace_relay = crate::relay::relay_ws_url_with_override(&state);
+    records
+        .iter()
+        .filter(|record| {
+            crate::managed_agents::community_scope::record_in_community(
+                record,
+                &workspace_relay,
+                &workspace_relay,
+            )
+        })
+        .map(|record| {
+            build_managed_agent_summary(app, record, &runtimes, &personas, &teams, &global_config)
+        })
+        .collect()
 }
 
 #[tauri::command]
@@ -460,15 +470,17 @@ pub async fn create_managed_agent(
             .to_bech32()
             .map_err(|error| format!("failed to encode private key: {error}"))?;
 
-        // Store the relay override exactly as supplied (trimmed). An explicit
-        // value pins the agent; empty stays empty and resolves to the active
-        // workspace relay at read-time. Uniform for Local and Provider.
-        let resolved_relay_url = input
-            .relay_url
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("")
-            .to_string();
+        // An agent belongs to the community that is active when it is
+        // created — always, for every backend. The caller's captured
+        // community (`relay_url`) must still be the active one, so a switch
+        // mid-create fails instead of assigning the agent elsewhere.
+        let resolved_relay_url = crate::relay::bind_expected_relay_scope(
+            input.relay_url.as_deref(),
+            relay_ws_url_with_override(&state),
+        )
+        .map_err(|_| "active community changed before the agent was created".to_string())?
+        .as_str()
+        .to_string();
 
         (keys, private_key_nsec, pubkey, resolved_relay_url, input)
     };
@@ -960,6 +972,14 @@ pub async fn start_managed_agent(
         }
 
         let record = find_managed_agent_mut(&mut records, &pubkey)?;
+        // An agent belongs to ONE community: refuse to start, deploy, or
+        // publish it from another (local, provider, and host alike).
+        crate::relay::ensure_agent_belongs_to_relay(
+            &record.name,
+            &record.relay_url,
+            reconcile_relay.as_str(),
+            reconcile_relay.as_str(),
+        )?;
 
         // Resolve the effective harness for the avatar-fallback derivation in
         // profile reconcile (the create-time snapshot may be empty or stale for

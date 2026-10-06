@@ -6,6 +6,8 @@ export async function applyCommunity(
   token?: string,
   reposDir?: string,
   agentManagedProfiles?: boolean,
+  /** First saved community: the one-time home of legacy unassigned agents. */
+  firstCommunityRelayUrl?: string,
 ): Promise<void> {
   await invokeTauri("apply_workspace", {
     relayUrl,
@@ -13,6 +15,7 @@ export async function applyCommunity(
     token: token ?? null,
     reposDir: reposDir ?? null,
     agentManagedProfiles: agentManagedProfiles ?? false,
+    firstCommunityRelayUrl: firstCommunityRelayUrl ?? null,
   });
 }
 

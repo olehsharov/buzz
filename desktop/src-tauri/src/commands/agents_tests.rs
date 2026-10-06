@@ -401,10 +401,13 @@ fn pinned_reconcile_relay_wins_over_a_post_switch_workspace() {
 }
 
 #[test]
-fn unpinned_reconcile_relay_resolves_the_execution_time_workspace() {
-    // No tenant boundary: legacy behavior — follow the live workspace via
-    // effective_agent_relay_url (which ignores the record pin by design).
-    let relay = resolve_reconcile_relay(None, "wss://stale-pin.example", "wss://tenant-b.example");
+fn unpinned_reconcile_relay_resolves_the_agents_own_community() {
+    // No task pin: the kind:0 goes to the agent's own community (its record
+    // relay), never to whichever community is active at execution time.
+    let relay = resolve_reconcile_relay(None, "wss://own.example", "wss://tenant-b.example");
+    assert_eq!(relay, "wss://own.example");
+    // An unassigned record follows the live workspace.
+    let relay = resolve_reconcile_relay(None, "", "wss://tenant-b.example");
     assert_eq!(relay, "wss://tenant-b.example");
 }
 

@@ -256,22 +256,39 @@ async fn oversized_hint_is_capped_in_relay_error_message_string() {
     reset_rate_limit_gate();
 }
 
-// ── effective_agent_relay_url: legacy pin ignored ─────────────────────────
+// ── effective_agent_relay_url: the record's community wins ──────────────
 
 #[test]
-fn stored_relay_pin_is_ignored() {
-    // Zero-touch cutover (#2122): a creation-era per-record relay pin is
-    // parsed and persisted but never consulted — the workspace relay wins.
+fn stored_relay_pin_is_the_agents_community() {
+    // Agents belong to ONE community (narrows #2122): the stored pin is the
+    // relay the agent runs and publishes on, whatever community is active.
     assert_eq!(
         effective_agent_relay_url("wss://relay.other.com", "wss://staging.example.com"),
-        "wss://staging.example.com"
+        "wss://relay.other.com"
     );
 }
 
 #[test]
+fn agent_belongs_only_to_its_own_relay() {
+    use super::{agent_belongs_to_relay, ensure_agent_belongs_to_relay};
+    let own = "wss://one.example";
+    let other = "wss://two.example";
+    // Canonical spelling differences still match the agent's community.
+    assert!(agent_belongs_to_relay(own, other, "WSS://One.Example:443/"));
+    assert!(!agent_belongs_to_relay(own, own, other));
+    assert!(!agent_belongs_to_relay(own, other, other));
+    // Unassigned records belong to the active workspace only.
+    assert!(agent_belongs_to_relay("", other, other));
+    assert!(!agent_belongs_to_relay("", other, own));
+    assert!(ensure_agent_belongs_to_relay("a", own, other, own).is_ok());
+    let error = ensure_agent_belongs_to_relay("a", own, other, other).unwrap_err();
+    assert!(error.contains("belongs to the community on wss://one.example"));
+}
+
+#[test]
 fn empty_relay_resolves_to_workspace() {
-    // A never-set record resolves to the active workspace relay at read-time,
-    // so a stale stored default can never make it load-bearing.
+    // A not-yet-assigned record resolves to the active workspace relay so it
+    // is never stranded without a community.
     assert_eq!(
         effective_agent_relay_url("", "wss://staging.example.com"),
         "wss://staging.example.com"
@@ -280,7 +297,7 @@ fn empty_relay_resolves_to_workspace() {
 
 #[test]
 fn whitespace_only_relay_resolves_to_workspace() {
-    // Whitespace-only behaves identically — no value survives.
+    // Whitespace-only is unassigned too.
     assert_eq!(
         effective_agent_relay_url("   ", "wss://staging.example.com"),
         "wss://staging.example.com"

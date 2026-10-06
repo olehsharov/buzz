@@ -31,6 +31,14 @@ pub(crate) fn retain_managed_agent_pending<R: tauri::Runtime>(
 
     let result = (|| -> Result<(), String> {
         let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+        // An agent's 30177 record is published only to its own community.
+        if !crate::relay::agent_belongs_to_relay(
+            &record.relay_url,
+            &scope.relay_url,
+            &scope.relay_url,
+        ) {
+            return Ok(());
+        }
         let conn = open_retention_db(&scope.db_path)?;
         // Shared engine with the boot-time reconcile: projection content diff
         // (no republish for runtime-only churn) + monotonic created_at bump

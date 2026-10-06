@@ -266,7 +266,30 @@ pub async fn search_users(
     query: String,
     limit: Option<u32>,
     cursor: Option<String>,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
+) -> Result<SearchUsersResponse, String> {
+    // Read before the query so the filter matches the relay queried.
+    let workspace_relay = crate::relay::relay_ws_url_with_override(&state);
+    let mut response = search_users_on_relay(query, limit, cursor, &state).await?;
+    // An agent belongs to ONE community: this device's agents from another
+    // community stay out of every people search here (pickers, mentions, DM
+    // recipients, topbar), even where an older build left a profile here.
+    let hidden = crate::managed_agents::community_scope::load_other_community_agent_pubkeys(
+        &app,
+        &workspace_relay,
+    )?;
+    response
+        .users
+        .retain(|user| !hidden.contains(&user.pubkey.to_ascii_lowercase()));
+    Ok(response)
+}
+
+async fn search_users_on_relay(
+    query: String,
+    limit: Option<u32>,
+    cursor: Option<String>,
+    state: &AppState,
 ) -> Result<SearchUsersResponse, String> {
     let trimmed = query.trim();
     let max = limit.unwrap_or(8).min(500) as usize;
@@ -285,7 +308,7 @@ pub async fn search_users(
 
     if trimmed.is_empty() {
         let events = query_relay(
-            &state,
+            state,
             &[serde_json::json!({
                 "kinds": [0],
                 "limit": max,
@@ -325,7 +348,7 @@ pub async fn search_users(
     // the relay runs whole-word `websearch_to_tsquery` matching and "tyl"
     // returns zero results for "Tyler". Same bridge-only extension the topbar
     // message search uses (see `build_search_messages_filter`).
-    let events = query_relay(&state, &[build_user_search_filter(trimmed, max, page)]).await?;
+    let events = query_relay(state, &[build_user_search_filter(trimmed, max, page)]).await?;
 
     let mut response = nostr_convert::rank_user_search_results(&events, trimmed, max);
     if events.len() >= max {

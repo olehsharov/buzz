@@ -222,6 +222,14 @@ pub async fn deploy_agent_to_host<R: Runtime>(
     let owner_keys = state.signing_keys()?;
 
     let record = load_record(app, state, agent)?;
+    // An agent belongs to ONE community: deploy it only from (and to a
+    // machine of) its own community.
+    crate::relay::ensure_agent_belongs_to_relay(
+        &record.name,
+        &record.relay_url,
+        community_relay,
+        community_relay,
+    )?;
     match &record.backend {
         BackendKind::Provider { .. } => {
             return Err("Agents deployed through a provider cannot be moved to a machine.".into())
