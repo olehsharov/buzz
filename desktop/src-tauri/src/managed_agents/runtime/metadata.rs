@@ -108,20 +108,69 @@ pub(crate) fn resolve_session_title(display_name: Option<&str>, name: &str) -> O
         .find(|value| !value.is_empty())
 }
 
-/// Build the `RUST_LOG` value forwarded to the agent child: keep an existing
-/// filter that already mentions `buzz_acp`, append `buzz_acp=info` to any other
-/// non-empty filter, and default to `buzz_acp=info` when unset.
+/// The harness's own log targets, at `info`. Most harness lines use explicit
+/// targets (`pool::prompt` for turn start/stop and steering, `pool::session`,
+/// `acp::session`, `acp::tool`, `acp::cancel`, …) rather than the `buzz_acp`
+/// module path, so `buzz_acp=info` alone hid every turn, steer and cancel
+/// line. `acp::wire`/`acp::update`/`acp::thought` stay off: they are per-frame.
+const HARNESS_LOG_DIRECTIVES: &str = "buzz_acp=info,pool=info,acp::session=info,\
+acp::tool=info,acp::cancel=info,acp::init=info,acp::permission=info,turn_journal=info,\
+scope_sessions=info,stream_draft=info,engram=info";
+
+/// Build the `RUST_LOG` value forwarded to the agent child from the desktop's
+/// own `RUST_LOG`: an explicit filter that already mentions `buzz_acp` is
+/// kept as the user set it; any other non-empty filter gets the harness
+/// targets appended; unset defaults to warnings plus the harness targets.
 pub(crate) fn child_rust_log_filter() -> String {
-    match std::env::var("RUST_LOG") {
-        Ok(existing) if existing.contains("buzz_acp") => existing,
-        Ok(existing) if !existing.trim().is_empty() => format!("{existing},buzz_acp=info"),
-        _ => "buzz_acp=info".to_string(),
+    child_rust_log_filter_from(std::env::var("RUST_LOG").ok())
+}
+
+fn child_rust_log_filter_from(existing: Option<String>) -> String {
+    match existing {
+        Some(existing) if existing.contains("buzz_acp") => existing,
+        Some(existing) if !existing.trim().is_empty() => {
+            format!("{existing},{HARNESS_LOG_DIRECTIVES}")
+        }
+        _ => format!("warn,{HARNESS_LOG_DIRECTIVES}"),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_replay_floor_env, resolve_session_title, REPLAY_FLOOR_ENV_VAR};
+    use super::{
+        apply_replay_floor_env, child_rust_log_filter_from, resolve_session_title,
+        REPLAY_FLOOR_ENV_VAR,
+    };
+
+    /// The default shows the harness's turn, steer and cancel lines, which log
+    /// under `pool::*` and `acp::*` targets, not the `buzz_acp` module path.
+    /// An explicit filter that already names the harness is left alone.
+    #[test]
+    fn child_rust_log_shows_turn_steer_and_cancel_targets_by_default() {
+        let default = child_rust_log_filter_from(None);
+        for directive in [
+            "buzz_acp=info",
+            "pool=info",
+            "acp::session=info",
+            "acp::tool=info",
+            "acp::cancel=info",
+        ] {
+            assert!(
+                default.split(',').any(|d| d == directive),
+                "{directive} in {default}"
+            );
+        }
+        assert!(default.starts_with("warn,"), "{default}");
+        assert!(!default.contains("acp::wire"), "{default}");
+        assert_eq!(child_rust_log_filter_from(Some(String::new())), default);
+
+        let explicit = "buzz_acp=debug".to_string();
+        assert_eq!(child_rust_log_filter_from(Some(explicit.clone())), explicit);
+
+        let other = child_rust_log_filter_from(Some("hyper=warn".into()));
+        assert!(other.starts_with("hyper=warn,"), "{other}");
+        assert!(other.split(',').any(|d| d == "pool=info"), "{other}");
+    }
 
     fn replay_floor_of(cmd: &std::process::Command) -> Option<String> {
         cmd.get_envs()

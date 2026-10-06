@@ -321,29 +321,51 @@ async fn clean_explicit_cancel_keeps_session_for_the_next_message() {
         "a clean !cancel keeps the session"
     );
 
-    let (result_tx, mut result_rx) = mpsc::unbounded_channel();
-    run_prompt_task(
-        result.agent,
-        Some(single_event_batch(channel_id, "the next message")),
-        None,
-        Arc::clone(&ctx),
-        result_tx,
-        None,
-        "next-turn".into(),
-    )
-    .await;
-    let mut result = result_rx.recv().await.expect("prompt result");
-    assert!(matches!(
-        result.outcome,
-        PromptOutcome::Ok(StopReason::EndTurn)
-    ));
-    result.agent.acp.shutdown().await;
+    assert!(
+        result.agent.state.deliveries[&scope].background_work_cancelled,
+        "the cancel is remembered until the agent has been told"
+    );
+
+    let mut agent = result.agent;
+    for content in ["the next message", "a later message"] {
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        run_prompt_task(
+            agent,
+            Some(single_event_batch(channel_id, content)),
+            None,
+            Arc::clone(&ctx),
+            result_tx,
+            None,
+            "next-turn".into(),
+        )
+        .await;
+        let result = result_rx.recv().await.expect("prompt result");
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::EndTurn)
+        ));
+        agent = result.agent;
+    }
+    agent.acp.shutdown().await;
     let requests = captured_requests(&capture);
     let _ = std::fs::remove_file(&capture);
     assert_eq!(requests_for(&requests, "session/new").len(), 1);
     let prompts = requests_for(&requests, "session/prompt");
-    assert_eq!(prompts.len(), 2);
+    assert_eq!(prompts.len(), 3);
     assert_eq!(prompts[1]["params"]["sessionId"], "new-0");
+    // The cancel stopped the turn's background subagents: the next prompt
+    // says so plainly, once.
+    let next = prompt_request_text(prompts[1]);
+    assert!(
+        next.contains("<background-work-cancelled>")
+            && next.contains("None of them is still running"),
+        "{next}"
+    );
+    let later = prompt_request_text(prompts[2]);
+    assert!(
+        !later.contains("<background-work-cancelled>"),
+        "told once: {later}"
+    );
 }
 
 /// Every cancel outcome other than a clean `cancelled` answer to a steer,
