@@ -82,6 +82,7 @@ done"#
 fn shape(outcome: &PromptOutcome) -> String {
     match outcome {
         PromptOutcome::SessionDead(reason) => format!("SessionDead({reason})"),
+        PromptOutcome::Refused(reason) => format!("Refused({reason})"),
         PromptOutcome::Error(error) => format!("Error({error})"),
         PromptOutcome::Ok(stop) => format!("Ok({stop:?})"),
         PromptOutcome::Cancelled => "Cancelled".into(),
@@ -440,6 +441,235 @@ async fn restored_turn_resume_failure_fails_fast() {
         assert!(
             journal_records(&store).is_empty(),
             "{label}: the record is dropped"
+        );
+    }
+}
+
+/// A scope keeps its conversation when its worker goes away. After an
+/// idle-pool sleep (a brand-new worker process) or a crash/respawn (the same
+/// slot with all sessions dropped), the scope's next session resumes the
+/// session it last ran in — `session/resume` of the same id, never a
+/// `session/new`.
+#[tokio::test]
+async fn worker_loss_resumes_the_scopes_session() {
+    for label in [
+        "pool sleep (new worker process)",
+        "crash respawn (sessions dropped)",
+    ] {
+        let (acp, capture) =
+            spawn_recovery_acp(RESUME_ONLY, "none", "none", PromptReply::EndTurn).await;
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        let relay = crate::stream_draft::test_relay::FakeRelay::spawn().await;
+        let mut ctx = cancel_test_ctx(&relay, channel_id);
+        ctx.scope_sessions = crate::scope_sessions::ScopeSessions::in_memory();
+        let ctx = Arc::new(ctx);
+
+        let result = run_turn(
+            cancel_test_agent(acp),
+            single_event_batch(channel_id, "first"),
+            &ctx,
+        )
+        .await;
+        assert!(
+            matches!(result.outcome, PromptOutcome::Ok(StopReason::EndTurn)),
+            "{label}"
+        );
+        let first_session = result.agent.state.sessions[&scope].clone();
+        assert_eq!(
+            ctx.scope_sessions.session_for(&scope).as_deref(),
+            Some(first_session.as_str()),
+            "{label}: the new session is remembered"
+        );
+
+        let (next_agent, next_capture) = if label.starts_with("pool sleep") {
+            let mut old = result.agent;
+            old.acp.shutdown().await;
+            let (acp, capture) =
+                spawn_recovery_acp(RESUME_ONLY, "none", "none", PromptReply::EndTurn).await;
+            (cancel_test_agent(acp), Some(capture))
+        } else {
+            let mut agent = result.agent;
+            agent.state.invalidate_all();
+            (agent, None)
+        };
+        let mut result = run_turn(next_agent, single_event_batch(channel_id, "second"), &ctx).await;
+        assert!(
+            matches!(result.outcome, PromptOutcome::Ok(StopReason::EndTurn)),
+            "{label}"
+        );
+        assert_eq!(
+            result.agent.state.sessions[&scope], first_session,
+            "{label}"
+        );
+        result.agent.acp.shutdown().await;
+
+        let second_capture = next_capture.as_ref().unwrap_or(&capture);
+        let requests = captured_requests(second_capture);
+        let resumes = requests_for(&requests, "session/resume");
+        assert_eq!(resumes.len(), 1, "{label}");
+        assert_eq!(
+            resumes[0]["params"]["sessionId"],
+            first_session.as_str(),
+            "{label}"
+        );
+        assert_eq!(
+            requests_for(&captured_requests(&capture), "session/new").len(),
+            1,
+            "{label}: only the very first turn created a session"
+        );
+        if let Some(path) = next_capture {
+            assert!(requests_for(&requests, "session/new").is_empty(), "{label}");
+            let _ = std::fs::remove_file(path);
+        }
+        let _ = std::fs::remove_file(&capture);
+    }
+}
+
+/// A remembered session is not resumed while another live worker may still
+/// hold it (two holders would race on its transcript), nor by an agent that
+/// cannot resume; both start a new session as before.
+#[tokio::test]
+async fn remembered_session_is_not_resumed_when_held_elsewhere_or_unsupported() {
+    for (label, caps, held) in [
+        ("held elsewhere", RESUME_ONLY, true),
+        ("no resume capability", "{}", false),
+    ] {
+        let (acp, capture) = spawn_recovery_acp(caps, "none", "none", PromptReply::EndTurn).await;
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        let relay = crate::stream_draft::test_relay::FakeRelay::spawn().await;
+        let mut ctx = cancel_test_ctx(&relay, channel_id);
+        ctx.scope_sessions = crate::scope_sessions::ScopeSessions::in_memory();
+        ctx.scope_sessions.record(&scope, "old-session").unwrap();
+        ctx.scope_sessions.set_held_elsewhere(&scope, held);
+        let ctx = Arc::new(ctx);
+
+        let mut result = run_turn(
+            cancel_test_agent(acp),
+            single_event_batch(channel_id, "hi"),
+            &ctx,
+        )
+        .await;
+        assert!(
+            matches!(result.outcome, PromptOutcome::Ok(StopReason::EndTurn)),
+            "{label}"
+        );
+        result.agent.acp.shutdown().await;
+        let requests = captured_requests(&capture);
+        let _ = std::fs::remove_file(&capture);
+        assert!(
+            requests_for(&requests, "session/resume").is_empty(),
+            "{label}"
+        );
+        assert_eq!(requests_for(&requests, "session/new").len(), 1, "{label}");
+    }
+}
+
+/// A remembered session that can no longer be resumed fails fast: the scope
+/// is dead, nothing silently starts over.
+#[tokio::test]
+async fn remembered_session_resume_failure_fails_fast() {
+    let (acp, capture) =
+        spawn_recovery_acp(RESUME_ONLY, "none", "gone-session", PromptReply::EndTurn).await;
+    let channel_id = Uuid::new_v4();
+    let scope = conv(channel_id);
+    let relay = crate::stream_draft::test_relay::FakeRelay::spawn().await;
+    let mut ctx = cancel_test_ctx(&relay, channel_id);
+    ctx.scope_sessions = crate::scope_sessions::ScopeSessions::in_memory();
+    ctx.scope_sessions.record(&scope, "gone-session").unwrap();
+    let ctx = Arc::new(ctx);
+
+    let mut result = run_turn(
+        cancel_test_agent(acp),
+        single_event_batch(channel_id, "hi"),
+        &ctx,
+    )
+    .await;
+    assert!(
+        matches!(&result.outcome, PromptOutcome::SessionDead(r) if r.contains("gone-session")),
+        "{}",
+        shape(&result.outcome)
+    );
+    result.agent.acp.shutdown().await;
+    let requests = captured_requests(&capture);
+    let _ = std::fs::remove_file(&capture);
+    assert!(
+        requests_for(&requests, "session/new").is_empty(),
+        "no silent new session"
+    );
+    assert!(requests_for(&requests, "session/prompt").is_empty());
+    assert!(ctx.dead_sessions.reason(&scope).is_some());
+}
+
+/// The harness refuses a turn it cannot make durable — an unwritable restart
+/// journal, or a scope-session map it cannot save — before the prompt reaches
+/// the agent, handing the batch back to be dead-lettered with the reason.
+#[tokio::test]
+async fn unwritable_durable_records_refuse_the_turn() {
+    for label in ["restart journal", "scope-session map"] {
+        let (acp, capture) =
+            spawn_recovery_acp(RESUME_ONLY, "none", "none", PromptReply::EndTurn).await;
+        let mut agent = cancel_test_agent(acp);
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        let relay = crate::stream_draft::test_relay::FakeRelay::spawn().await;
+        let state = tempfile::tempdir().expect("state dir");
+        // A regular file where the state root's directories must go: every
+        // directory create under it fails.
+        let blocked_root = state.path().join("not-a-directory");
+        std::fs::write(&blocked_root, b"").unwrap();
+        let mut ctx = cancel_test_ctx(&relay, channel_id);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        if label == "restart journal" {
+            agent.state.sessions.insert(scope.clone(), "live-1".into());
+            ctx.turn_journal = TurnJournal::new(
+                TurnJournalStore::new(&blocked_root, "agent-hex"),
+                shutdown_rx,
+            );
+        } else {
+            let store =
+                crate::scope_sessions::ScopeSessionStore::new(state.path(), "agent-hex", &ctx.cwd);
+            ctx.scope_sessions =
+                crate::scope_sessions::ScopeSessions::load(store, &ctx.cwd).expect("empty map");
+            // The map's directory can no longer be created.
+            std::fs::write(state.path().join("scope-sessions"), b"").unwrap();
+        }
+        let ctx = Arc::new(ctx);
+
+        let mut result = run_turn(agent, single_event_batch(channel_id, "hi"), &ctx).await;
+        let PromptOutcome::Refused(reason) = &result.outcome else {
+            panic!("{label}: expected Refused, got {}", shape(&result.outcome));
+        };
+        let culprit = if label == "restart journal" {
+            "not-a-directory"
+        } else {
+            "scope-sessions"
+        };
+        assert!(
+            reason.contains(culprit),
+            "{label}: names the io error: {reason}"
+        );
+        if label == "restart journal" {
+            assert!(
+                reason.starts_with("couldn't save restart record:"),
+                "{reason}"
+            );
+        }
+        assert!(
+            result.batch.is_some(),
+            "{label}: the batch comes back to be dead-lettered"
+        );
+        assert!(
+            ctx.dead_sessions.reason(&scope).is_none(),
+            "{label}: not a dead session"
+        );
+        result.agent.acp.shutdown().await;
+        let requests = captured_requests(&capture);
+        let _ = std::fs::remove_file(&capture);
+        assert!(
+            requests_for(&requests, "session/prompt").is_empty(),
+            "{label}: the turn never reached the agent"
         );
     }
 }

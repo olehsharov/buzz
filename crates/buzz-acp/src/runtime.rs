@@ -131,6 +131,7 @@ fn make_prompt_context(
         // Conversation mode attaches the store and shutdown signal; isolated
         // tasks never journal.
         turn_journal: crate::turn_journal::TurnJournal::default(),
+        scope_sessions: crate::scope_sessions::ScopeSessions::default(),
         // Needs the live relay publisher; conversation startup attaches it.
         // Isolated tasks never stream.
         stream: None,

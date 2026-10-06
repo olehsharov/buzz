@@ -300,28 +300,25 @@ impl TurnJournal {
             .is_some_and(|rx| rx.has_changed().unwrap_or(true))
     }
 
-    /// Record the turn about to be prompted. A write failure is logged and the
-    /// turn proceeds unjournaled: the in-memory queue stays authoritative for
-    /// a running harness, and refusing the turn over a full disk would turn a
-    /// crash-safety net into an outage.
-    pub fn begin(&self, batch: &FlushBatch, session_id: &str, cwd: &str) -> TurnJournalGuard {
+    /// Record the turn about to be prompted. A write failure is returned: the
+    /// caller refuses the turn visibly rather than run it without a record a
+    /// restart could resume from.
+    pub fn begin(
+        &self,
+        batch: &FlushBatch,
+        session_id: &str,
+        cwd: &str,
+    ) -> io::Result<TurnJournalGuard> {
         let Some(store) = &self.store else {
-            return TurnJournalGuard::disarmed();
+            return Ok(TurnJournalGuard::disarmed());
         };
         let record = TurnRecord::for_turn(batch, session_id, cwd, now_unix());
-        if let Err(error) = store.save(&record) {
-            tracing::error!(
-                target: "turn_journal",
-                scope = %batch.scope.telemetry_label(),
-                "could not journal the turn; it will not resume after a restart: {error}"
-            );
-            return TurnJournalGuard::disarmed();
-        }
-        TurnJournalGuard {
+        store.save(&record)?;
+        Ok(TurnJournalGuard {
             journal: Some(self.clone()),
             scope: Some(batch.scope.clone()),
             completed: false,
-        }
+        })
     }
 
     /// Remove `scope`'s record and its pending restart, logging failures.
@@ -695,7 +692,7 @@ mod tests {
             let (tx, rx) = tokio::sync::watch::channel(());
             let journal = TurnJournal::new(store.clone(), rx);
             let b = batch(thread(), None);
-            let mut guard = journal.begin(&b, "s", "/w");
+            let mut guard = journal.begin(&b, "s", "/w").expect("journal written");
             assert_eq!(store.load_all().unwrap().len(), 1, "{label}: written");
             if shutting_down {
                 tx.send(()).unwrap();

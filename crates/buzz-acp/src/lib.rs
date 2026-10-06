@@ -23,6 +23,7 @@ mod run_task;
 mod runtime;
 use runtime::{AgentRuntime, PoolStartup, SessionMode};
 mod scope;
+mod scope_sessions;
 mod setup_mode;
 mod stream_draft;
 mod turn_journal;
@@ -2869,6 +2870,31 @@ async fn run_harness(
              by a restart will not resume"
         ),
     }
+    match resume_store::state_root_from_env(|key| std::env::var_os(key)) {
+        Some(root) => {
+            let store =
+                scope_sessions::ScopeSessionStore::new(&root, &pubkey_hex, &prompt_context.cwd);
+            match scope_sessions::ScopeSessions::load(store.clone(), &prompt_context.cwd) {
+                Ok(map) => {
+                    tracing::info!(
+                        "scope-session map {} (conversations resume across worker restarts)",
+                        store.path().display()
+                    );
+                    prompt_context.scope_sessions = map;
+                }
+                Err(error) => {
+                    // Starting with an empty map would silently start every
+                    // conversation over. Keep the evidence and refuse to start.
+                    anyhow::bail!(
+                        "{error} — move it aside to start with no remembered conversations"
+                    );
+                }
+            }
+        }
+        None => tracing::warn!(
+            "no state directory: conversations will not resume after a worker restart"
+        ),
+    }
     let ctx = Arc::new(prompt_context);
     // Turns a previous run could not finish re-run once, in their own
     // sessions. Their events are skipped if the relay replays them.
@@ -3345,6 +3371,7 @@ async fn run_harness(
                                     // complete normally (the relay may reject actions if
                                     // the agent lost access).
                                     let drained_ids = queue.drain_channel(ch);
+                                    ctx.scope_sessions.forget_channel(ch);
                                     let invalidated = if pool_ready {
                                         pool.invalidate_channel_sessions(ch)
                                     } else {
@@ -3500,6 +3527,7 @@ async fn run_harness(
                                     // session: a resume binding on this scope
                                     // must not re-apply the fork.
                                     ctx.resume_session.release(&scope);
+                                    ctx.scope_sessions.forget(&scope);
                                     // `!rotate` is the one way out of a dead
                                     // session: the next message starts fresh.
                                     if ctx.dead_sessions.clear(&scope) {
@@ -4928,6 +4956,10 @@ fn dispatch_pending(
         // Assign ownership before moving the worker into the task. If this is
         // a bounded-hold fork, the new generation immediately invalidates the
         // prior busy worker's copy when that worker eventually returns.
+        // Before ownership moves: may the scope's previous worker still hold
+        // its session live? Only then must this worker not resume it.
+        ctx.scope_sessions
+            .set_held_elsewhere(&scope, pool.scope_held_by_other_worker(&scope, agent.index));
         let owner_generation = pool.record_scope_owner(scope.clone(), agent.index);
         agent
             .state
@@ -5179,14 +5211,17 @@ fn handle_prompt_result(
         // Don't requeue batches for channels the agent was removed from —
         // those events are stale and should be silently dropped.
         if !removed_channels.contains(&batch.channel_id) {
-            if let PromptOutcome::SessionDead(reason) = &result.outcome {
-                // Fail fast: retrying cannot revive the session and must not
-                // burn the retry budget against it. Post the full reason in
-                // the thread; the scope stays dead until `!rotate`.
+            if let PromptOutcome::SessionDead(reason) | PromptOutcome::Refused(reason) =
+                &result.outcome
+            {
+                // Fail fast: retrying cannot revive a dead session or fix the
+                // durable record that refused the turn, and must not burn the
+                // retry budget. Post the full reason in the thread; a dead
+                // scope stays dead until `!rotate`.
                 tracing::error!(
                     channel_id = %batch.channel_id,
                     events = batch.events.len(),
-                    "dead-lettering batch immediately — provider session is gone: {reason}"
+                    "dead-lettering batch immediately: {reason}"
                 );
                 spawn_failure_notice(
                     rest_client,
@@ -5332,6 +5367,7 @@ fn handle_prompt_result(
         PromptOutcome::Cancelled => "cancelled",
         PromptOutcome::CancelDrainTimeout(_) => "cancel_drain_timeout",
         PromptOutcome::SessionDead(_) => "session_dead",
+        PromptOutcome::Refused(_) => "refused",
     };
     let agent_index = result.agent.index;
     // Capture the spawn-time configured model and our PID before the agent is
@@ -5487,12 +5523,12 @@ fn handle_prompt_result(
         }
         // The scope's provider session is gone. The agent process is fine;
         // the batch was dead-lettered with a notice above.
-        PromptOutcome::SessionDead(reason) => {
+        PromptOutcome::SessionDead(reason) | PromptOutcome::Refused(reason) => {
             tracing::error!(
                 agent = agent_index,
                 outcome = outcome_label,
                 reason,
-                "agent_returned (provider session gone — scope fails until !rotate)"
+                "agent_returned (turn failed fast — batch dead-lettered)"
             );
             emit_turn_error(&reason, None);
             pool.return_agent(result.agent);
@@ -11992,6 +12028,29 @@ mod error_outcome_emission_tests {
     /// exactly one `turn_error` with it.
     #[tokio::test]
     async fn session_dead_dead_letters_with_the_reason_and_one_turn_error() {
+        let reason = "my session s-1 for this conversation is gone (code -32603): Internal error: Session not found";
+        fail_fast_outcome_dead_letters(
+            PromptOutcome::SessionDead(reason.into()),
+            reason,
+            "session_dead",
+        )
+        .await;
+    }
+
+    /// A turn refused for an unwritable durable record is dead-lettered the
+    /// same way, with the io error in the thread.
+    #[tokio::test]
+    async fn refused_turn_dead_letters_with_the_reason_and_one_turn_error() {
+        let reason = "couldn't save restart record: failed to create turn-journal record /x: Not a directory";
+        fail_fast_outcome_dead_letters(PromptOutcome::Refused(reason.into()), reason, "refused")
+            .await;
+    }
+
+    async fn fail_fast_outcome_dead_letters(
+        outcome: PromptOutcome,
+        reason: &str,
+        outcome_label: &str,
+    ) {
         let relay = crate::stream_draft::test_relay::FakeRelay::spawn().await;
         let rest = relay.rest(&Keys::generate());
         let channel_id = uuid::Uuid::new_v4();
@@ -12039,12 +12098,11 @@ mod error_outcome_emission_tests {
         let (respawn_tx, _respawn_rx) = mpsc::channel(8);
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let observer = ObserverHandle::in_process();
-        let reason = "my session s-1 for this conversation is gone (code -32603): Internal error: Session not found";
         let result = PromptResult {
             agent,
             source: PromptSource::Channel(scope),
             turn_id: "test-turn-id".to_string(),
-            outcome: PromptOutcome::SessionDead(reason.to_string()),
+            outcome,
             batch: Some(batch),
         };
         handle_prompt_result(
@@ -12070,7 +12128,7 @@ mod error_outcome_emission_tests {
             .collect();
         assert_eq!(turn_errors.len(), 1);
         assert_eq!(turn_errors[0].payload["error"], reason);
-        assert_eq!(turn_errors[0].payload["outcome"], "session_dead");
+        assert_eq!(turn_errors[0].payload["outcome"], outcome_label);
         let posted = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let posted = relay.posted_messages();

@@ -461,13 +461,15 @@ done"#;
     let state = tempfile::tempdir().expect("state dir");
     let mut ctx = cancel_test_ctx(&relay, channel_id);
     ctx.max_turns_per_session = 1;
+    ctx.scope_sessions = crate::scope_sessions::ScopeSessions::in_memory();
+    ctx.scope_sessions.record(&scope, "fork-1").unwrap();
     ctx.resume_session = ResumeSessionSlot::new(Some(PendingResume {
         source: "src-1".into(),
         store: crate::resume_store::ResumeForkStore::new(state.path(), "agent-hex"),
     }));
     let claim = ctx
         .resume_session
-        .claim(&scope, agent.index)
+        .claim(&scope, agent.index, false)
         .expect("claims the pending resume");
     ctx.resume_session.settle(claim, &scope, agent.index, true);
     assert!(ctx.resume_session.bound_owner().is_some());
@@ -498,6 +500,11 @@ done"#;
         None,
         "a deliberate rotation releases the binding"
     );
-    assert!(ctx.resume_session.claim(&scope, 0).is_none());
+    assert!(ctx.resume_session.claim(&scope, 0, false).is_none());
+    assert_eq!(
+        ctx.scope_sessions.session_for(&scope),
+        None,
+        "a deliberate rotation forgets the scope's session"
+    );
     result.agent.acp.shutdown().await;
 }

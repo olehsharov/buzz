@@ -738,6 +738,12 @@ pub enum PromptOutcome {
     /// every later message for the scope fails the same way until the owner
     /// sends `!rotate`. See [`DeadSessions`].
     SessionDead(String),
+    /// The turn was refused before reaching the agent because the harness
+    /// could not durably record what it needs to keep the conversation (the
+    /// restart journal or the scope-session map). The batch is dead-lettered
+    /// with this reason in its thread — running without the record would lose
+    /// the turn or the conversation silently on the next restart.
+    Refused(String),
 }
 
 /// Scopes whose provider session is gone, with the reason shown to the user.
@@ -1048,6 +1054,8 @@ pub struct PromptContext {
     pub dead_sessions: DeadSessions,
     /// Durable journal of turns in flight, resumed after a restart.
     pub turn_journal: crate::turn_journal::TurnJournal,
+    /// Durable scope → provider-session map; see [`crate::scope_sessions`].
+    pub scope_sessions: crate::scope_sessions::ScopeSessions,
     /// Live reply streaming (NIP-SD drafts). `None` when `--stream off` or
     /// for isolated tasks.
     pub stream: Option<crate::stream_draft::StreamRuntime>,
@@ -1245,6 +1253,28 @@ impl AgentPool {
         mut has_pending_work: impl FnMut(&SessionScope) -> bool,
     ) {
         self.held_since.retain(|scope, _| has_pending_work(scope));
+    }
+
+    /// Whether a worker other than `agent_index` may still hold `scope`'s
+    /// provider session live: the scope's recorded owner is another worker
+    /// that is checked out (busy), or idle with a session for the scope. A
+    /// worker that was torn down (idle-pool sleep), crashed or respawned holds
+    /// nothing, so the scope's session may be resumed elsewhere.
+    pub fn scope_held_by_other_worker(&self, scope: &SessionScope, agent_index: usize) -> bool {
+        let Some(owner) = self.session_owners.get(scope) else {
+            return false;
+        };
+        if owner.agent_index == agent_index {
+            return false;
+        }
+        self.task_map
+            .values()
+            .any(|meta| meta.agent_index == owner.agent_index)
+            || self
+                .agents
+                .get(owner.agent_index)
+                .and_then(Option::as_ref)
+                .is_some_and(|agent| agent.state.sessions.contains_key(scope))
     }
 
     /// Whether any idle agent already has a session for `scope`.
@@ -1767,13 +1797,26 @@ impl ResumeSessionSlot {
     }
 
     /// The continuation `agent_index` must use for a new session of `scope`,
-    /// if any: the bound one for the owning `(scope, worker)`, else the
-    /// unclaimed one.
-    fn claim(&self, scope: &SessionScope, agent_index: usize) -> Option<ResumeClaim> {
+    /// if any: the bound one for the owning scope, else the unclaimed one.
+    ///
+    /// The binding follows its scope to a new worker once no other live
+    /// worker holds the fork (`held_elsewhere` is false): after an idle-pool
+    /// sleep, a crash or a respawn the old worker is gone, and whichever
+    /// worker runs the scope next continues the fork. While another live
+    /// worker may hold it, a second worker never resumes it.
+    fn claim(
+        &self,
+        scope: &SessionScope,
+        agent_index: usize,
+        held_elsewhere: bool,
+    ) -> Option<ResumeClaim> {
         let mut state = self.lock();
-        if let Some(bound) = &state.bound {
-            return (bound.scope == *scope && bound.agent_index == agent_index)
-                .then(|| ResumeClaim::Rebind(bound.pending.clone()));
+        if let Some(bound) = state.bound.as_mut() {
+            if bound.scope != *scope || (bound.agent_index != agent_index && held_elsewhere) {
+                return None;
+            }
+            bound.agent_index = agent_index;
+            return Some(ResumeClaim::Rebind(bound.pending.clone()));
         }
         if state.reserved.as_ref().is_some_and(|r| r != scope) {
             return None;
@@ -1822,6 +1865,14 @@ impl ResumeSessionSlot {
         } else if state.pending.is_none() && state.bound.is_none() {
             state.pending = Some(pending);
         }
+    }
+
+    /// Whether `scope` owns the binding (its sessions continue the fork).
+    pub(crate) fn is_bound_to(&self, scope: &SessionScope) -> bool {
+        self.lock()
+            .bound
+            .as_ref()
+            .is_some_and(|b| b.scope == *scope)
     }
 
     /// Drop the binding if `scope` owns it: the scope's session is being
@@ -1953,6 +2004,36 @@ async fn continue_provider_session(
     Ok(resp)
 }
 
+/// The provider session a new session for `scope` must resume instead of
+/// starting fresh: a turn restored from the journal first, else the session
+/// the scope last ran in (from the durable scope map) when the adapter can
+/// resume and no other live worker may still hold it. `None` means a genuinely
+/// new conversation.
+fn session_to_resume(
+    ctx: &PromptContext,
+    agent: &OwnedAgent,
+    scope: &SessionScope,
+) -> Option<String> {
+    if let Some(restored) = ctx.turn_journal.restart_session(scope) {
+        return Some(restored);
+    }
+    if ctx.scope_sessions.held_elsewhere(scope) {
+        return None;
+    }
+    let known = ctx.scope_sessions.session_for(scope)?;
+    if !agent.acp.resume_supported() {
+        tracing::warn!(
+            target: "pool::session",
+            scope = %scope.telemetry_label(),
+            "agent {:?} cannot resume sessions; scope {} starts a new session instead of {known}",
+            agent.agent_name,
+            scope.telemetry_label()
+        );
+        return None;
+    }
+    Some(known)
+}
+
 async fn create_session_and_apply_model(
     agent: &mut OwnedAgent,
     ctx: &PromptContext,
@@ -2006,9 +2087,14 @@ async fn create_session_and_apply_model(
     );
     // Only channel/DM sessions continue a configured provider session;
     // heartbeat and isolated-task sessions always start fresh.
-    let resume_claim = channel
-        .scope
-        .and_then(|scope| Some((scope, ctx.resume_session.claim(scope, agent.index)?)));
+    let resume_claim = channel.scope.and_then(|scope| {
+        let held_elsewhere = ctx.scope_sessions.held_elsewhere(scope);
+        Some((
+            scope,
+            ctx.resume_session
+                .claim(scope, agent.index, held_elsewhere)?,
+        ))
+    });
     let resp = match resume_claim {
         Some((scope, claim)) => {
             if matches!(claim, ResumeClaim::Rebind(_)) {
@@ -2034,27 +2120,29 @@ async fn create_session_and_apply_model(
         }
         None => match channel
             .scope
-            .and_then(|scope| ctx.turn_journal.restart_session(scope))
+            .and_then(|scope| session_to_resume(ctx, agent, scope))
         {
-            // A turn restored from the journal continues in the session it
-            // ran in. Never falls back to a new session: the caller fails the
-            // scope fast if this errors.
-            Some(restored) => {
+            // The scope already has a provider session (a turn restored from
+            // the journal, or the session its last worker held): continue it.
+            // Never falls back to a new session — the caller fails the scope
+            // fast if this errors.
+            Some(known) => {
                 if !agent.acp.resume_supported() {
                     return Err(AcpError::Protocol(format!(
-                        "cannot resume session {restored} after a restart: agent {:?} does \
-                         not advertise sessionCapabilities.resume",
+                        "cannot resume session {known}: agent {:?} does not advertise \
+                         sessionCapabilities.resume",
                         agent.agent_name
                     )));
                 }
                 tracing::info!(
                     target: "pool::session",
-                    "resuming session {restored} for a turn interrupted by a restart"
+                    "resuming session {known} for scope {}",
+                    channel.scope.map(SessionScope::telemetry_label).unwrap_or_default()
                 );
                 agent
                     .acp
                     .session_resume_full(
-                        &restored,
+                        &known,
                         &ctx.cwd,
                         mcp_servers,
                         system_prompt,
@@ -3120,6 +3208,20 @@ pub async fn run_prompt_task(
             if let Some(sid) = agent.state.sessions.get(scope) {
                 (sid.clone(), false)
             } else {
+                // Whether this creation continues a session the scope already
+                // had (restored turn, remembered session, or bound fork). If
+                // that fails the scope fails fast — never a retry that would
+                // end in a new session.
+                let resumed: Option<String> =
+                    session_to_resume(&ctx, &agent, scope).or_else(|| {
+                        (ctx.resume_session.is_bound_to(scope)
+                            && !ctx.scope_sessions.held_elsewhere(scope))
+                        .then(|| {
+                            ctx.scope_sessions
+                                .session_for(scope)
+                                .unwrap_or_else(|| "(its recorded fork)".to_string())
+                        })
+                    });
                 // The title includes channel and, for thread sessions, the
                 // canonical root prefix so sibling sessions are distinguishable.
                 // DMs, unresolved, and unnamed channels omit the channel name.
@@ -3143,6 +3245,29 @@ pub async fn run_prompt_task(
                             "created session {sid} for channel {cid} (scope {})",
                             scope.telemetry_label()
                         );
+                        // Remember the scope's session so the next worker
+                        // resumes it. Without the record a pool sleep or a
+                        // restart would start the scope over unseen, so a
+                        // failed write refuses the turn visibly.
+                        if let Err(error) = ctx.scope_sessions.record(scope, &sid) {
+                            tracing::error!(
+                                target: "pool::session",
+                                scope = %scope.telemetry_label(),
+                                session_id = %sid,
+                                "{error}"
+                            );
+                            send_prompt_result(
+                                &result_tx,
+                                &turn_id,
+                                agent,
+                                source,
+                                PromptOutcome::Refused(format!(
+                                    "couldn't save which session this conversation uses: {error}"
+                                )),
+                                batch,
+                            );
+                            return;
+                        }
                         agent.state.sessions.insert(scope.clone(), sid.clone());
                         ctx.turn_journal.finish_restart(scope);
                         agent
@@ -3170,12 +3295,12 @@ pub async fn run_prompt_task(
                         );
                         return;
                     }
-                    Err(e) if ctx.turn_journal.restart_session(scope).is_some() => {
-                        // Resuming a restored turn's session failed. Same rule
+                    Err(e) if resumed.is_some() => {
+                        // Resuming the scope's known session failed. Same rule
                         // as a dead session: fail fast and visibly, never a
                         // new session in its place.
-                        let restored = ctx.turn_journal.restart_session(scope).unwrap_or_default();
-                        let reason = mark_session_dead(&mut agent, &ctx, scope, &restored, &e);
+                        let known = resumed.clone().unwrap_or_default();
+                        let reason = mark_session_dead(&mut agent, &ctx, scope, &known, &e);
                         send_prompt_result(
                             &result_tx,
                             &turn_id,
@@ -3698,9 +3823,31 @@ pub async fn run_prompt_task(
     // shuts down (or dies) before the turn completes can resume it in this
     // same session on its next start. The guard removes the record when the
     // turn ends, except when the harness is shutting down mid-turn.
-    let mut turn_journal = match (&source, &batch) {
+    //
+    // No record, no turn: running it unjournaled could lose it to a restart
+    // unseen, so a failed write refuses the turn with the reason in its thread.
+    let journaled = match (&source, &batch) {
         (PromptSource::Channel(_), Some(b)) => ctx.turn_journal.begin(b, &session_id, &ctx.cwd),
-        _ => crate::turn_journal::TurnJournalGuard::disarmed(),
+        _ => Ok(crate::turn_journal::TurnJournalGuard::disarmed()),
+    };
+    let mut turn_journal = match journaled {
+        Ok(guard) => guard,
+        Err(error) => {
+            tracing::error!(
+                target: "turn_journal",
+                "refusing turn for {}: couldn't save restart record: {error}",
+                prompt_label(&source)
+            );
+            send_prompt_result(
+                &result_tx,
+                &turn_id,
+                agent,
+                source,
+                PromptOutcome::Refused(format!("couldn't save restart record: {error}")),
+                batch,
+            );
+            return;
+        }
     };
 
     // When control_rx is Some (channel tasks), wrap the prompt in select! so
@@ -4020,6 +4167,7 @@ pub async fn run_prompt_task(
                 agent.state.invalidate(&source);
                 if let PromptSource::Channel(scope) = &source {
                     ctx.resume_session.release(scope);
+                    ctx.scope_sessions.forget(scope);
                 }
             }
 
@@ -9286,6 +9434,56 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         agent
     }
 
+    /// A scope's session counts as held by another worker only while its
+    /// recorded owner is a different worker that is busy, or idle with the
+    /// session. After a pool sleep (no owners), a respawn (owner slot empty or
+    /// without the session) or on the owner itself, the session may be
+    /// resumed.
+    #[tokio::test]
+    async fn scope_held_by_other_worker_tracks_live_holders_only() {
+        let scope = SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+        let other = SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+
+        // Fresh pool, as after an idle-pool sleep: nobody holds anything.
+        let mut pool = AgentPool::from_slots(vec![None, None]);
+        assert!(!pool.scope_held_by_other_worker(&scope, 1));
+
+        pool.record_scope_owner(scope.clone(), 0);
+        assert!(
+            !pool.scope_held_by_other_worker(&scope, 0),
+            "the owner itself"
+        );
+        assert!(
+            !pool.scope_held_by_other_worker(&scope, 1),
+            "owner slot empty (crashed / respawning)"
+        );
+
+        mark_agent_busy(&mut pool, 0, other.clone());
+        assert!(pool.scope_held_by_other_worker(&scope, 1), "owner busy");
+
+        let mut pool = AgentPool::from_slots(vec![
+            Some(idle_agent_with_session(0, scope.clone()).await),
+            None,
+        ]);
+        pool.record_scope_owner(scope.clone(), 0);
+        assert!(
+            pool.scope_held_by_other_worker(&scope, 1),
+            "owner idle with it"
+        );
+
+        let mut pool =
+            AgentPool::from_slots(vec![Some(idle_agent_with_session(0, other).await), None]);
+        pool.record_scope_owner(scope.clone(), 0);
+        assert!(
+            !pool.scope_held_by_other_worker(&scope, 1),
+            "owner respawned without the session"
+        );
+    }
+
     // `hold_decision` is gated on the scope variant (not session policy),
     // short-circuits when an idle worker already holds the session or no busy
     // owner is recorded, and only a busy `Thread` owner holds — for a bounded
@@ -9846,6 +10044,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             PromptOutcome::ProjectContextIndeterminate(_) => "ProjectContextIndeterminate",
             PromptOutcome::Cancelled => "Cancelled",
             PromptOutcome::SessionDead(_) => "SessionDead",
+            PromptOutcome::Refused(_) => "Refused",
             PromptOutcome::Ok(_) => "Ok",
         };
         assert_eq!(
@@ -11079,6 +11278,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             resume_session: ResumeSessionSlot::default(),
             dead_sessions: DeadSessions::default(),
             turn_journal: crate::turn_journal::TurnJournal::default(),
+            scope_sessions: crate::scope_sessions::ScopeSessions::default(),
             stream: None,
         }
     }
@@ -12464,7 +12664,8 @@ done"#
     /// The scope that consumed the resume owns it: when its session is lost
     /// (invalidated for a failure), the next session for that scope on that
     /// worker continues the recorded fork again — no new fork, no fresh
-    /// session. Other scopes, and the same scope on another worker, stay fresh.
+    /// session. Other scopes stay fresh; another worker takes the binding over
+    /// only once the old worker can no longer hold the fork.
     #[tokio::test]
     async fn resume_binding_reapplies_recorded_fork_after_owner_scope_loses_session() {
         let (mut agent, observer) = spawn_resume_agent(RESUME_CAPS, FORK_OK).await;
@@ -12505,13 +12706,32 @@ done"#
             .expect("an unbound scope starts fresh");
         assert!(sid.starts_with("new-"), "unbound scope got {sid}");
 
+        // While its old worker may still hold the fork live, another worker
+        // must not resume it a second time.
         agent.index = 1;
+        ctx.scope_sessions.set_held_elsewhere(&bound, true);
         let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&bound))
             .await
             .expect("another worker starts the bound scope fresh");
         assert!(sid.starts_with("new-"), "other worker got {sid}");
         assert_eq!(acp_writes(&observer, "session/fork"), 1);
         assert_eq!(acp_writes(&observer, "session/resume"), 2);
+        assert_eq!(ctx.resume_session.bound_owner(), Some((bound.clone(), 0)));
+
+        // Once the old worker is gone (pool sleep, crash, respawn), the
+        // binding moves to whichever worker runs the scope next.
+        ctx.scope_sessions.set_held_elsewhere(&bound, false);
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&bound))
+            .await
+            .expect("the new worker continues the fork");
+        assert_eq!(sid, "fork-1");
+        assert_eq!(
+            acp_writes(&observer, "session/fork"),
+            1,
+            "never forks twice"
+        );
+        assert_eq!(acp_writes(&observer, "session/resume"), 3);
+        assert_eq!(ctx.resume_session.bound_owner(), Some((bound.clone(), 1)));
     }
 
     /// A bound scope re-applied in a respawned process (same worker): a
@@ -12592,18 +12812,21 @@ done"#
         assert!(!slot
             .reserve_for_restored(&restored, "some-other-session", &ctx.cwd)
             .expect("readable"));
-        assert!(slot.claim(&other, 0).is_some(), "unreserved: anyone claims");
+        assert!(
+            slot.claim(&other, 0, false).is_some(),
+            "unreserved: anyone claims"
+        );
 
         let slot = pending_slot("src-1", state.path());
         assert!(slot
             .reserve_for_restored(&restored, "fork-1", &ctx.cwd)
             .expect("readable"));
         assert!(
-            slot.claim(&other, 0).is_none(),
+            slot.claim(&other, 0, false).is_none(),
             "another scope cannot claim"
         );
         assert!(matches!(
-            slot.claim(&restored, 0),
+            slot.claim(&restored, 0, false),
             Some(ResumeClaim::First(_))
         ));
     }
