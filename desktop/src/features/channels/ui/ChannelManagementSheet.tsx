@@ -25,6 +25,7 @@ import { canvasIngressOpen } from "./canvasIngress";
 import { compareMembersByRole } from "@/features/channels/lib/memberUtils";
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import { useChannelWorkflowsQuery } from "@/features/workflows/hooks";
+import { isCommunityWindow } from "@/shared/lib/windowKind";
 import { DEFAULT_EPHEMERAL_TTL_SECONDS } from "@/features/channels/lib/ephemeralChannel";
 import type { Channel, ChannelMember, Workflow } from "@/shared/api/types";
 import { useWorkflowEditorOverlay } from "@/shared/context/WorkflowEditorOverlayContext";
@@ -119,7 +120,9 @@ export function ChannelManagementSheet({
     !isSplitLayout,
   );
   const channelId = channel?.id ?? null;
-  const workflowsEnabled = useFeatureEnabled("workflows");
+  // Workflows are main-window surfaces: a community window does not offer them.
+  const workflowsEnabled =
+    useFeatureEnabled("workflows") && !isCommunityWindow();
   const detailsQuery = useChannelDetailsQuery(channelId, open);
   const membersQuery = useChannelMembersQuery(channelId, open);
   const canvasQuery = useCanvasQuery(channelId, channelId !== null && open);

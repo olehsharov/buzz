@@ -124,6 +124,10 @@ import { isMainWindowOnlyPath } from "@/features/community-window/communityWindo
 import { MainWindowOnlyState } from "@/features/community-window/ui/MainWindowOnlyState";
 const EMPTY_CHANNELS: Channel[] = [];
 const EMPTY_COMMUNITIES: never[] = [];
+async function skipTemplateAgents(
+  _templateId: string | undefined,
+  _channelId: string,
+): Promise<void> {}
 export function AppShell() {
   useWebviewZoomShortcuts();
   useTauriWindowDrag();
@@ -553,7 +557,12 @@ export function AppShell() {
 
   const createChannelMutation = useCreateChannelMutation(),
     createForumMutation = useCreateChannelMutation();
-  const { applyCanvas, applyAgents } = useApplyTemplate();
+  const { applyCanvas, applyAgents: applyTemplateAgents } = useApplyTemplate();
+  // Template agents are managed agents, which belong to the main window: a
+  // community window applies a template's canvas but starts no agents.
+  const applyAgents = isCommunityWindowShell
+    ? skipTemplateAgents
+    : applyTemplateAgents;
   const openDmMutation = useOpenDmMutation();
   const hideDmMutation = useHideDmMutation();
   useDmResurfaceFromMessages({
