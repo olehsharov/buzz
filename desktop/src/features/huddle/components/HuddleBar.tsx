@@ -30,6 +30,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 import { useHuddle, useHuddleLevels } from "../HuddleContext";
 import { useHuddleParticipantRoster } from "../hooks/useHuddleParticipantRoster";
 import { AddAgentDialog, type AgentAddResult } from "./AddAgentDialog";
+import { HuddleErrorBanner } from "./HuddleErrorBanner";
 import type { HuddleAgentVoiceSettings } from "./AgentVoiceMenu";
 import { MicControls, SpeakerControls } from "./MicControls";
 import { HuddleParticipantsControl } from "./ParticipantList";
@@ -585,20 +586,10 @@ export function HuddleBar({
       <div className="flex min-w-0 items-center gap-3 overflow-hidden">
         {/* Error banner */}
         {huddleError && (
-          <div
-            role="alert"
-            className="flex min-w-0 items-center gap-1.5 rounded bg-destructive/10 px-2 py-1 text-xs text-destructive"
-          >
-            <span className="max-w-[220px] truncate">{huddleError}</span>
-            <button
-              aria-label="Dismiss error"
-              className="ml-1 opacity-60 hover:opacity-100"
-              onClick={clearHuddleError}
-              type="button"
-            >
-              ✕
-            </button>
-          </div>
+          <HuddleErrorBanner
+            message={huddleError}
+            onDismiss={clearHuddleError}
+          />
         )}
 
         {/* Model download progress */}
