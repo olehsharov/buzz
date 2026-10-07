@@ -299,7 +299,9 @@ impl ArchiveSyncIo for AppIo {
     ) -> BoxFuture<'_, Result<ArchiveBatchResult, String>> {
         Box::pin(async move {
             let state: State<'_, AppState> = self.app.state();
-            super::archive_candidates(&state, candidates).await
+            // Archive sync runs in the main window on its workspace relay.
+            let relay_url = crate::relay::relay_ws_url_with_override(&state);
+            super::archive_candidates(&state, &relay_url, candidates).await
         })
     }
 

@@ -185,3 +185,34 @@ fn one_window_per_community_focuses_the_existing_window() {
     assert!(other.created);
     assert!(open_or_focus_community_window(handle, "bad/id", None).is_err());
 }
+
+#[test]
+fn a_popout_opened_from_a_community_window_follows_its_community() {
+    let state = state_with_saved(&[RELAY_B]);
+    bind_window_relay(&state, LABEL, RELAY_B).unwrap();
+    let app = tauri::test::mock_builder()
+        .manage(state)
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .unwrap();
+    let state = app.state::<AppState>();
+    let popout = "popout-0f1e2d3c-4b5a-4968-8776-655443322110";
+    // Unbound pop-outs follow the main window.
+    assert_eq!(relay_ws_url_for_window(&state, popout).unwrap(), RELAY_A);
+    let inherited = crate::popout::inherit_parent_relay(app.handle(), LABEL, popout).unwrap();
+    assert_eq!(inherited.as_deref(), Some(RELAY_B));
+    assert_eq!(relay_ws_url_for_window(&state, popout).unwrap(), RELAY_B);
+    // A main-window workspace switch does not move it.
+    *state.relay_url_override.lock().unwrap() = Some("wss://relay-c.example".into());
+    assert_eq!(relay_ws_url_for_window(&state, popout).unwrap(), RELAY_B);
+    // Closing the pop-out drops the inherited binding.
+    release_window_relay(&state, popout);
+    assert_eq!(
+        relay_ws_url_for_window(&state, popout).unwrap(),
+        "wss://relay-c.example"
+    );
+    // An unbound parent passes nothing on.
+    assert_eq!(
+        crate::popout::inherit_parent_relay(app.handle(), "community-other", popout).unwrap(),
+        None
+    );
+}

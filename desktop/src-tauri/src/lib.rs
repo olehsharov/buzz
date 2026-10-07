@@ -529,7 +529,7 @@ pub fn run() {
                     use tauri::Manager;
                     loop {
                         let state = flush_handle.state::<AppState>();
-                        if let Err(e) = managed_agents::persona_events::flush_active_pending_events(
+                        if let Err(e) = managed_agents::persona_events::flush_bound_pending_events(
                             &flush_handle,
                             &state,
                         )
@@ -993,6 +993,8 @@ pub fn run() {
             ..
         } if popout::is_popout_label(&label) => {
             app_handle.state::<popout::PopoutRegistry>().release(&label);
+            // A pop-out that followed a community window held its binding.
+            window_relay::release_window_relay(&app_handle.state::<AppState>(), &label);
         }
         RunEvent::WindowEvent {
             label,

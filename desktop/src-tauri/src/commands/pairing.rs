@@ -20,7 +20,7 @@ use crate::app_state::AppState;
 /// How long a pairing session waits for the other device before it times out
 /// (shown as the code's expiry in "Add machine").
 pub(crate) const PAIRING_SESSION_TIMEOUT: Duration = Duration::from_secs(130);
-use crate::relay::{relay_api_base_url_with_override, relay_ws_url_with_override};
+use crate::relay::relay_ws_url_with_override;
 
 #[derive(Serialize, Clone)]
 struct PairingSasPayload {
@@ -114,7 +114,8 @@ pub async fn start_pairing(
     state: State<'_, AppState>,
     pairing: State<'_, PairingHandle>,
 ) -> Result<String, String> {
-    start_pairing_session(app, state, pairing, PairingMode::SendIdentity).await
+    let ws_url = relay_ws_url_with_override(&state);
+    start_pairing_session(app, state, pairing, PairingMode::SendIdentity, ws_url).await
 }
 
 /// Start a recovery session. The fresh desktop shows the QR and receives the
@@ -125,7 +126,8 @@ pub async fn start_identity_recovery_pairing(
     state: State<'_, AppState>,
     pairing: State<'_, PairingHandle>,
 ) -> Result<String, String> {
-    start_pairing_session(app, state, pairing, PairingMode::RecoverIdentity).await
+    let ws_url = relay_ws_url_with_override(&state);
+    start_pairing_session(app, state, pairing, PairingMode::RecoverIdentity, ws_url).await
 }
 
 /// Start a session that approves a new agent host. The desktop shows the
@@ -133,10 +135,13 @@ pub async fn start_identity_recovery_pairing(
 #[tauri::command]
 pub async fn start_host_pairing(
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
     pairing: State<'_, PairingHandle>,
 ) -> Result<String, String> {
-    start_pairing_session(app, state, pairing, PairingMode::ApproveHost).await
+    // A machine is approved in the invoking window's community.
+    let ws_url = relay.ws_url().to_string();
+    start_pairing_session(app, state, pairing, PairingMode::ApproveHost, ws_url).await
 }
 
 async fn start_pairing_session<R: Runtime>(
@@ -144,6 +149,8 @@ async fn start_pairing_session<R: Runtime>(
     state: State<'_, AppState>,
     pairing: State<'_, PairingHandle>,
     mode: PairingMode,
+    // The community relay the session runs on, resolved by the command.
+    ws_url: String,
 ) -> Result<String, String> {
     let _start_guard = pairing.start_lock.lock().await;
     let task_generation =
@@ -159,8 +166,7 @@ async fn start_pairing_session<R: Runtime>(
     *pairing.mode.lock().map_err(|e| e.to_string())? = mode;
     *pairing.payload.lock().map_err(|e| e.to_string())? = None;
 
-    let ws_url = relay_ws_url_with_override(&state);
-    let http_url = relay_api_base_url_with_override(&state);
+    let http_url = crate::relay::relay_http_base_url(&ws_url);
     let pairing_relay_url = resolve_pairing_relay_url(&ws_url, probe_pairing_relay(&ws_url).await)?;
     let (session, qr_payload) = PairingSession::new_source(pairing_relay_url.clone());
     let mut qr_uri = encode_qr(&qr_payload);

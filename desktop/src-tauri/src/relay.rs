@@ -709,7 +709,7 @@ pub struct AgentProfileInfo {
 // ── Signed-event submission ─────────────────────────────────────────────────
 
 mod get;
-pub use get::get_relay_json;
+pub use get::get_relay_json_at;
 
 mod submit;
 pub use submit::{

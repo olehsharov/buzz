@@ -16,6 +16,11 @@ export type PopoutSession = {
   communityId: string | null;
   /** Route to show on boot, or null for the "nothing to show" state. */
   initialRoute: string | null;
+  /**
+   * Opened from a community window: bound natively to that window's
+   * community relay, so it runs whatever community the main window is on.
+   */
+  bound: boolean;
 };
 
 // sessionStorage is per window, so it survives a reload of this pop-out
@@ -32,41 +37,55 @@ let session: PopoutSession | null = null;
 export function resolvePopoutSession({
   launch,
   storedCommunityId,
+  storedBound = false,
   currentRoute,
 }: {
   launch: PopoutLaunchPayload | null;
   storedCommunityId: string | null;
+  storedBound?: boolean;
   currentRoute: string | null;
 }): PopoutSession {
   const launchCommunity = launch
     ? parsePopoutCommunityRef(launch.community)
     : null;
   const launchRoute = launch ? normalizePopoutRoute(launch.route) : null;
+  const bound = launch ? launch.bound === true : storedBound;
   if (launchCommunity && launchRoute) {
-    return { communityId: launchCommunity.id, initialRoute: launchRoute };
+    return {
+      communityId: launchCommunity.id,
+      initialRoute: launchRoute,
+      bound,
+    };
   }
   return {
     communityId: launchCommunity?.id ?? storedCommunityId,
     initialRoute: normalizePopoutRoute(currentRoute),
+    bound,
   };
 }
 
-function readStoredCommunityId(): string | null {
+function readStoredSession(): { id: string | null; bound: boolean } {
   try {
     const raw = window.sessionStorage.getItem(POPOUT_SESSION_STORAGE_KEY);
-    if (!raw) return null;
+    if (!raw) return { id: null, bound: false };
     const parsed: unknown = JSON.parse(raw);
-    return parsePopoutCommunityRef(parsed)?.id ?? null;
+    return {
+      id: parsePopoutCommunityRef(parsed)?.id ?? null,
+      bound:
+        typeof parsed === "object" &&
+        parsed !== null &&
+        (parsed as { bound?: unknown }).bound === true,
+    };
   } catch {
-    return null;
+    return { id: null, bound: false };
   }
 }
 
-function storeCommunityId(communityId: string): void {
+function storeCommunityId(communityId: string, bound: boolean): void {
   try {
     window.sessionStorage.setItem(
       POPOUT_SESSION_STORAGE_KEY,
-      JSON.stringify({ id: communityId }),
+      JSON.stringify({ id: communityId, bound }),
     );
   } catch (error) {
     console.warn("Failed to remember the pop-out community:", error);
@@ -92,12 +111,16 @@ export async function initializePopoutSession(): Promise<PopoutSession | null> {
     console.error("Failed to read the pop-out launch payload:", error);
   }
 
+  const stored = readStoredSession();
   session = resolvePopoutSession({
     launch,
-    storedCommunityId: readStoredCommunityId(),
+    storedCommunityId: stored.id,
+    storedBound: stored.bound,
     currentRoute: currentHashRoute(),
   });
-  if (session.communityId) storeCommunityId(session.communityId);
+  if (session.communityId) {
+    storeCommunityId(session.communityId, session.bound);
+  }
   return session;
 }
 

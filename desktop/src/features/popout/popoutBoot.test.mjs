@@ -78,7 +78,7 @@ test("resolvePopoutSession prefers the launch payload", () => {
       storedCommunityId: "old",
       currentRoute: "/pulse?profile=abc",
     }),
-    { communityId: "c1", initialRoute: CHANNEL_ROUTE },
+    { communityId: "c1", initialRoute: CHANNEL_ROUTE, bound: false },
   );
 });
 
@@ -90,7 +90,7 @@ test("resolvePopoutSession falls back to the reload state", () => {
       storedCommunityId: "c1",
       currentRoute: CHANNEL_ROUTE,
     }),
-    { communityId: "c1", initialRoute: CHANNEL_ROUTE },
+    { communityId: "c1", initialRoute: CHANNEL_ROUTE, bound: false },
   );
   // Nothing to show: no payload and no destination route.
   assert.deepEqual(
@@ -99,7 +99,7 @@ test("resolvePopoutSession falls back to the reload state", () => {
       storedCommunityId: "c1",
       currentRoute: "/",
     }),
-    { communityId: "c1", initialRoute: null },
+    { communityId: "c1", initialRoute: null, bound: false },
   );
 });
 
@@ -110,7 +110,7 @@ test("resolvePopoutSession refuses invalid launch routes and community refs", ()
       storedCommunityId: null,
       currentRoute: null,
     }),
-    { communityId: "c1", initialRoute: null },
+    { communityId: "c1", initialRoute: null, bound: false },
   );
   assert.deepEqual(
     resolvePopoutSession({
@@ -118,7 +118,7 @@ test("resolvePopoutSession refuses invalid launch routes and community refs", ()
       storedCommunityId: null,
       currentRoute: null,
     }),
-    { communityId: null, initialRoute: null },
+    { communityId: null, initialRoute: null, bound: false },
   );
 });
 
@@ -183,4 +183,48 @@ test("popoutWindowTitle names the channel, DM, thread, or person", () => {
     "Bob",
   );
   assert.equal(popoutWindowTitle({ destination: null }), "Buzz");
+});
+
+test("resolvePopoutSession carries the community-window binding across reloads", () => {
+  assert.deepEqual(
+    resolvePopoutSession({
+      launch: { route: CHANNEL_ROUTE, community: { id: "b" }, bound: true },
+      storedCommunityId: null,
+      currentRoute: null,
+    }),
+    { communityId: "b", initialRoute: CHANNEL_ROUTE, bound: true },
+  );
+  assert.deepEqual(
+    resolvePopoutSession({
+      launch: null,
+      storedCommunityId: "b",
+      storedBound: true,
+      currentRoute: CHANNEL_ROUTE,
+    }),
+    { communityId: "b", initialRoute: CHANNEL_ROUTE, bound: true },
+  );
+});
+
+test("a pop-out bound to a community window ignores the main window's community", () => {
+  const communities = [
+    { id: "a", relayUrl: "wss://a.example" },
+    { id: "b", relayUrl: "wss://b.example" },
+  ];
+  const gate = (overrides) =>
+    evaluatePopoutCommunityGate({
+      popoutCommunityId: "b",
+      communities,
+      mainActiveCommunityId: "a",
+      backendRelayUrl: "wss://b.example",
+      bound: true,
+      ...overrides,
+    });
+  // Main is on A; the bound pop-out still runs B on its own binding.
+  assert.equal(gate({}), "active");
+  assert.equal(gate({ backendRelayUrl: undefined }), "checking");
+  // Its binding resolving anything else pauses it (fail closed).
+  assert.equal(gate({ backendRelayUrl: "wss://a.example" }), "paused");
+  assert.equal(gate({ backendRelayUrl: null }), "paused");
+  // Unbound, the same pop-out pauses while main is elsewhere.
+  assert.equal(gate({ bound: false }), "paused");
 });

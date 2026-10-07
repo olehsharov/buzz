@@ -395,5 +395,36 @@ pub fn save_personas<R: tauri::Runtime>(
     crate::managed_agents::storage::save_agent_definitions(app, &definitions)
 }
 
+/// [`save_personas`], assigning the definitions `new_persona_ids` (just
+/// created or imported) to the community on `community_relay` — the invoking
+/// window's — instead of letting the write-time net stamp them with the main
+/// window's community.
+pub fn save_personas_assigning<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    records: &[AgentDefinition],
+    new_persona_ids: &[&str],
+    community_relay: &str,
+) -> Result<(), String> {
+    let mut sorted = records.to_vec();
+    sort_personas(&mut sorted);
+    let definitions: Vec<_> = sorted
+        .into_iter()
+        .map(|persona| {
+            let mut record = persona.into_agent_record();
+            if !record.is_builtin
+                && record
+                    .slug
+                    .as_deref()
+                    .is_some_and(|slug| new_persona_ids.contains(&slug))
+                && record.relay_url.trim().is_empty()
+            {
+                record.relay_url = community_relay.to_string();
+            }
+            record
+        })
+        .collect();
+    crate::managed_agents::storage::save_agent_definitions(app, &definitions)
+}
+
 #[cfg(test)]
 mod tests;

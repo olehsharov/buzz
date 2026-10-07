@@ -5,16 +5,21 @@ use tauri::{AppHandle, State};
 use crate::{
     agent_hosts::{channel::RelayHostChannel, frames, ops, store::AgentHostRecord, HostOps},
     app_state::AppState,
-    relay::{relay_http_base_url, relay_ws_url_with_override},
+    relay::relay_http_base_url,
 };
 
-fn community_relay(state: &AppState) -> String {
-    relay_ws_url_with_override(state)
+/// Machines are approved per community: every host command acts on the
+/// invoking window's community relay.
+fn community_relay(relay: &crate::window_relay::WindowRelay) -> String {
+    relay.ws_url().to_string()
 }
 
-fn relay_channel(state: &AppState) -> Result<RelayHostChannel, String> {
+fn relay_channel(
+    state: &AppState,
+    relay: &crate::window_relay::WindowRelay,
+) -> Result<RelayHostChannel, String> {
     Ok(RelayHostChannel {
-        relay_url: community_relay(state),
+        relay_url: community_relay(relay),
         owner_keys: state.signing_keys()?,
     })
 }
@@ -64,8 +69,11 @@ pub struct HostInstallInfo {
 
 /// The "Add machine" commands for one pairing session.
 #[tauri::command]
-pub fn get_host_install_info(state: State<'_, AppState>, pairing_uri: String) -> HostInstallInfo {
-    let base_url = host_install_base(&community_relay(&state));
+pub fn get_host_install_info(
+    relay: crate::window_relay::WindowRelay,
+    pairing_uri: String,
+) -> HostInstallInfo {
+    let base_url = host_install_base(&community_relay(&relay));
     HostInstallInfo {
         command: host_install_command(&base_url, &pairing_uri),
         up_command: host_up_command(&pairing_uri),
@@ -78,10 +86,10 @@ pub fn get_host_install_info(state: State<'_, AppState>, pairing_uri: String) ->
 #[tauri::command]
 pub fn list_agent_hosts(
     app: AppHandle,
-    state: State<'_, AppState>,
+    relay: crate::window_relay::WindowRelay,
     hosts: State<'_, HostOps>,
 ) -> Result<Vec<AgentHostRecord>, String> {
-    ops::list_hosts(&app, &hosts, &community_relay(&state))
+    ops::list_hosts(&app, &hosts, &community_relay(&relay))
 }
 
 /// Deploy (or redeploy, or move) an agent onto an approved machine and wait
@@ -91,11 +99,12 @@ pub async fn deploy_to_host(
     pubkey: String,
     host_pubkey: String,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
     hosts: State<'_, HostOps>,
 ) -> Result<crate::managed_agents::ManagedAgentSummary, String> {
-    let channel = relay_channel(&state)?;
-    let relay = community_relay(&state);
+    let channel = relay_channel(&state, &relay)?;
+    let relay = community_relay(&relay);
     ops::deploy_agent_to_host(
         &app,
         &state,
@@ -115,10 +124,11 @@ pub async fn deploy_to_host(
 pub async fn undeploy_from_host(
     pubkey: String,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
     hosts: State<'_, HostOps>,
 ) -> Result<crate::managed_agents::ManagedAgentSummary, String> {
-    let channel = relay_channel(&state)?;
+    let channel = relay_channel(&state, &relay)?;
     ops::undeploy_agent_from_host(&app, &state, &hosts, &channel, &pubkey).await?;
     summary_for(&app, &state, &pubkey)
 }
@@ -128,11 +138,12 @@ pub async fn undeploy_from_host(
 pub async fn request_host_status(
     host_pubkey: String,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
     hosts: State<'_, HostOps>,
 ) -> Result<AgentHostRecord, String> {
-    let channel = relay_channel(&state)?;
-    let relay = community_relay(&state);
+    let channel = relay_channel(&state, &relay)?;
+    let relay = community_relay(&relay);
     ops::refresh_host_status(&app, &state, &hosts, &channel, &relay, &host_pubkey).await
 }
 
@@ -141,11 +152,12 @@ pub async fn request_host_status(
 pub async fn forget_host(
     host_pubkey: String,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
     hosts: State<'_, HostOps>,
 ) -> Result<ops::ForgetHostOutcome, String> {
-    let channel = relay_channel(&state)?;
-    let relay = community_relay(&state);
+    let channel = relay_channel(&state, &relay)?;
+    let relay = community_relay(&relay);
     ops::forget_host(&app, &state, &hosts, &channel, &relay, &host_pubkey).await
 }
 
@@ -157,13 +169,14 @@ pub async fn forget_host(
 pub fn ingest_host_telemetry(
     event_json: String,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
     hosts: State<'_, HostOps>,
 ) -> Result<Option<AgentHostRecord>, String> {
     use nostr::JsonUtil;
     let event =
         nostr::Event::from_json(event_json).map_err(|error| format!("invalid event: {error}"))?;
-    let relay = community_relay(&state);
+    let relay = community_relay(&relay);
     let known = ops::list_hosts(&app, &hosts, &relay)?;
     if !known
         .iter()

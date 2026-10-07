@@ -11,6 +11,7 @@ import {
   useHuddlePttState,
 } from "./lib/useHuddlePttState";
 import { useHuddleSpeakerActivity } from "./lib/useHuddleSpeakerActivity";
+import { isCommunityWindow } from "@/shared/lib/windowKind";
 import { useMicLevelAnalyser } from "./lib/useMicLevelAnalyser";
 import { useTtsSubscription } from "./lib/useTtsSubscription";
 import type {
@@ -628,6 +629,11 @@ export function HuddleProvider({
       memberPubkeys: string[],
       channelName?: string,
     ) => {
+      // Huddle audio is owned by the main window (one capture pipeline, one
+      // native huddle state on the main community's relay).
+      if (isCommunityWindow()) {
+        throw new Error(HUDDLES_IN_MAIN_WINDOW_ONLY);
+      }
       if (busyRef.current) return;
       busyRef.current = true;
 
@@ -708,6 +714,11 @@ export function HuddleProvider({
       ephemeralChannelId: string,
       huddleThreadEventId?: string,
     ) => {
+      // Huddle audio is owned by the main window (one capture pipeline, one
+      // native huddle state on the main community's relay).
+      if (isCommunityWindow()) {
+        throw new Error(HUDDLES_IN_MAIN_WINDOW_ONLY);
+      }
       if (busyRef.current) return;
       busyRef.current = true;
       tokenRef.current += 1;
@@ -975,3 +986,7 @@ export function useHuddleLevels(): HuddleLevelsValue {
   }
   return ctx;
 }
+
+/** Shown when a huddle is started or joined from a community window. */
+export const HUDDLES_IN_MAIN_WINDOW_ONLY =
+  "Huddles run in the main Buzz window. Switch the main window to this community to start or join one.";

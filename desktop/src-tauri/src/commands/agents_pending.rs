@@ -30,8 +30,15 @@ pub(crate) fn retain_managed_agent_pending<R: tauri::Runtime>(
     use crate::managed_agents::{reconcile::retain_agent_record, retention::open_retention_db};
 
     let result = (|| -> Result<(), String> {
-        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
-        // An agent's 30177 record is published only to its own community.
+        // An agent's 30177 record is published only to its own community, so
+        // it is retained in that community's scope — whichever window (main
+        // or that community's own) made the write.
+        let community_relay = crate::relay::effective_agent_relay_url(
+            &record.relay_url,
+            &crate::relay::relay_ws_url_with_override(state),
+        );
+        let scope =
+            crate::managed_agents::retention::retention_scope_for(app, state, &community_relay)?;
         if !crate::relay::agent_belongs_to_relay(
             &record.relay_url,
             &scope.relay_url,
@@ -64,10 +71,12 @@ pub(crate) fn retain_managed_agent_pending<R: tauri::Runtime>(
 pub(crate) fn tombstone_managed_agent_pending(
     app: &AppHandle,
     state: &AppState,
+    community_relay: &str,
     agent_pubkey: &str,
 ) {
     let result = (|| -> Result<(), String> {
-        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+        let scope =
+            crate::managed_agents::retention::retention_scope_for(app, state, community_relay)?;
         tombstone_managed_agent_at(&scope.db_path, &scope.owner_keys, agent_pubkey)
     })();
     if let Err(e) = result {

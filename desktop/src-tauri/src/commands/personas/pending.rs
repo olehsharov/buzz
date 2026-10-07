@@ -39,9 +39,10 @@ pub(super) struct PreparedPersonaPublication {
 pub(in crate::commands) fn retain_persona_pending(
     app: &AppHandle,
     state: &AppState,
+    community_relay: &str,
     persona: &AgentDefinition,
 ) {
-    if let Err(e) = prepare_persona_publication(app, state, persona, None) {
+    if let Err(e) = prepare_persona_publication(app, state, community_relay, persona, None) {
         eprintln!("buzz-desktop: persona-retain: {e}");
     }
 }
@@ -67,10 +68,11 @@ pub(in crate::commands) fn retain_persona_pending_at(
 pub(super) fn prepare_persona_publication(
     app: &AppHandle,
     state: &AppState,
+    community_relay: &str,
     persona: &AgentDefinition,
     shared_override: Option<bool>,
 ) -> Result<PreparedPersonaPublication, String> {
-    let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+    let scope = crate::managed_agents::retention::retention_scope_for(app, state, community_relay)?;
     let (event, retained, persona) = prepare_persona_publication_at(
         &scope.db_path,
         &scope.owner_keys,
@@ -107,9 +109,10 @@ fn retained_persona_is_shared(row: Option<&RetainedEvent>) -> bool {
 pub(super) fn project_active_persona_sharing(
     app: &AppHandle,
     state: &AppState,
+    community_relay: &str,
     personas: &mut [AgentDefinition],
 ) {
-    let scope = crate::managed_agents::retention::active_retention_scope(app, state);
+    let scope = crate::managed_agents::retention::retention_scope_for(app, state, community_relay);
     project_scoped_persona_sharing(scope, personas);
 }
 
@@ -221,10 +224,12 @@ pub(super) fn prepare_persona_publication_at(
 pub(in crate::commands) fn tombstone_persona_pending(
     app: &AppHandle,
     state: &AppState,
+    community_relay: &str,
     d_tag: &str,
 ) {
     let result = (|| -> Result<(), String> {
-        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+        let scope =
+            crate::managed_agents::retention::retention_scope_for(app, state, community_relay)?;
         tombstone_persona_at(&scope.db_path, &scope.owner_keys, d_tag)
     })();
     if let Err(e) = result {

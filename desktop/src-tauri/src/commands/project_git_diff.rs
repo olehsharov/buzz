@@ -406,9 +406,10 @@ pub async fn get_project_repo_diff(
     base_branch: Option<String>,
     target_ref: Option<String>,
     target_commit: Option<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<ProjectRepoDiffInfo, String> {
-    validate_workspace_clone_url(&clone_url, &state)?;
+    validate_workspace_clone_url(&clone_url, &relay)?;
     let auth = build_git_auth_config(&state)?;
     let branch = clean_branch(default_branch);
     let base_branch = clean_branch(base_branch);

@@ -69,22 +69,20 @@ test("gating split: a community window shows chat but owns no app-global work", 
   assert.equal(huddle.ownsAppGlobals, false);
 });
 
-test("main-window-only screens are recognized by their first path segment", () => {
-  for (const path of [
-    "/agents",
-    "/projects",
-    "/projects/p1",
-    "/workflows/w1",
-    "/settings",
-  ]) {
+test("only app settings are main-window-only in a community window", () => {
+  for (const path of ["/settings", "/settings/"]) {
     assert.equal(isMainWindowOnlyPath(path), true, path);
   }
   for (const path of [
     "/",
+    "/agents",
+    "/projects",
+    "/projects/p1",
+    "/workflows/w1",
     "/channels/c1",
     "/pulse",
     "/messages/new",
-    "/agentsx",
+    "/settingsx",
   ]) {
     assert.equal(isMainWindowOnlyPath(path), false, path);
   }

@@ -35,6 +35,7 @@ export default defineConfig({
         "**/navigation.spec.ts",
         "**/popout-windows.spec.ts",
         "**/community-windows.spec.ts",
+        "**/community-window-layout-screenshots.spec.ts",
         "**/channels.spec.ts",
         "**/stream-draft-ghost.spec.ts",
         "**/channel-shared-header-backdrop.spec.ts",

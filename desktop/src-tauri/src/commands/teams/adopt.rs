@@ -58,6 +58,7 @@ pub struct AddTeamFromCatalogResult {
 pub async fn add_team_from_catalog(
     input: AddTeamFromCatalogRequest,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
 ) -> Result<AddTeamFromCatalogResult, String> {
     let source = TeamCatalogSource {
         owner_pubkey: input.owner_pubkey,
@@ -73,7 +74,7 @@ pub async fn add_team_from_catalog(
     // then no longer publish community A's team into community B's retention db.
     let scope = {
         let state = app.state::<AppState>();
-        crate::managed_agents::retention::active_retention_scope(&app, &state)?
+        crate::managed_agents::retention::retention_scope_for(&app, &state, relay.ws_url())?
     };
 
     // Fetch and verify BEFORE taking the store lock: holding it across the
@@ -86,7 +87,7 @@ pub async fn add_team_from_catalog(
 
     let app_for_write = app.clone();
     tokio::task::spawn_blocking(move || {
-        apply::add_verified_team(&app_for_write, scope, &source, &content)
+        apply::add_verified_team(&app_for_write, scope, &source, &content, &relay)
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?

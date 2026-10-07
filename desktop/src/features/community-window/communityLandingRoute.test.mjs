@@ -32,16 +32,20 @@ test("a community window opens on its community's last channel, else Home", asyn
   );
 });
 
-test("a community window opens no pop-outs", async () => {
+test("a community window opens pop-outs but not other community windows", async () => {
   installLocalStorage();
   const { canOpenInNewWindow } = await import(
     "../popout/useOpenInNewWindow.ts"
   );
   const channel = { kind: "channel", channelId: CHANNEL };
   assert.equal(canOpenInNewWindow(channel, false), true);
-  assert.equal(canOpenInNewWindow(channel, true), false);
+  assert.equal(canOpenInNewWindow(channel, true), true);
   assert.equal(
     canOpenInNewWindow({ kind: "community", communityId: "x" }, true),
     false,
+  );
+  assert.equal(
+    canOpenInNewWindow({ kind: "community", communityId: "x" }, false),
+    true,
   );
 });

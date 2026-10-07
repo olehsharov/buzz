@@ -207,7 +207,7 @@ test.describe("community window", () => {
     await seedCommunities(page);
   });
 
-  test("binds its own relay and shows chat without the rail or management", async ({
+  test("binds its own relay and shows the full app without the rail", async ({
     page,
   }) => {
     await page.goto("/");
@@ -218,9 +218,10 @@ test.describe("community window", () => {
     await expect(page.locator('[data-testid^="community-rail"]')).toHaveCount(
       0,
     );
-    await expect(page.getByTestId("open-agents-view")).toHaveCount(0);
-    await expect(page.getByTestId("open-workflows-view")).toHaveCount(0);
-    await expect(page.getByTestId("open-projects-view")).toHaveCount(0);
+    // A full Buzz for this community: agents, projects, and workflows too.
+    await expect(page.getByTestId("open-agents-view")).toBeVisible();
+    await expect(page.getByTestId("open-workflows-view")).toBeVisible();
+    await expect(page.getByTestId("open-projects-view")).toBeVisible();
     await expect(
       page.getByRole("button", { name: "Show main window" }),
     ).toBeVisible();
@@ -279,10 +280,17 @@ test.describe("community window", () => {
     expect(new Set(connectUrls)).toEqual(new Set([COMMUNITY_B.relayUrl]));
   });
 
-  test("main-window-only screens point back to the main window", async ({
+  test("the agents page lists only this community's agents", async ({
     page,
   }) => {
-    await page.goto("/#/agents");
+    await page.goto("/");
+    await page.getByTestId("open-agents-view").click();
+    await expect(page.getByText("BravoScout").first()).toBeVisible();
+    await expect(page.getByText("AlphaScout")).toHaveCount(0);
+  });
+
+  test("app settings point back to the main window", async ({ page }) => {
+    await page.goto("/#/settings");
     await expect(page.getByTestId("community-window-main-only")).toBeVisible();
     await clearCommandLog(page);
     await page

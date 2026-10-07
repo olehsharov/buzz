@@ -18,7 +18,7 @@ use crate::{
             decrypt_envelope, parse_chunk_payload, resolve_unlock_secret, ChunkPayload,
             LOCKED_CARD_REFUSAL,
         },
-        load_managed_agents, load_personas, save_managed_agents, save_personas, AgentDefinition,
+        load_managed_agents, load_personas, save_managed_agents, AgentDefinition,
         ManagedAgentRecord, RespondTo,
     },
     relay::{effective_agent_relay_url, relay_ws_url_with_override},
@@ -456,6 +456,7 @@ pub(crate) fn build_agent_snapshot_import_preview(
 pub async fn confirm_agent_snapshot_import(
     input: AgentSnapshotImportConfirm,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<AgentSnapshotImportResult, String> {
     // ── Phase 1: validate (no writes) ────────────────────────────────────────
@@ -495,14 +496,11 @@ pub async fn confirm_agent_snapshot_import(
         snapshot.profile.avatar_data_url.as_deref(),
         snapshot.profile.avatar_url.as_deref(),
         |avatar_bytes| async {
-            crate::commands::media::upload_image_bytes(
-                avatar_bytes,
-                &state,
-                &crate::relay::relay_api_base_url_with_override(&state),
-            )
-            .await
-            .map(|descriptor| descriptor.url)
-            .map_err(|error| format!("Could not upload the imported avatar: {error}"))
+            // The avatar is hosted on the importing window's community.
+            crate::commands::media::upload_image_bytes(avatar_bytes, &state, &relay.api_base())
+                .await
+                .map(|descriptor| descriptor.url)
+                .map_err(|error| format!("Could not upload the imported avatar: {error}"))
         },
     )
     .await?;
@@ -596,10 +594,15 @@ pub async fn confirm_agent_snapshot_import(
         };
 
         personas.push(persona.clone());
-        save_personas(&app, &personas)?;
+        crate::managed_agents::save_personas_assigning(
+            &app,
+            &personas,
+            &[persona.id.as_str()],
+            relay.ws_url(),
+        )?;
 
         // Enqueue the kind:30175 persona event via the retention path.
-        super::super::pending::retain_persona_pending(&app, &state, &persona);
+        super::super::pending::retain_persona_pending(&app, &state, relay.ws_url(), &persona);
         // Build the managed agent record — no machine-local commands, no
         // secrets, no lineage from the snapshot.
         let record = ManagedAgentRecord {
@@ -614,7 +617,8 @@ pub async fn confirm_agent_snapshot_import(
             persona_id: Some(persona_id.clone()),
             private_key_nsec: private_key_nsec.clone(),
             auth_tag: auth_tag.clone(),
-            relay_url: String::new(), // resolves to workspace relay at runtime
+            // Imported into the invoking window's community.
+            relay_url: relay.ws_url().to_string(),
             avatar_url: effective_avatar.clone(),
             // Only the validated portable ACP alias crosses the snapshot boundary.
             // Harness paths still resolve locally at spawn.
@@ -782,7 +786,16 @@ fn retain_agent_pending(app: &AppHandle, state: &AppState, record: &ManagedAgent
     use nostr::JsonUtil;
 
     let result = (|| -> Result<(), String> {
-        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+        // Retained in the agent's own community scope (see
+        // `agents::retain_managed_agent_pending`).
+        let scope = crate::managed_agents::retention::retention_scope_for(
+            app,
+            state,
+            &crate::relay::effective_agent_relay_url(
+                &record.relay_url,
+                &crate::relay::relay_ws_url_with_override(state),
+            ),
+        )?;
         let conn = open_retention_db(&scope.db_path)?;
         let content = serde_json::to_string(&agent_event_content(record))
             .map_err(|e| format!("failed to serialize agent content: {e}"))?;

@@ -23,6 +23,13 @@ export type CollapsibleSidebarGroup =
 export type CreateChannelKind = "stream" | "forum";
 
 export type AppSidebarProps = {
+  /**
+   * Whether the community rail sits beside this sidebar. The sidebar tucks
+   * under the rail's edge only then; a community window lists several
+   * communities but shows no rail, so it keeps the single-community insets.
+   * Defaults to "more than one community".
+   */
+  hasCommunityRail?: boolean;
   addCommunityPrefill?: AddCommunityPrefillRequest | null;
   activeCommunity: Community | null;
   channels: Channel[];

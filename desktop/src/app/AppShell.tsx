@@ -124,10 +124,6 @@ import { isMainWindowOnlyPath } from "@/features/community-window/communityWindo
 import { MainWindowOnlyState } from "@/features/community-window/ui/MainWindowOnlyState";
 const EMPTY_CHANNELS: Channel[] = [];
 const EMPTY_COMMUNITIES: never[] = [];
-async function skipTemplateAgents(
-  _templateId: string | undefined,
-  _channelId: string,
-): Promise<void> {}
 export function AppShell() {
   useWebviewZoomShortcuts();
   useTauriWindowDrag();
@@ -162,7 +158,10 @@ export function AppShell() {
     isSecondaryWindow,
     ownsAppGlobals,
   } = appShellWindowRoles(currentWindowKind(), isHuddleRoom);
-  const hasCommunityRail = communitiesHook.communities.length > 1;
+  // The rail is a main-window surface: a community window lays out as a
+  // single-community window (no rail inset, traffic-light clearance kept).
+  const hasCommunityRail =
+    communitiesHook.communities.length > 1 && ownsAppGlobals;
   const addCommunityDialog = useAddCommunityDialogState();
   const [isChannelManagementOpen, setIsChannelManagementOpen] =
     React.useState(false);
@@ -237,16 +236,15 @@ export function AppShell() {
     identityQuery.data?.pubkey,
     communitiesHook.activeCommunity?.relayUrl,
   );
+  // Each community is synced by the window that owns it: the main window for
+  // its active community, a community window for its own. Pop-outs never.
   usePersonaSync(
-    isSecondaryWindow ? undefined : identityQuery.data?.pubkey,
+    isPopout ? undefined : identityQuery.data?.pubkey,
     communitiesHook.activeCommunity?.relayUrl,
   );
   useAgentsDataRefresh();
   // Chunk F: auto-restart drifted idle agents (per-agent opt-out, default ON).
-  useAutoRestartPolicy(
-    communitiesHook.activeCommunity?.relayUrl,
-    !isSecondaryWindow,
-  );
+  useAutoRestartPolicy(communitiesHook.activeCommunity?.relayUrl, !isPopout);
   // Owner-global observer ingestion: receives + decrypts agent observer
   // frames and keeps derived active-turn liveness in sync app-wide, so no
   // individual screen/panel has to mount its own bridge for ingestion.
@@ -279,8 +277,9 @@ export function AppShell() {
   useCommunityEmojiLiveUpdates();
   useMembershipNotifications(identityQuery.data?.pubkey);
   // Presence is published by the main window only.
+  // Presence is per community: each community's owning window publishes it.
   const presenceSession = usePresenceSession(
-    isSecondaryWindow ? undefined : deferredPubkey,
+    isPopout ? undefined : deferredPubkey,
   );
   const selfStatusQuery = useUserStatusQuery(
     deferredPubkey ? [deferredPubkey] : [],
@@ -557,12 +556,7 @@ export function AppShell() {
 
   const createChannelMutation = useCreateChannelMutation(),
     createForumMutation = useCreateChannelMutation();
-  const { applyCanvas, applyAgents: applyTemplateAgents } = useApplyTemplate();
-  // Template agents are managed agents, which belong to the main window: a
-  // community window applies a template's canvas but starts no agents.
-  const applyAgents = isCommunityWindowShell
-    ? skipTemplateAgents
-    : applyTemplateAgents;
+  const { applyCanvas, applyAgents } = useApplyTemplate();
   const openDmMutation = useOpenDmMutation();
   const hideDmMutation = useHideDmMutation();
   useDmResurfaceFromMessages({
@@ -744,7 +738,10 @@ export function AppShell() {
   });
   // Dispatch `buzz://` deep links only from the main window; the companion is dedicated to its active Huddle route.
   useAppDeepLinks(ownsAppGlobals);
-  useMainWindowPopoutNavigation(ownsAppGlobals);
+  useMainWindowPopoutNavigation(
+    ownsAppGlobals || isCommunityWindowShell,
+    isCommunityWindowShell,
+  );
   const handleOpenCreateChannel = React.useCallback(
     () => setIsCreateChannelOpen(true),
     [],
@@ -838,7 +835,7 @@ export function AppShell() {
             onViewHuddleChannel={viewHuddleChannel}
             onVisibilityChange={handleHuddleVisibilityChange}
           >
-            {hasCommunityRail && ownsAppGlobals ? (
+            {hasCommunityRail ? (
               <CommunityRail
                 activeCommunityId={communitiesHook.activeCommunity?.id ?? null}
                 onAddCommunity={addCommunityDialog.openDialog}
@@ -869,7 +866,7 @@ export function AppShell() {
                           ? (communitiesHook.activeCommunity?.name ?? null)
                           : undefined
                       }
-                      hasCommunityRail={hasCommunityRail && ownsAppGlobals}
+                      hasCommunityRail={hasCommunityRail}
                       onGoBack={goBack}
                       onGoForward={goForward}
                     />
@@ -918,6 +915,7 @@ export function AppShell() {
                     <div className="relative flex min-h-0 flex-1 overflow-visible">
                       {!isAuxWindow ? (
                         <AppSidebar
+                          hasCommunityRail={hasCommunityRail}
                           activeCommunity={communitiesHook.activeCommunity}
                           channels={sidebarChannels}
                           currentPubkey={identityQuery.data?.pubkey}
@@ -1057,12 +1055,8 @@ export function AppShell() {
                       ) : null}
                     </div>
                   )}
-                  {isCommunityWindowShell ? null : (
-                    <>
-                      <RequestedAgentCreateDialogs />
-                      <AgentManagementDialogs />
-                    </>
-                  )}
+                  <RequestedAgentCreateDialogs />
+                  <AgentManagementDialogs />
                   <AppShellOverlays
                     activeChannel={managedChannel}
                     browseDialogType={browseDialogType}

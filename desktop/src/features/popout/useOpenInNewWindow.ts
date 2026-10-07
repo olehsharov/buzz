@@ -16,16 +16,15 @@ import { isCommunityWindow } from "@/shared/lib/windowKind";
 
 /**
  * Whether this window can open `destination` in a new window. A community
- * window opens no pop-outs: a pop-out runs on the main window's community
- * (see popoutCommunityGate), so one opened from another community would only
- * ever show "paused". Communities open their own window from the main window's
- * rail.
+ * window's pop-outs inherit its native relay binding and follow its
+ * community; only opening another community's window is main-window work
+ * (the rail lives there).
  */
 export function canOpenInNewWindow(
   destination: PopoutDestination,
   inCommunityWindow: boolean = isCommunityWindow(),
 ): boolean {
-  if (inCommunityWindow) return false;
+  if (inCommunityWindow && destination.kind === "community") return false;
   return buildPopoutRoute(destination) !== null;
 }
 

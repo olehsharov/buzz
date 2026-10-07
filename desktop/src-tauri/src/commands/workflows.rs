@@ -7,7 +7,7 @@ use tauri::State;
 use crate::{
     app_state::AppState,
     events,
-    relay::{get_relay_json, parse_command_response, query_relay, submit_event},
+    relay::{get_relay_json_at, parse_command_response, query_relay_at, submit_event_at},
 };
 
 // ── Wire shapes (snake_case, consumed by tauriWorkflows.ts) ──────────────────
@@ -91,10 +91,12 @@ struct WorkflowTriggerAck {
 #[tauri::command]
 pub async fn get_channel_workflows(
     channel_id: String,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<Vec<WorkflowWire>, String> {
-    let events = query_relay(
+    let events = query_relay_at(
         &state,
+        &relay.api_base(),
         &[serde_json::json!({
             "kinds": [30620],
             "#h": [channel_id],
@@ -125,6 +127,7 @@ const WORKFLOW_QUERY_CHANNEL_BATCH_SIZE: usize = 128;
 #[tauri::command]
 pub async fn get_channels_workflows(
     channel_ids: Vec<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<Vec<WorkflowWire>, String> {
     let filter_batches = channel_workflow_filter_batches(channel_ids)?;
@@ -132,7 +135,7 @@ pub async fn get_channels_workflows(
     let mut workflows = Vec::new();
 
     for filters in filter_batches {
-        let events = query_relay(&state, &filters).await?;
+        let events = query_relay_at(&state, &relay.api_base(), &filters).await?;
         append_unique_workflows(&mut workflows, &mut seen_event_ids, &events);
     }
 
@@ -177,10 +180,12 @@ fn channel_workflow_filters(channel_ids: Vec<String>) -> Result<Vec<Value>, Stri
 #[tauri::command]
 pub async fn get_workflow(
     workflow_id: String,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<WorkflowWire, String> {
-    let events = query_relay(
+    let events = query_relay_at(
         &state,
+        &relay.api_base(),
         &[serde_json::json!({
             "kinds": [30620],
             "#d": [workflow_id],
@@ -199,13 +204,15 @@ pub async fn get_workflow(
 pub async fn get_workflow_runs(
     workflow_id: String,
     limit: Option<u32>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<WorkflowRunsWire, String> {
     let workflow_id =
         uuid::Uuid::parse_str(&workflow_id).map_err(|_| "invalid workflow id".to_string())?;
     let limit = limit.unwrap_or(20).clamp(1, 100);
-    get_relay_json(
+    get_relay_json_at(
         &state,
+        &relay.api_base(),
         &format!("/workflows/{workflow_id}/runs?limit={limit}"),
     )
     .await
@@ -217,12 +224,13 @@ pub async fn get_workflow_runs(
 pub async fn create_workflow(
     channel_id: String,
     yaml_definition: String,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<WorkflowSaveWire, String> {
     let workflow_id = uuid::Uuid::new_v4().to_string();
     let builder =
         events::build_workflow_definition(&workflow_id, &channel_id, &yaml_definition, None)?;
-    let result = submit_event(builder, &state).await?;
+    let result = submit_event_at(builder, &state, &relay.api_base()).await?;
 
     // The relay returns `webhook_secret` in the OK response message for
     // webhook-triggered workflows. Everything else in the save record is built
@@ -258,13 +266,15 @@ pub async fn update_workflow(
     workflow_id: String,
     yaml_definition: String,
     expected_revision: String,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<WorkflowSaveWire, String> {
     // Find the channel id (and creation time) from the existing workflow event
     // so the new event carries the same `h` tag — kind:30620 is replaceable by
     // (pubkey, d-tag).
-    let prior = query_relay(
+    let prior = query_relay_at(
         &state,
+        &relay.api_base(),
         &[serde_json::json!({
             "kinds": [30620],
             "#d": [workflow_id.clone()],
@@ -288,7 +298,7 @@ pub async fn update_workflow(
         &yaml_definition,
         Some(&expected_revision),
     )?;
-    let result = submit_event(builder, &state).await?;
+    let result = submit_event_at(builder, &state, &relay.api_base()).await?;
 
     let updated_at = now_secs();
     let workflow = workflow_record(
@@ -311,20 +321,22 @@ pub async fn update_workflow(
 #[tauri::command]
 pub async fn delete_workflow(
     workflow_id: String,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let builder = events::build_workflow_delete(&workflow_id, &current_pubkey_hex(&state)?)?;
-    submit_event(builder, &state).await?;
+    submit_event_at(builder, &state, &relay.api_base()).await?;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn trigger_workflow(
     workflow_id: String,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<WorkflowTriggerWire, String> {
     let builder = events::build_workflow_trigger(&workflow_id)?;
-    let result = submit_event(builder, &state).await?;
+    let result = submit_event_at(builder, &state, &relay.api_base()).await?;
     trigger_wire_from_message(workflow_id, &result.message)
 }
 
@@ -334,14 +346,16 @@ pub async fn trigger_workflow(
 pub async fn get_run_approvals(
     workflow_id: String,
     run_id: String,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<WorkflowApprovalsWire, String> {
     let workflow_id =
         uuid::Uuid::parse_str(&workflow_id).map_err(|_| "invalid workflow id".to_string())?;
     let run_id =
         uuid::Uuid::parse_str(&run_id).map_err(|_| "invalid workflow run id".to_string())?;
-    get_relay_json(
+    get_relay_json_at(
         &state,
+        &relay.api_base(),
         &format!("/workflows/{workflow_id}/runs/{run_id}/approvals"),
     )
     .await
@@ -351,10 +365,11 @@ pub async fn get_run_approvals(
 pub async fn grant_approval(
     token: String,
     note: Option<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<Value, String> {
     let builder = events::build_approval_grant(&token, note.as_deref())?;
-    let result = submit_event(builder, &state).await?;
+    let result = submit_event_at(builder, &state, &relay.api_base()).await?;
     Ok(serde_json::json!({ "event_id": result.event_id }))
 }
 
@@ -362,10 +377,11 @@ pub async fn grant_approval(
 pub async fn deny_approval(
     token: String,
     note: Option<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<Value, String> {
     let builder = events::build_approval_deny(&token, note.as_deref())?;
-    let result = submit_event(builder, &state).await?;
+    let result = submit_event_at(builder, &state, &relay.api_base()).await?;
     Ok(serde_json::json!({ "event_id": result.event_id }))
 }
 

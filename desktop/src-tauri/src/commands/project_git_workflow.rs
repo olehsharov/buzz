@@ -423,9 +423,10 @@ pub async fn clone_project_repository(
     project_dtag: String,
     clone_url: String,
     default_branch: Option<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<ProjectRepoCloneResult, String> {
-    validate_local_clone_url_for_workspace(&clone_url, &state)?;
+    validate_local_clone_url_for_workspace(&clone_url, &relay)?;
     let auth = build_git_clone_auth_config(&clone_url, &state)?;
     tauri::async_runtime::spawn_blocking(move || {
         clone_project_repository_blocking(
@@ -493,6 +494,7 @@ pub async fn publish_project_pull_request_merged_status(
 pub async fn merge_project_pull_request(
     input: ProjectPullRequestMergeInput,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<ProjectRepoMergeResult, ProjectPullRequestMergeError> {
     let ProjectPullRequestMergeInput {
@@ -507,8 +509,8 @@ pub async fn merge_project_pull_request(
         source_branch,
         expected_commit,
     } = input;
-    validate_workspace_clone_url(&target_clone_url, &state)?;
-    validate_workspace_clone_url(&source_clone_url, &state)?;
+    validate_workspace_clone_url(&target_clone_url, &relay)?;
+    validate_workspace_clone_url(&source_clone_url, &relay)?;
     let target_owner = target_owner.trim().to_ascii_lowercase();
     if target_owner.len() != 64 || !target_owner.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err("Invalid target repository owner.".to_string().into());

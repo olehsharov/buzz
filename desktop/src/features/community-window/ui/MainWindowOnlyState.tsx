@@ -1,9 +1,9 @@
 import { OpenInMainWindowButton } from "@/features/popout/ui/PopoutChrome";
 
 /**
- * Shown in a community window in place of a main-window-only screen (agents,
- * projects, workflows, settings). The one action brings the main window
- * forward, so the user always has a way to the screen they asked for.
+ * Shown in a community window in place of a main-window-only screen (app
+ * settings). The one action brings the main window forward, so the user
+ * always has a way to the screen they asked for.
  */
 export function MainWindowOnlyState() {
   return (
@@ -14,8 +14,7 @@ export function MainWindowOnlyState() {
     >
       <h2 className="text-base font-semibold">Available in the main window</h2>
       <p className="max-w-sm text-sm text-muted-foreground">
-        Agents, projects, workflows, and settings are managed from the main Buzz
-        window.
+        Settings are managed from the main Buzz window.
       </p>
       <OpenInMainWindowButton destination={null} focusOnly />
     </div>

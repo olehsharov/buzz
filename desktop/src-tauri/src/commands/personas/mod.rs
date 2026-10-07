@@ -90,7 +90,7 @@ pub async fn list_personas(
             .map_err(|error| error.to_string())?;
         let mut personas = load_personas(&app)?;
         retain_community_personas(&app, &community_relay, &mut personas)?;
-        pending::project_active_persona_sharing(&app, &state, &mut personas);
+        pending::project_active_persona_sharing(&app, &state, relay.ws_url(), &mut personas);
         Ok(personas)
     })
     .await
@@ -176,7 +176,11 @@ fn commit_cascade_agents(
 }
 
 #[tauri::command]
-pub async fn delete_persona(id: String, app: AppHandle) -> Result<(), String> {
+pub async fn delete_persona(
+    id: String,
+    app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
+) -> Result<(), String> {
     use tauri::Manager;
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -304,9 +308,9 @@ pub async fn delete_persona(id: String, app: AppHandle) -> Result<(), String> {
                 delete_agent_key(pk);
                 // Tombstone + NIP-IA kind:9035 archive enqueue atomically; the
                 // archive's `persona_id` is derived from the retained 30177 head.
-                super::agents::tombstone_managed_agent_pending(&app, &state, pk);
+                super::agents::tombstone_managed_agent_pending(&app, &state, relay.ws_url(), pk);
             }
-            tombstone_persona_pending(&app, &state, &d_tag);
+            tombstone_persona_pending(&app, &state, relay.ws_url(), &d_tag);
 
             // _store_guard drops here, before try_regenerate_nest.
         }

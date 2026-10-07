@@ -633,7 +633,10 @@ pub async fn mint_agent_card(
             record.pubkey.clone(),
             &app,
             &state,
-            &crate::relay::relay_api_base_url_with_override(&state),
+            &crate::relay::relay_http_base_url(&crate::relay::effective_agent_relay_url(
+                &record.relay_url,
+                &crate::relay::relay_ws_url_with_override(&state),
+            )),
         )
         .await?;
         memory_entries_from_listing(listing, memory_level)
@@ -675,8 +678,13 @@ pub async fn mint_agent_card(
             // Relay-hosted avatars (kind:0 pictures under the relay's /media/)
             // require Blossom get-auth. Mint the header ONLY for same-origin URLs
             // so the token never leaves the relay (same contract as
-            // `media_download.rs`).
-            let relay_base = crate::relay::relay_api_base_url_with_override(&state);
+            // `media_download.rs`). The agent's avatar lives on its own
+            // community relay.
+            let relay_base =
+                crate::relay::relay_http_base_url(&crate::relay::effective_agent_relay_url(
+                    &record.relay_url,
+                    &crate::relay::relay_ws_url_with_override(&state),
+                ));
             let auth = is_same_origin(url, &relay_base)
                 .then(|| crate::commands::media::mint_media_get_auth(&state, &relay_base))
                 .flatten();

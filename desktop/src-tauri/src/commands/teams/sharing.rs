@@ -48,6 +48,7 @@ pub async fn set_team_shared(
     id: String,
     shared: bool,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
 ) -> Result<SetTeamSharedResult, String> {
     let prepared = tokio::task::spawn_blocking({
         let app = app.clone();
@@ -70,7 +71,7 @@ pub async fn set_team_shared(
             let members = resolve_team_members(team, &load_personas(&app)?)?;
             // Strict path: unlike ordinary team saves, an enqueue failure for
             // this privacy-sensitive toggle must reach the command/UI.
-            prepare_team_publication(&app, &state, team, &members, Some(shared))
+            prepare_team_publication(&app, &state, relay.ws_url(), team, &members, Some(shared))
         }
     })
     .await

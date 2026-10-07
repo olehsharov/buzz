@@ -128,9 +128,10 @@ pub async fn get_project_repo_file_content(
     target_ref: Option<String>,
     target_commit: Option<String>,
     path: String,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<Option<String>, String> {
-    validate_workspace_clone_url(&clone_url, &state)?;
+    validate_workspace_clone_url(&clone_url, &relay)?;
     validate_repo_file_path(&path)?;
     let auth = build_git_auth_config(&state)?;
     let branch = clean_branch(default_branch);

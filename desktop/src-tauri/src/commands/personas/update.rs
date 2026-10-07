@@ -125,16 +125,25 @@ type ProfileSyncParams = Vec<(
 pub async fn update_persona(
     input: UpdatePersonaRequest,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
 ) -> Result<UpdatePersonaResult, String> {
-    let (persona, ()) = update_persona_with(input, app, |app, state, persona| {
-        retain_persona_pending(app, state, persona);
-        // F2: immediately refresh any shared 30178 heads that include this
-        // persona as a member. Best-effort inside retain so a hiccup cannot
-        // fail the persona edit itself.
-        crate::commands::refresh_team_catalog_heads_for_persona(app, state, &persona.id);
-        Ok(())
-    })
-    .await?;
+    let community_relay = relay.ws_url().to_string();
+    let retain_relay = community_relay.clone();
+    let (persona, ()) =
+        update_persona_with(input, app, community_relay, move |app, state, persona| {
+            retain_persona_pending(app, state, &retain_relay, persona);
+            // F2: immediately refresh any shared 30178 heads that include this
+            // persona as a member. Best-effort inside retain so a hiccup cannot
+            // fail the persona edit itself.
+            crate::commands::refresh_team_catalog_heads_for_persona(
+                app,
+                state,
+                &retain_relay,
+                &persona.id,
+            );
+            Ok(())
+        })
+        .await?;
     Ok(UpdatePersonaResult { persona })
 }
 
@@ -148,6 +157,9 @@ pub async fn update_persona(
 pub(super) async fn update_persona_with<R: Send + 'static>(
     input: UpdatePersonaRequest,
     app: AppHandle,
+    // The invoking window's community: its retention scope holds the
+    // definition's sharing state.
+    community_relay: String,
     retain: impl FnOnce(&AppHandle, &AppState, &AgentDefinition) -> Result<R, String> + Send + 'static,
 ) -> Result<(AgentDefinition, R), String> {
     use tauri::Manager;
@@ -172,7 +184,7 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
                 .lock()
                 .map_err(|error| error.to_string())?;
             let mut personas = load_personas(&app)?;
-            pending::project_active_persona_sharing(&app, &state, &mut personas);
+            pending::project_active_persona_sharing(&app, &state, &community_relay, &mut personas);
             let persona = personas
                 .iter_mut()
                 .find(|record| record.id == input.id)

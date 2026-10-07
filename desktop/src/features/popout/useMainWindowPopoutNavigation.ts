@@ -1,4 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import * as React from "react";
 
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
@@ -11,7 +12,15 @@ import { parsePopoutRoute } from "@/features/popout/popoutRoute";
  * (MVP destinations only) and committed through the normal navigation choke
  * point. Anything else ("/" from a paused pop-out) is a focus-only request.
  */
-export function useMainWindowPopoutNavigation(enabled: boolean): void {
+export function useMainWindowPopoutNavigation(
+  enabled: boolean,
+  /**
+   * A community window follows its own pop-outs. It listens on its own window
+   * target only: a global listener would also follow navigations the native
+   * side addresses to the main window.
+   */
+  windowScoped = false,
+): void {
   const { goChannel, goForumPost, goProfile } = useAppNavigation();
 
   const navigateTo = React.useEffectEvent((route: unknown) => {
@@ -44,7 +53,10 @@ export function useMainWindowPopoutNavigation(enabled: boolean): void {
     if (!enabled) return;
     let cancelled = false;
     let unlisten: (() => void) | null = null;
-    void listen<{ route?: unknown }>(POPOUT_NAVIGATE_MAIN_EVENT, (event) => {
+    const subscribe = windowScoped
+      ? getCurrentWebviewWindow().listen.bind(getCurrentWebviewWindow())
+      : listen;
+    void subscribe<{ route?: unknown }>(POPOUT_NAVIGATE_MAIN_EVENT, (event) => {
       if (!cancelled) navigateTo(event.payload?.route);
     })
       .then((cleanup) => {
@@ -58,5 +70,5 @@ export function useMainWindowPopoutNavigation(enabled: boolean): void {
       cancelled = true;
       unlisten?.();
     };
-  }, [enabled]);
+  }, [enabled, windowScoped]);
 }

@@ -70,12 +70,14 @@ struct CatalogAgentProjection {
 /// response cannot populate the new community's query cache.
 #[tauri::command]
 pub(crate) async fn fetch_persona_catalog(
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
     relay_client: State<'_, NativeRelayClient>,
 ) -> Result<Vec<PersonaCatalogPublication>, String> {
     let keys = state.signing_keys()?;
     let owner = keys.public_key().to_hex();
-    let relay_url = crate::relay::relay_ws_url_with_override(&state);
+    // The invoking window's community catalog.
+    let relay_url = relay.ws_url().to_string();
     let session = relay_client.session(relay_url.clone(), keys).await;
     let mut by_id = HashMap::new();
     let mut until = None;
@@ -108,9 +110,7 @@ pub(crate) async fn fetch_persona_catalog(
     }
 
     let current_keys = state.signing_keys()?;
-    if current_keys.public_key().to_hex() != owner
-        || crate::relay::relay_ws_url_with_override(&state) != relay_url
-    {
+    if current_keys.public_key().to_hex() != owner || !relay.is_current(&state) {
         return Err("persona catalog scope changed while fetching".to_string());
     }
 

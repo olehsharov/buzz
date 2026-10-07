@@ -33,6 +33,10 @@ pub(crate) const NAVIGATE_MAIN_EVENT: &str = "popout:navigate-main";
 pub struct PopoutLaunch {
     pub route: String,
     pub community: serde_json::Value,
+    /// True when the pop-out was opened from a community window and inherits
+    /// that window's relay binding: it then follows its parent window's
+    /// community instead of pausing whenever the main window is elsewhere.
+    pub bound: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -105,6 +109,9 @@ struct RegistryInner {
     open: HashSet<String>,
     /// Launch payloads not yet taken by their window.
     launches: HashMap<String, PopoutLaunch>,
+    /// Parent community window of a pop-out that inherited its binding;
+    /// "Open in main window" hands the route to that window instead.
+    parents: HashMap<String, String>,
 }
 
 /// Tracks open pop-out windows and their one-time launch payloads.
@@ -148,6 +155,19 @@ impl PopoutRegistry {
         let mut inner = self.lock();
         inner.open.remove(label);
         inner.launches.remove(label);
+        inner.parents.remove(label);
+    }
+
+    /// Record that pop-out `label` follows community window `parent`.
+    pub(crate) fn set_parent(&self, label: &str, parent: &str) {
+        self.lock()
+            .parents
+            .insert(label.to_owned(), parent.to_owned());
+    }
+
+    /// The community window pop-out `label` follows, if any.
+    pub(crate) fn parent(&self, label: &str) -> Option<String> {
+        self.lock().parents.get(label).cloned()
     }
 
     #[cfg(test)]
@@ -167,13 +187,32 @@ pub async fn open_popout_window(
     route: String,
     community: serde_json::Value,
     app: tauri::AppHandle,
+    webview: tauri::Webview,
     registry: State<'_, PopoutRegistry>,
 ) -> Result<String, String> {
     validate_route(&route)?;
     validate_community(&community)?;
 
     let label = format!("{POPOUT_LABEL_PREFIX}{}", uuid::Uuid::new_v4());
-    registry.reserve(&label, PopoutLaunch { route, community })?;
+    // A pop-out opened from a community window inherits that window's relay
+    // binding, so its commands keep targeting the parent's community.
+    let parent = webview.label().to_string();
+    let inherited = crate::window_relay::is_community_window_label(&parent)
+        .then(|| inherit_parent_relay(&app, &parent, &label))
+        .transpose()?
+        .flatten();
+    let bound = inherited.is_some();
+    registry.reserve(
+        &label,
+        PopoutLaunch {
+            route,
+            community,
+            bound,
+        },
+    )?;
+    if bound {
+        registry.set_parent(&label, &parent);
+    }
 
     let built = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App("index.html".into()))
         .title("Buzz")
@@ -188,6 +227,10 @@ pub async fn open_popout_window(
         Ok(window) => window,
         Err(error) => {
             registry.release(&label);
+            crate::window_relay::release_window_relay(
+                &app.state::<crate::app_state::AppState>(),
+                &label,
+            );
             return Err(error.to_string());
         }
     };
@@ -195,6 +238,22 @@ pub async fn open_popout_window(
         eprintln!("buzz-desktop: failed to focus pop-out window: {error}");
     }
     Ok(label)
+}
+
+/// Copy community window `parent`'s relay binding onto pop-out `label`.
+/// `Ok(None)` when the parent is not bound (it then fails closed itself).
+pub(crate) fn inherit_parent_relay<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    parent: &str,
+    label: &str,
+) -> Result<Option<String>, String> {
+    let state = app.state::<crate::app_state::AppState>();
+    let mut relays = state.window_relays.lock().map_err(|e| e.to_string())?;
+    let Some(relay_url) = relays.get(parent).cloned() else {
+        return Ok(None);
+    };
+    relays.insert(label.to_string(), relay_url.clone());
+    Ok(Some(relay_url))
 }
 
 /// Return and remove the calling pop-out window's launch payload. Returns
@@ -208,12 +267,21 @@ pub fn take_popout_launch(
 }
 
 /// Bring the main window forward and ask it (and only it) to navigate to
-/// `route`.
+/// `route`. A pop-out that follows a community window hands the route to
+/// that window instead: the main window is on another community.
 #[tauri::command]
-pub fn focus_main_window_route(route: String, app: tauri::AppHandle) -> Result<(), String> {
+pub fn focus_main_window_route(
+    route: String,
+    app: tauri::AppHandle,
+    webview: tauri::Webview,
+    registry: State<'_, PopoutRegistry>,
+) -> Result<(), String> {
     validate_route(&route)?;
+    let target = registry
+        .parent(webview.label())
+        .unwrap_or_else(|| MAIN_WINDOW_LABEL.to_string());
     let window = app
-        .get_webview_window(MAIN_WINDOW_LABEL)
+        .get_webview_window(&target)
         .ok_or("main window is unavailable")?;
     if let Err(error) = window.unminimize() {
         eprintln!("buzz-desktop: failed to unminimize main window: {error}");
@@ -225,7 +293,7 @@ pub fn focus_main_window_route(route: String, app: tauri::AppHandle) -> Result<(
         eprintln!("buzz-desktop: failed to focus main window: {error}");
     }
     app.emit_to(
-        MAIN_WINDOW_LABEL,
+        target.as_str(),
         NAVIGATE_MAIN_EVENT,
         NavigateMainPayload { route },
     )

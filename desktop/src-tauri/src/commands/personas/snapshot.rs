@@ -283,12 +283,14 @@ pub(crate) async fn materialize_snapshot_bytes(
             } else {
                 &def_record.pubkey
             };
-            Some(validate_memory_source(
-                mpk,
-                is_definition,
-                def_id,
-                &instances,
-            )?)
+            let pubkey = validate_memory_source(mpk, is_definition, def_id, &instances)?;
+            // Memory lives on the source agent's own community relay.
+            let memory_relay = instances
+                .iter()
+                .find(|instance| instance.pubkey == pubkey)
+                .map(|instance| instance.relay_url.clone())
+                .unwrap_or_default();
+            Some((pubkey, memory_relay))
         } else {
             None
         };
@@ -310,18 +312,22 @@ pub(crate) async fn materialize_snapshot_bytes(
         .and_then(crate::managed_agents::agent_snapshot::decode_avatar_data_url);
 
     // ── Fetch memory ─────────────────────────────────────────────────────────
-    let memory_entries: Vec<AgentSnapshotMemoryEntry> = if let Some(pubkey) = memory_pubkey {
-        let listing = crate::commands::engrams::load_agent_memory(
-            pubkey,
-            &app,
-            &state,
-            &crate::relay::relay_api_base_url_with_override(&state),
-        )
-        .await?;
-        memory_entries_from_listing(listing, memory_level)
-    } else {
-        Vec::new()
-    };
+    let memory_entries: Vec<AgentSnapshotMemoryEntry> =
+        if let Some((pubkey, memory_relay)) = memory_pubkey {
+            let listing = crate::commands::engrams::load_agent_memory(
+                pubkey,
+                &app,
+                &state,
+                &crate::relay::relay_http_base_url(&crate::relay::effective_agent_relay_url(
+                    &memory_relay,
+                    &crate::relay::relay_ws_url_with_override(&state),
+                )),
+            )
+            .await?;
+            memory_entries_from_listing(listing, memory_level)
+        } else {
+            Vec::new()
+        };
 
     // ── Build manifest ───────────────────────────────────────────────────────
     let snapshot = build_snapshot(

@@ -190,6 +190,18 @@ fn harness() -> Harness {
             crate::commands::agent_discovery::relay_directory::list_relay_agents,
             crate::commands::agent_discovery::relay_directory::revalidate_relay_agents,
             list_managed_agents,
+            get_host_install_info,
+            get_channel_workflows,
+            get_channels_workflows,
+            get_workflow,
+            get_workflow_runs,
+            create_workflow,
+            update_workflow,
+            delete_workflow,
+            trigger_workflow,
+            get_run_approvals,
+            grant_approval,
+            deny_approval,
         ])
         .build(context)
         .unwrap();
@@ -593,6 +605,62 @@ fn rows() -> Vec<Row> {
             cmd: "get_relay_self",
             args: |_| json!({}),
         },
+        // commands/workflows.rs
+        Row {
+            file: "workflows.rs",
+            cmd: "get_channel_workflows",
+            args: |_| json!({ "channelId": CHANNEL }),
+        },
+        Row {
+            file: "workflows.rs",
+            cmd: "get_channels_workflows",
+            args: |_| json!({ "channelIds": [CHANNEL] }),
+        },
+        Row {
+            file: "workflows.rs",
+            cmd: "get_workflow",
+            args: |_| json!({ "workflowId": CHANNEL }),
+        },
+        Row {
+            file: "workflows.rs",
+            cmd: "get_workflow_runs",
+            args: |_| json!({ "workflowId": CHANNEL }),
+        },
+        Row {
+            file: "workflows.rs",
+            cmd: "create_workflow",
+            args: |_| json!({ "channelId": CHANNEL, "yamlDefinition": "name: w\n" }),
+        },
+        Row {
+            file: "workflows.rs",
+            cmd: "update_workflow",
+            args: |_| json!({ "workflowId": CHANNEL, "yamlDefinition": "name: w\n", "expectedRevision": EVENT }),
+        },
+        Row {
+            file: "workflows.rs",
+            cmd: "delete_workflow",
+            args: |_| json!({ "workflowId": CHANNEL }),
+        },
+        Row {
+            file: "workflows.rs",
+            cmd: "trigger_workflow",
+            args: |_| json!({ "workflowId": CHANNEL }),
+        },
+        Row {
+            file: "workflows.rs",
+            cmd: "get_run_approvals",
+            args: |_| json!({ "workflowId": CHANNEL, "runId": CHANNEL }),
+        },
+        Row {
+            file: "workflows.rs",
+            cmd: "grant_approval",
+            args: |_| json!({ "token": CHANNEL }),
+        },
+        Row {
+            file: "workflows.rs",
+            cmd: "deny_approval",
+            args: |_| json!({ "token": CHANNEL }),
+        },
         // commands/agent_discovery/relay_directory.rs (mention directory)
         Row {
             file: "agent_discovery/relay_directory.rs",
@@ -798,4 +866,60 @@ fn community_window_lists_only_its_own_communitys_agents() {
     assert_eq!(pubkeys_at(&managed(&h.community).unwrap(), ""), vec![b_hex]);
     assert_eq!(pubkeys_at(&managed(&h.main).unwrap(), ""), vec![a_hex]);
     crate::relay_admission::reset_rate_limit_gate();
+}
+
+/// Projects: every git command validates its clone URL against the invoking
+/// window's relay (`validate_workspace_clone_url`) before touching a repo, so
+/// a community window works on its own community's repositories and a clone
+/// URL from another community is refused. One table over both windows.
+#[test]
+fn project_clone_urls_are_scoped_to_the_invoking_windows_relay() {
+    let h = harness();
+    let state = h.main.state::<AppState>();
+    let owner = "a".repeat(64);
+    let repo = |base: &str| format!("{base}/git/{owner}/repo");
+    let window_b = crate::window_relay::WindowRelay::resolve(&state, COMMUNITY_LABEL).unwrap();
+    let main = crate::window_relay::WindowRelay::resolve(&state, "main").unwrap();
+    for (relay, own, other) in [
+        (
+            &window_b,
+            &h.community_relay.http_base,
+            &h.main_relay.http_base,
+        ),
+        (&main, &h.main_relay.http_base, &h.community_relay.http_base),
+    ] {
+        crate::commands::project_git_exec::validate_workspace_clone_url(&repo(own), relay)
+            .unwrap_or_else(|error| panic!("own repo refused: {error}"));
+        assert!(
+            crate::commands::project_git_exec::validate_workspace_clone_url(&repo(other), relay)
+                .is_err(),
+            "another community's repo must be refused"
+        );
+        // GitHub remotes stay allowed for local checkouts in every window.
+        crate::commands::project_git_exec::validate_local_clone_url_for_workspace(
+            "https://github.com/block/buzz.git",
+            relay,
+        )
+        .unwrap();
+    }
+}
+
+/// Machines (agent hosts) are approved per community: the "Add machine"
+/// installer a community window shows points at its own community's relay.
+#[test]
+fn host_install_info_names_the_invoking_windows_relay() {
+    let h = harness();
+    let base_of = |window| {
+        invoke(
+            window,
+            "get_host_install_info",
+            json!({ "pairingUri": "pair-uri" }),
+        )
+        .unwrap()["base_url"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert!(base_of(&h.community).starts_with(&h.community_relay.http_base));
+    assert!(base_of(&h.main).starts_with(&h.main_relay.http_base));
 }

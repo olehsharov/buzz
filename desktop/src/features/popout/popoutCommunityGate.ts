@@ -42,16 +42,30 @@ export function evaluatePopoutCommunityGate({
   communities,
   mainActiveCommunityId,
   backendRelayUrl,
+  bound = false,
 }: {
   popoutCommunityId: string;
   communities: readonly Pick<Community, "id" | "relayUrl">[];
   mainActiveCommunityId: string | null;
   backendRelayUrl: string | null | undefined;
+  /**
+   * Opened from a community window: the native side bound this pop-out to
+   * that window's relay, so the main window's community is irrelevant; it
+   * runs while its own relay is the one this window resolves.
+   */
+  bound?: boolean;
 }): PopoutCommunityGateStatus {
   const own = communities.find(
     (community) => community.id === popoutCommunityId,
   );
   if (!own) return "missing";
+  if (bound) {
+    if (backendRelayUrl === undefined) return "checking";
+    if (backendRelayUrl === null) return "paused";
+    return relayKey(backendRelayUrl) === relayKey(own.relayUrl)
+      ? "active"
+      : "paused";
+  }
   // Mirror useCommunities: an unknown stored id falls back to the first.
   const mainActive =
     communities.find((community) => community.id === mainActiveCommunityId) ??
@@ -86,6 +100,7 @@ export type PopoutCommunityGate = {
  */
 export function usePopoutCommunityGate(
   popoutCommunityId: string,
+  bound = false,
 ): PopoutCommunityGate {
   const [gate, setGate] = React.useState<PopoutCommunityGate>(() => ({
     status: "checking",
@@ -124,6 +139,7 @@ export function usePopoutCommunityGate(
           communities,
           mainActiveCommunityId,
           backendRelayUrl,
+          bound,
         });
       // Storage alone can already prove a mismatch: pause synchronously,
       // before any backend round-trip, so writes stop as soon as the main
@@ -168,7 +184,7 @@ export function usePopoutCommunityGate(
       document.removeEventListener("visibilitychange", onVisibility);
       window.clearInterval(interval);
     };
-  }, [popoutCommunityId]);
+  }, [popoutCommunityId, bound]);
 
   return gate;
 }

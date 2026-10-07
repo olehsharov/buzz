@@ -52,7 +52,9 @@ impl RelayTarget {
 }
 
 /// Capture the effective relay target once, before any network work.
+// window-relay: the main window's nest regeneration (AGENTS.md) target.
 pub(crate) fn capture_relay_target(state: &AppState) -> RelayTarget {
+    // window-relay: the main window's workspace (nest regeneration).
     match workspace_relay_override(state) {
         Some(url) => RelayTarget {
             api_base_url: relay_http_base_url(&url),

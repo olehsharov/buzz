@@ -211,6 +211,7 @@ pub(crate) async fn reconcile_agent_profile<R: tauri::Runtime>(
     let relay_url = resolve_reconcile_relay(
         data.target_relay_url.as_deref(),
         &data.relay_url,
+        // window-relay: unassigned-record fallback behind the pinned target.
         &relay_ws_url_with_override(state),
     );
 

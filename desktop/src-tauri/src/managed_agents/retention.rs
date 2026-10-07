@@ -74,7 +74,18 @@ pub fn active_retention_scope<R: tauri::Runtime>(
     app: &AppHandle<R>,
     state: &AppState,
 ) -> Result<RetentionScope, String> {
-    let relay_url = crate::relay::relay_ws_url_with_override(state);
+    retention_scope_for(app, state, &crate::relay::relay_ws_url_with_override(state))
+}
+
+/// Snapshot the owner and resolve the durable event store of the community
+/// on `relay_url` — the invoking window's community for window-scoped
+/// commands (a community window owns its community's scope while open).
+pub fn retention_scope_for<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    relay_url: &str,
+) -> Result<RetentionScope, String> {
+    let relay_url = relay_url.to_string();
     let owner_keys = state.signing_keys()?;
     let base_dir = super::managed_agents_base_dir(app)?;
     let db_path =
@@ -101,10 +112,11 @@ pub fn active_retention_scope<R: tauri::Runtime>(
 pub fn arrival_retention_scope<R: tauri::Runtime>(
     app: &AppHandle<R>,
     state: &AppState,
+    community_relay: &str,
     arrival_relay_url: &str,
 ) -> Result<Option<RetentionScope>, String> {
     Ok(scope_for_arrival(
-        active_retention_scope(app, state)?,
+        retention_scope_for(app, state, community_relay)?,
         arrival_relay_url,
     ))
 }

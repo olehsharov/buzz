@@ -18,9 +18,9 @@ use crate::{
     managed_agents::{
         agent_snapshot::{build_snapshot, AgentSnapshot, AgentSnapshotMemoryEntry, MemoryLevel},
         load_managed_agents, load_personas, load_teams, load_teams_readonly, save_managed_agents,
-        save_personas, save_teams, AgentDefinition, ManagedAgentRecord, TeamRecord,
+        save_teams, AgentDefinition, ManagedAgentRecord, TeamRecord,
     },
-    relay::{effective_agent_relay_url, relay_ws_url_with_override, sync_managed_agent_profile},
+    relay::{effective_agent_relay_url, sync_managed_agent_profile},
     util::now_iso,
 };
 
@@ -357,11 +357,15 @@ async fn materialize_team_snapshot_bytes(
                     && r.persona_id.as_deref() == Some(persona_id.as_str())
             });
             if let Some(instance) = instance {
+                // Memory lives on the agent's own community relay.
                 let listing = crate::commands::engrams::load_agent_memory(
                     instance.pubkey.clone(),
                     &app,
                     &state,
-                    &crate::relay::relay_api_base_url_with_override(&state),
+                    &crate::relay::relay_http_base_url(&effective_agent_relay_url(
+                        &instance.relay_url,
+                        &crate::relay::relay_ws_url_with_override(&state),
+                    )),
                 )
                 .await?;
                 let mut entries = Vec::new();
@@ -512,6 +516,7 @@ pub async fn preview_team_snapshot_import(
 pub async fn confirm_team_snapshot_import(
     input: TeamSnapshotImportConfirm,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<TeamSnapshotImportResult, String> {
     // ── Phase 1: validate (no I/O) ───────────────────────────────────────────
@@ -573,7 +578,7 @@ pub async fn confirm_team_snapshot_import(
             persona_id: Some(definition.id.clone()),
             private_key_nsec: private_key_nsec.clone(),
             auth_tag: auth_tag.clone(),
-            relay_url: String::new(),
+            relay_url: relay.ws_url().to_string(),
             avatar_url: effective_avatar_url.clone(),
             acp_command: crate::managed_agents::DEFAULT_ACP_COMMAND.to_string(),
             agent_command: String::new(),
@@ -724,7 +729,14 @@ pub async fn confirm_team_snapshot_import(
         for m in &minted {
             personas.push(m.definition.clone());
         }
-        if let Err(e) = save_personas(&app, &personas) {
+        let new_definition_ids: Vec<&str> =
+            minted.iter().map(|m| m.definition.id.as_str()).collect();
+        if let Err(e) = crate::managed_agents::save_personas_assigning(
+            &app,
+            &personas,
+            &new_definition_ids,
+            relay.ws_url(),
+        ) {
             return Err(rollback_agents(e));
         }
 
@@ -761,12 +773,17 @@ pub async fn confirm_team_snapshot_import(
 
         // All writes committed — safe to update in-memory state.
         for m in &minted {
-            crate::commands::personas::retain_persona_pending(&app, &state, &m.definition);
+            crate::commands::personas::retain_persona_pending(
+                &app,
+                &state,
+                relay.ws_url(),
+                &m.definition,
+            );
         }
         for m in &minted {
-            retain_agent_pending(&app, &state, &m.record);
+            retain_agent_pending(&app, &state, relay.ws_url(), &m.record);
         }
-        crate::commands::teams::retain_team_pending(&app, &state, &imported_team);
+        crate::commands::teams::retain_team_pending(&app, &state, relay.ws_url(), &imported_team);
 
         crate::managed_agents::try_regenerate_nest(&app);
         let _ = app.emit("agents-data-changed", ());
@@ -775,7 +792,7 @@ pub async fn confirm_team_snapshot_import(
     };
 
     // ── Phase 4 & 5: profile sync + memory restore (async, outside lock) ────
-    let relay_ws = relay_ws_url_with_override(&state);
+    let relay_ws = relay.ws_url().to_string();
     let mut member_results: Vec<TeamSnapshotImportMemberResult> = Vec::with_capacity(minted.len());
 
     for (m, snap_member) in minted.iter().zip(snapshot.members.iter()) {
@@ -870,7 +887,12 @@ pub async fn confirm_team_snapshot_import(
 
 /// Inline retention for the managed-agent kind:30177 event — mirrors
 /// `commands::personas::snapshot::import::retain_agent_pending`.
-fn retain_agent_pending(app: &AppHandle, state: &AppState, record: &ManagedAgentRecord) {
+fn retain_agent_pending(
+    app: &AppHandle,
+    state: &AppState,
+    community_relay: &str,
+    record: &ManagedAgentRecord,
+) {
     use crate::managed_agents::{
         agent_events::{agent_event_content, build_agent_event},
         persona_events::monotonic_created_at,
@@ -880,7 +902,8 @@ fn retain_agent_pending(app: &AppHandle, state: &AppState, record: &ManagedAgent
     use nostr::JsonUtil;
 
     let result = (|| -> Result<(), String> {
-        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+        let scope =
+            crate::managed_agents::retention::retention_scope_for(app, state, community_relay)?;
         let conn = open_retention_db(&scope.db_path)?;
         let content = serde_json::to_string(&agent_event_content(record))
             .map_err(|e| format!("failed to serialize agent content: {e}"))?;

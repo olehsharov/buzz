@@ -138,6 +138,7 @@ async fn pairing_host_live_approve_deploy_undeploy_forget() {
         app.state(),
         app.state(),
         PairingMode::ApproveHost,
+        crate::relay::relay_ws_url_with_override(&app.state::<AppState>()),
     )
     .await
     .expect("start host pairing");

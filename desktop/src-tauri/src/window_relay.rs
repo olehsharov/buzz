@@ -18,7 +18,7 @@
 use std::collections::HashSet;
 
 use tauri::ipc::{CommandArg, CommandItem, InvokeError};
-use tauri::{Manager, Runtime, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{Manager, Runtime, WebviewUrl, WebviewWindowBuilder};
 
 use crate::app_state::AppState;
 use crate::relay::{relay_http_base_url, relay_ws_url_with_override};
@@ -99,6 +99,11 @@ impl WindowRelay {
             label: window_label.to_string(),
             ws_url: relay_ws_url_for_window(state, window_label)?,
         })
+    }
+
+    /// The invoking window's label.
+    pub fn label(&self) -> &str {
+        &self.label
     }
 
     /// The relay WebSocket URL (`ws://` / `wss://`).
@@ -225,13 +230,31 @@ pub(crate) fn bound_relay_base_for_authority(state: &AppState, authority: &str) 
 
 /// Bind the calling community window to `relay_url` (validated against the
 /// saved community list). Re-binding replaces the previous relay.
+///
+/// Then reconcile this community's scoped event store, exactly as
+/// `apply_workspace` does for the main window's community, and before the
+/// window exposes its community: local agent, definition, and team records
+/// of this community are retained (and flushed by the shared publisher) so
+/// its catalogs and agent records are current while the window owns it. The
+/// two-writer guard keeps the main window off this community meanwhile.
 #[tauri::command]
-pub fn bind_window_community(
+pub async fn bind_window_community(
     relay_url: String,
     webview: tauri::Webview,
-    state: State<'_, AppState>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
-    bind_window_relay(&state, webview.label(), &relay_url)
+    let state = app.state::<AppState>();
+    bind_window_relay(&state, webview.label(), &relay_url)?;
+    let scope =
+        crate::managed_agents::retention::retention_scope_for(&app, &state, relay_url.trim())?;
+    crate::event_sync::run_event_sync_blocking(
+        app.clone(),
+        scope.owner_keys,
+        scope.db_path,
+        scope.relay_url,
+    )
+    .await
+    .map_err(|error| format!("community event sync failed: {error}"))
 }
 
 fn validate_title(title: &str) -> Result<String, String> {
@@ -310,14 +333,22 @@ pub(crate) fn open_or_focus_community_window<R: Runtime>(
             created: false,
         });
     }
-    let built = WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
+    let builder = WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
         .title(title)
         .inner_size(1100.0, 760.0)
         .min_inner_size(640.0, 480.0)
         // Match the main window: HTML5 file drops reach the composer.
         .disable_drag_drop_handler()
-        .focused(true)
-        .build();
+        .focused(true);
+    // Match the main window's chrome (tauri.conf.json): an overlay title bar
+    // with the traffic lights where the app's top chrome leaves room for
+    // them. The top chrome is the drag region.
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true)
+        .traffic_light_position(tauri::LogicalPosition::new(16.0, 25.0));
+    let built = builder.build();
     match built {
         Ok(window) => {
             focus_window(&window);

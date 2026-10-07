@@ -167,9 +167,11 @@ pub(super) async fn start_local_agent_pairs_with_preflight(
     summarize_from_disk(app, record, &runtimes)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn start_local_agent_with_preflight<R: tauri::Runtime>(
     app: &AppHandle<R>,
     state: &AppState,
+    community_relay: &str,
     pubkey: &str,
     allow_fresh_create_start: bool,
     expected_relay_url: Option<&str>,
@@ -179,6 +181,7 @@ pub(super) async fn start_local_agent_with_preflight<R: tauri::Runtime>(
     start_local_agent_after_preflight(
         app,
         state,
+        community_relay,
         pubkey,
         expected_relay_url,
         expected_signer_pubkey,
@@ -193,9 +196,14 @@ pub(super) async fn start_local_agent_with_preflight<R: tauri::Runtime>(
 
 /// The ordinary start with its one awaited step, mesh preflight, supplied by
 /// the caller so tests can hold it open across a removal.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn start_local_agent_after_preflight<R, P, F>(
     app: &AppHandle<R>,
     state: &AppState,
+    // The community the start runs in: the invoking window's (a community
+    // window starts its own community's agents; the main window its active
+    // one). The agent must belong to it.
+    community_relay: &str,
     pubkey: &str,
     expected_relay_url: Option<&str>,
     expected_signer_pubkey: Option<&str>,
@@ -252,10 +260,8 @@ where
     // below — the check is tied to its use, so a switch landing after this
     // point can no longer retarget the spawn (it only changes state this
     // call no longer consults).
-    let workspace_relay_url = crate::relay::bind_expected_relay_scope(
-        expected_relay_url,
-        crate::relay::relay_ws_url_with_override(state),
-    )?;
+    let workspace_relay_url =
+        crate::relay::bind_expected_relay_scope(expected_relay_url, community_relay.to_string())?;
     // Bind the active owner after the same final await as the relay. A
     // same-relay identity replacement during mesh preflight must not release
     // the stale preflight owner to spawn.
@@ -390,6 +396,7 @@ pub(crate) fn list_community_managed_agents<R: tauri::Runtime>(
     // machines) reads this list, so this is the one place other communities'
     // agents are hidden. An unassigned record resolves to the active
     // workspace, as everywhere else.
+    // window-relay: unassigned-record fallback only (see record_in_community).
     let workspace_relay = crate::relay::relay_ws_url_with_override(&state);
     records
         .iter()
@@ -406,10 +413,28 @@ pub(crate) fn list_community_managed_agents<R: tauri::Runtime>(
         .collect()
 }
 
+/// The community a new agent belongs to: the invoking window's — always, for
+/// every backend (a community window creates agents of its own community;
+/// the main window, of its active one). The caller's captured community
+/// (`expected_relay_url`) must still be that window's, so a switch mid-create
+/// fails instead of assigning the agent elsewhere.
+pub(super) fn creation_community(
+    expected_relay_url: Option<&str>,
+    relay: &crate::window_relay::WindowRelay,
+) -> Result<String, String> {
+    Ok(
+        crate::relay::bind_expected_relay_scope(expected_relay_url, relay.ws_url().to_string())
+            .map_err(|_| "active community changed before the agent was created".to_string())?
+            .as_str()
+            .to_string(),
+    )
+}
+
 #[tauri::command]
 pub async fn create_managed_agent(
     input: CreateManagedAgentRequest,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<CreateManagedAgentResponse, String> {
     let name = input.name.trim().to_string();
@@ -478,17 +503,7 @@ pub async fn create_managed_agent(
             .to_bech32()
             .map_err(|error| format!("failed to encode private key: {error}"))?;
 
-        // An agent belongs to the community that is active when it is
-        // created — always, for every backend. The caller's captured
-        // community (`relay_url`) must still be the active one, so a switch
-        // mid-create fails instead of assigning the agent elsewhere.
-        let resolved_relay_url = crate::relay::bind_expected_relay_scope(
-            input.relay_url.as_deref(),
-            relay_ws_url_with_override(&state),
-        )
-        .map_err(|_| "active community changed before the agent was created".to_string())?
-        .as_str()
-        .to_string();
+        let resolved_relay_url = creation_community(input.relay_url.as_deref(), &relay)?;
 
         (keys, private_key_nsec, pubkey, resolved_relay_url, input)
     };
@@ -505,7 +520,7 @@ pub async fn create_managed_agent(
         crate::agent_hosts::ops::approved_host(
             &app,
             &app.state::<crate::agent_hosts::HostOps>(),
-            &relay_ws_url_with_override(&state),
+            relay.ws_url(),
             host_pubkey,
         )?;
     }
@@ -798,7 +813,17 @@ pub async fn create_managed_agent(
     // ── Phase 3b: local spawn (async preflight outside store lock) ───────────
     let mut spawn_error = None;
     let agent = if input.spawn_after_create && input.backend == BackendKind::Local {
-        match start_local_agent_with_preflight(&app, &state, &pubkey, true, None, None, None).await
+        match start_local_agent_with_preflight(
+            &app,
+            &state,
+            &resolved_relay_url,
+            &pubkey,
+            true,
+            None,
+            None,
+            None,
+        )
+        .await
         {
             Ok(agent) => agent,
             Err(error) => {
@@ -868,7 +893,7 @@ pub async fn create_managed_agent(
                 Err(e) => Some(e),
             }
         } else if let BackendKind::Host { ref host_pubkey } = input.backend {
-            match deploy_host_agent(&app, &state, &pubkey, host_pubkey).await {
+            match deploy_host_agent(&app, &state, &resolved_relay_url, &pubkey, host_pubkey).await {
                 Ok(()) => spawn_error,
                 Err(e) => Some(e),
             }
@@ -915,8 +940,11 @@ pub async fn start_managed_agent(
     expected_signer_pubkey: Option<String>,
     replay_floor_unix: Option<u64>,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<ManagedAgentSummary, String> {
+    // The community this start runs in: the invoking window's.
+    let community_relay = relay.ws_url().to_string();
     // Snapshot the workspace owner pubkey for the legacy auth_tag fallback.
     // Read outside the records lock to keep lock ordering simple.
     let owner_hex = workspace_owner_hex(&state)?;
@@ -930,10 +958,7 @@ pub async fn start_managed_agent(
     // the checked value rather than re-reading mutable state; the provider
     // path asserts against the relay embedded in the deploy payload before
     // deploying.
-    crate::relay::assert_expected_relay_scope(
-        expected_relay_url.as_deref(),
-        &crate::relay::relay_api_base_url_with_override(&state),
-    )?;
+    crate::relay::assert_expected_relay_scope(expected_relay_url.as_deref(), &relay.api_base())?;
     crate::relay::assert_expected_signer(expected_signer_pubkey.as_deref(), &owner_hex)?;
     // Pin the relay for the fire-and-forget profile reconciliation spawned
     // after a successful start: one validated workspace-relay read, captured
@@ -943,7 +968,7 @@ pub async fn start_managed_agent(
     // tenant's relay under authorization the caller only gave for this one.
     let reconcile_relay = crate::relay::bind_expected_relay_scope(
         expected_relay_url.as_deref(),
-        relay_ws_url_with_override(&state),
+        community_relay.clone(),
     )?;
     enum StartTarget {
         Local,
@@ -1024,6 +1049,7 @@ pub async fn start_managed_agent(
             start_local_agent_with_preflight(
                 &app,
                 &state,
+                &community_relay,
                 &pubkey,
                 false,
                 expected_relay_url.as_deref(),
@@ -1079,9 +1105,9 @@ pub async fn start_managed_agent(
             // callback must not deploy into a different community.
             crate::relay::assert_expected_relay_scope(
                 expected_relay_url.as_deref(),
-                &crate::relay::relay_api_base_url_with_override(&state),
+                &relay.api_base(),
             )?;
-            deploy_host_agent(&app, &state, &pubkey, &host_pubkey).await?;
+            deploy_host_agent(&app, &state, &community_relay, &pubkey, &host_pubkey).await?;
             let _store_guard = state
                 .managed_agents_store_lock
                 .lock()
@@ -1202,11 +1228,12 @@ fn run_managed_agent_deletion<T>(
 async fn deploy_host_agent(
     app: &AppHandle,
     state: &AppState,
+    community_relay: &str,
     pubkey: &str,
     host_pubkey: &str,
 ) -> Result<(), String> {
     use tauri::Manager;
-    let relay = relay_ws_url_with_override(state);
+    let relay = community_relay.to_string();
     let channel = crate::agent_hosts::channel::RelayHostChannel {
         relay_url: relay.clone(),
         owner_keys: state.signing_keys()?,
@@ -1233,6 +1260,7 @@ pub async fn delete_managed_agent(
     pubkey: String,
     force_remote_delete: Option<bool>,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
 ) -> Result<(), String> {
     use tauri::Manager;
     // A host agent is removed from its machine first, and the machine must
@@ -1254,7 +1282,7 @@ pub async fn delete_managed_agent(
         };
         if on_host && !force_remote_delete.unwrap_or(false) {
             let channel = crate::agent_hosts::channel::RelayHostChannel {
-                relay_url: relay_ws_url_with_override(&state),
+                relay_url: relay.ws_url().to_string(),
                 owner_keys: state.signing_keys()?,
             };
             crate::agent_hosts::ops::undeploy_agent_from_host(
@@ -1329,7 +1357,7 @@ pub async fn delete_managed_agent(
             // stops the identity appearing in member pickers and autocomplete —
             // is enqueued in the SAME transaction, its `persona_id` derived from
             // the retained 30177 head.
-            tombstone_managed_agent_pending(&app, &state, &pubkey);
+            tombstone_managed_agent_pending(&app, &state, relay.ws_url(), &pubkey);
         }
         try_regenerate_nest(&app);
         Ok(())

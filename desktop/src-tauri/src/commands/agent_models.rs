@@ -198,8 +198,12 @@ pub struct DiscoverAgentModelsInput {
 #[tauri::command]
 pub async fn discover_agent_models(
     input: DiscoverAgentModelsInput,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<AgentModelsResponse, String> {
+    // Only the mesh-llm build's shared-compute discovery reads the relay.
+    #[cfg(not(feature = "mesh-llm"))]
+    let _ = &relay;
     crate::managed_agents::validate_user_env_keys(&input.env_vars)?;
     // Also validate definition_env (caller-supplied, same trust level as env_vars).
     crate::managed_agents::validate_user_env_keys(&input.definition_env)?;
@@ -244,8 +248,10 @@ pub async fn discover_agent_models(
     if input.provider.as_deref().map(str::trim)
         == Some(crate::managed_agents::RELAY_MESH_PROVIDER_ID)
     {
-        let events = crate::relay::query_relay(
+        // Shared compute is per community: ask the invoking window's relay.
+        let events = crate::relay::query_relay_at(
             &state,
+            &relay.api_base(),
             &[
                 crate::mesh_llm::mesh_status_filter(),
                 crate::mesh_llm::relay_membership_filter(),

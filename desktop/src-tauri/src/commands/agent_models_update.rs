@@ -123,7 +123,7 @@ pub(crate) async fn flush_managed_agent_policy(
     state: &AppState,
     existing_error: Option<String>,
 ) -> Option<String> {
-    match crate::managed_agents::persona_events::flush_active_pending_events(app, state).await {
+    match crate::managed_agents::persona_events::flush_bound_pending_events(app, state).await {
         Ok(_) => existing_error,
         Err(error) => Some(match existing_error {
             Some(profile_error) => {
@@ -385,7 +385,7 @@ pub async fn update_managed_agent(
     // 30-second retention sweep. The flush remains durable/best-effort; rows a
     // relay does not accept stay pending for the background retry.
     let mut profile_sync_error =
-        crate::managed_agents::persona_events::flush_active_pending_events(&app, &state)
+        crate::managed_agents::persona_events::flush_bound_pending_events(&app, &state)
             .await
             .err()
             .map(|error| format!("managed policy sync failed: {error}"));

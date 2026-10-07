@@ -741,7 +741,10 @@ function PopoutGatedCommunityApp({
   sharedIdentity: boolean;
 }) {
   const { activeCommunity, communities, reinitKey } = useCommunities();
-  const gate = usePopoutCommunityGate(communityId);
+  const gate = usePopoutCommunityGate(
+    communityId,
+    getPopoutSession()?.bound === true,
+  );
   const isActive = gate.status === "active" && activeCommunity !== null;
   const communityKey = `popout-${communityId}-${activeCommunity?.relayUrl ?? ""}-${reinitKey}-${currentPubkey ?? "anonymous"}`;
   // A null community is the pause path: useCommunityInit disconnects the

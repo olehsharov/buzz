@@ -10,7 +10,7 @@ use crate::{
             recover_pending_assignment_cleanup, replace_assignment, BestieAssignment,
         },
         load_managed_agents, managed_agents_base_dir,
-        retention::{active_retention_scope, open_retention_db, RetentionScope},
+        retention::{open_retention_db, retention_scope_for, RetentionScope},
         BackendKind, ManagedAgentRecord,
     },
     models::ChannelInfo,
@@ -77,9 +77,10 @@ pub fn get_bestie_assignment(
     expected_relay_url: Option<String>,
     expected_signer_pubkey: Option<String>,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<Option<BestieAssignment>, String> {
-    let scope = active_retention_scope(&app, &state)?;
+    let scope = retention_scope_for(&app, &state, relay.ws_url())?;
     assert_expected_scope(
         &scope,
         expected_relay_url.as_deref(),
@@ -101,10 +102,11 @@ pub fn assign_bestie(
     expected_relay_url: Option<String>,
     expected_signer_pubkey: Option<String>,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<BestieAssignment, String> {
     let pubkey = validate_agent_pubkey(&agent_pubkey)?;
-    let scope = active_retention_scope(&app, &state)?;
+    let scope = retention_scope_for(&app, &state, relay.ws_url())?;
     assert_expected_scope(
         &scope,
         expected_relay_url.as_deref(),
@@ -126,9 +128,10 @@ pub fn clear_bestie_assignment(
     expected_relay_url: Option<String>,
     expected_signer_pubkey: Option<String>,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let scope = active_retention_scope(&app, &state)?;
+    let scope = retention_scope_for(&app, &state, relay.ws_url())?;
     assert_expected_scope(
         &scope,
         expected_relay_url.as_deref(),
@@ -149,10 +152,11 @@ pub async fn resolve_bestie_conversation(
     expected_relay_url: Option<String>,
     expected_signer_pubkey: Option<String>,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<ChannelInfo, String> {
     let generation = state.workspace_apply_generation.load(Ordering::Acquire);
-    let scope = active_retention_scope(&app, &state)?;
+    let scope = retention_scope_for(&app, &state, relay.ws_url())?;
     assert_expected_scope(
         &scope,
         expected_relay_url.as_deref(),
@@ -182,10 +186,12 @@ pub async fn resolve_bestie_conversation(
     )
     .await?;
 
-    if state.workspace_apply_generation.load(Ordering::Acquire) != generation {
+    if state.workspace_apply_generation.load(Ordering::Acquire) != generation
+        || !relay.is_current(&state)
+    {
         return Err("active workspace changed while resolving Bestie".to_string());
     }
-    let current_scope = active_retention_scope(&app, &state)?;
+    let current_scope = retention_scope_for(&app, &state, relay.ws_url())?;
     assert_expected_scope(&current_scope, Some(&scope.relay_url), Some(&owner_pubkey))?;
     let conn = open_retention_db(&scope.db_path)?;
     if !assignment_matches(&conn, &assignment.agent_pubkey)? {

@@ -16,6 +16,11 @@ export type PopoutCommunityRef = { id: string };
 export type PopoutLaunchPayload = {
   route: string;
   community: unknown;
+  /**
+   * True when opened from a community window: the pop-out inherited that
+   * window's native relay binding and follows its community.
+   */
+  bound?: boolean;
 };
 
 /** Opens a pop-out window for `route`; resolves to the new window label. */

@@ -4,6 +4,7 @@ fn launch(route: &str) -> PopoutLaunch {
     PopoutLaunch {
         route: route.to_owned(),
         community: serde_json::json!({ "id": "community-a" }),
+        bound: false,
     }
 }
 
@@ -120,7 +121,11 @@ fn launch_payload_serializes_camel_case() {
     let value = serde_json::to_value(launch("/channels/a")).expect("serialize");
     assert_eq!(
         value,
-        serde_json::json!({ "route": "/channels/a", "community": { "id": "community-a" } })
+        serde_json::json!({
+            "route": "/channels/a",
+            "community": { "id": "community-a" },
+            "bound": false,
+        })
     );
 }
 
@@ -132,4 +137,15 @@ fn bare_root_route_is_the_focus_only_request() {
     assert!(validate_route("/").is_ok());
     assert!(validate_route("//").is_err());
     assert!(validate_route("/\\").is_err());
+}
+
+#[test]
+fn registry_tracks_and_forgets_a_bound_popouts_parent() {
+    let registry = PopoutRegistry::default();
+    registry.reserve("popout-1", launch("/")).expect("reserve");
+    assert_eq!(registry.parent("popout-1"), None);
+    registry.set_parent("popout-1", "community-b");
+    assert_eq!(registry.parent("popout-1").as_deref(), Some("community-b"));
+    registry.release("popout-1");
+    assert_eq!(registry.parent("popout-1"), None);
 }
