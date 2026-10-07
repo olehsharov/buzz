@@ -141,30 +141,39 @@ pub(crate) async fn redeploy_for_access_policy<R: tauri::Runtime>(
     result
 }
 
-/// Pending host redeploys for the agents of `community_relay`.
-pub(crate) fn pending_host_redeploys(
+/// Pending access redeploys that workspace apply retries in the background
+/// for `community_relay`: paired-machine agents of that community (their
+/// machine is approved there), and, unless this build enforces owner-only
+/// access (which redeploys every provider agent inline and fails closed),
+/// provider agents, whose payload always targets their own community.
+pub(crate) fn pending_access_redeploys(
     records: &[ManagedAgentRecord],
     community_relay: &str,
+    owner_only_access: bool,
 ) -> Vec<(String, RemoteAccessRedeploy)> {
     records
         .iter()
         .filter(|record| super::provider_access::needs_reconciliation_with_policy(record, false))
-        .filter(|record| {
-            crate::relay::agent_belongs_to_relay(
-                &record.relay_url,
-                community_relay,
-                community_relay,
-            )
-        })
         .filter_map(|record| match &record.backend {
-            BackendKind::Host { host_pubkey } => Some((
-                record.pubkey.clone(),
-                RemoteAccessRedeploy::Host {
-                    host_pubkey: host_pubkey.clone(),
-                    community_relay: community_relay.to_string(),
-                },
-            )),
-            BackendKind::Local | BackendKind::Provider { .. } => None,
+            BackendKind::Host { host_pubkey }
+                if crate::relay::agent_belongs_to_relay(
+                    &record.relay_url,
+                    community_relay,
+                    community_relay,
+                ) =>
+            {
+                Some((
+                    record.pubkey.clone(),
+                    RemoteAccessRedeploy::Host {
+                        host_pubkey: host_pubkey.clone(),
+                        community_relay: community_relay.to_string(),
+                    },
+                ))
+            }
+            BackendKind::Provider { .. } if !owner_only_access => {
+                Some((record.pubkey.clone(), RemoteAccessRedeploy::Provider))
+            }
+            BackendKind::Local | BackendKind::Host { .. } | BackendKind::Provider { .. } => None,
         })
         .collect()
 }

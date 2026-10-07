@@ -1384,6 +1384,8 @@ pub(super) mod access_transition;
 mod deploy;
 pub(super) mod provider_access;
 mod provider_deploy;
+#[cfg(all(test, unix))]
+pub(super) mod scripted_provider_fixture;
 pub(super) use deploy::build_deploy_payload;
 #[cfg(test)]
 use deploy::{deploy_payload_json, DeployProjections};

@@ -21,6 +21,9 @@ mod inbound_tests;
 // runner (same constraint as `persona_events::tests::flush_barrier`).
 #[cfg(all(test, not(target_os = "windows")))]
 mod catalog_reconcile_tests;
+// Unix-only: drives a scripted provider fixture.
+#[cfg(all(test, unix))]
+mod access_reconcile_tests;
 
 #[derive(Debug)]
 enum InboundRuntimeRefresh {

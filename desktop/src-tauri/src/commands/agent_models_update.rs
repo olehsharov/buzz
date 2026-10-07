@@ -141,6 +141,64 @@ pub async fn update_managed_agent(
     update_managed_agent_scoped(input, app, &state, relay.ws_url(), None).await
 }
 
+/// The access step of an agent edit (`update_managed_agent` Phase 1), run on
+/// the record inside the locked store write.
+///
+/// Merges `respond_to` / `respond_to_allowlist` onto the record's current
+/// policy and validates the merged state, so a single update can switch to
+/// Allowlist and supply its pubkeys together. When the effective policy
+/// changes it plans how the running agent receives it: active local pairs are
+/// stopped here, before the new policy is written, so nothing observes a saved
+/// narrow policy while the old broad process is alive (a stop failure aborts
+/// before mutation); a deployed remote agent is marked
+/// `provider_policy_pending` for a redeploy. Every backend accepts the edit.
+///
+/// Returns whether the effective policy changed and the runtime transition
+/// the caller completes after saving.
+pub(crate) fn apply_access_edit<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    record: &mut ManagedAgentRecord,
+    runtimes: &mut std::collections::HashMap<
+        crate::managed_agents::ManagedAgentRuntimeKey,
+        crate::managed_agents::ManagedAgentPairRuntime,
+    >,
+    respond_to: Option<crate::managed_agents::RespondTo>,
+    respond_to_allowlist: Option<&[String]>,
+    community_relay: &str,
+) -> Result<(bool, AccessRuntimeTransition), String> {
+    let prospective_mode = respond_to.unwrap_or(record.respond_to);
+    let prospective_allowlist = match respond_to_allowlist {
+        Some(list) => crate::managed_agents::validate_respond_to_allowlist(list)?,
+        None => record.respond_to_allowlist.clone(),
+    };
+    if prospective_mode == crate::managed_agents::RespondTo::Allowlist
+        && prospective_allowlist.is_empty()
+    {
+        return Err(
+            "respond-to mode 'allowlist' requires at least one pubkey in the allowlist".to_string(),
+        );
+    }
+    let access_policy_changed = managed_agent_access_policy_changed(
+        record.respond_to,
+        &record.respond_to_allowlist,
+        prospective_mode,
+        &prospective_allowlist,
+        crate::managed_agents::owner_only_access_build(),
+    );
+    let access_transition =
+        plan_access_runtime_transition(record, access_policy_changed, runtimes, community_relay);
+    if let AccessRuntimeTransition::RestartLocal { .. } = &access_transition {
+        crate::managed_agents::stop_managed_agent_process(app, record, runtimes)?;
+    }
+    record.respond_to = prospective_mode;
+    // Preserve the persisted allowlist across mode toggles — only replace
+    // when the caller explicitly supplied a new list.
+    if respond_to_allowlist.is_some() {
+        record.respond_to_allowlist = prospective_allowlist;
+    }
+    Ok((access_policy_changed, access_transition))
+}
+
 /// Error returned by [`update_managed_agent_scoped`] when its
 /// `access_precondition` no longer holds.
 pub(crate) const ACCESS_PRECONDITION_FAILED: &str =
@@ -279,52 +337,17 @@ pub(crate) async fn update_managed_agent_scoped(
             record.relay_mesh = Some(crate::managed_agents::RelayMeshConfig { model_ref });
         }
 
-        // Inbound author gate: merge patch onto current values, then validate
-        // the merged state. This lets a single update switch to Allowlist AND
-        // supply pubkeys atomically.
-        let prospective_mode = input.respond_to.unwrap_or(record.respond_to);
-        let prospective_allowlist = match input.respond_to_allowlist.as_ref() {
-            Some(list) => crate::managed_agents::validate_respond_to_allowlist(list)?,
-            None => record.respond_to_allowlist.clone(),
-        };
-        if prospective_mode == crate::managed_agents::RespondTo::Allowlist
-            && prospective_allowlist.is_empty()
-        {
-            return Err(
-                "respond-to mode 'allowlist' requires at least one pubkey in the allowlist"
-                    .to_string(),
-            );
-        }
-        let access_policy_changed = managed_agent_access_policy_changed(
-            record.respond_to,
-            &record.respond_to_allowlist,
-            prospective_mode,
-            &prospective_allowlist,
-            crate::managed_agents::owner_only_access_build(),
-        );
-        // A deployed remote agent is marked pending here, in this same write.
-        let access_transition = plan_access_runtime_transition(
+        // Inbound author gate: validate, plan, and write the new policy (a
+        // running local pair is stopped first, a deployed remote agent is
+        // marked pending in this same write).
+        let (access_policy_changed, access_transition) = apply_access_edit(
+            &app,
             record,
-            access_policy_changed,
-            &runtimes,
+            &mut runtimes,
+            input.respond_to,
+            input.respond_to_allowlist.as_deref(),
             community_relay,
-        );
-
-        // Revoke the currently running local gate before persisting or
-        // advertising the replacement policy. Keeping this inside the same
-        // store/process critical section prevents another command or a status
-        // refresh from observing a saved narrow policy while the old broad
-        // process is still alive. A stop failure aborts before mutation.
-        if let AccessRuntimeTransition::RestartLocal { .. } = &access_transition {
-            crate::managed_agents::stop_managed_agent_process(&app, record, &mut runtimes)?;
-        }
-
-        record.respond_to = prospective_mode;
-        // Preserve the persisted allowlist across mode toggles — only replace
-        // when the caller explicitly supplied a new list.
-        if input.respond_to_allowlist.is_some() {
-            record.respond_to_allowlist = prospective_allowlist;
-        }
+        )?;
 
         // Effort + env_vars: applied together inside `apply_record_field_updates` to
         // enforce the ordering invariant (env_vars before effort column write) and
