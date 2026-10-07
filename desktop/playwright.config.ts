@@ -182,6 +182,7 @@ export default defineConfig({
         "**/inline-custom-harness.spec.ts",
         "**/where-to-run-config.spec.ts",
         "**/agent-hosts.spec.ts",
+        "**/run-on-alignment.spec.ts",
         "**/agent-defaults-community.spec.ts",
         "**/huddle-transcription.spec.ts",
         "**/agent-numeric-tuning.spec.ts",
