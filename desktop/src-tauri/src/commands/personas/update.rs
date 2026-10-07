@@ -16,6 +16,7 @@ use crate::{
 
 use super::{normalize_description, pending, retain_persona_pending, trim_optional, trim_required};
 
+mod access_propagation;
 #[cfg(test)]
 mod name_propagation_tests;
 
@@ -110,6 +111,15 @@ fn prepare_linked_profile_update(
     }
 }
 
+/// Phase 1 of a persona edit: the saved definition, the caller's retained
+/// publication, linked profile syncs, and the instances its access edit moves.
+type PersonaSaved<R> = (
+    AgentDefinition,
+    R,
+    ProfileSyncParams,
+    Option<access_propagation::AccessPropagation>,
+);
+
 /// Profile sync params collected under the store lock for async relay publish:
 /// (agent keys, relay url, display name, avatar url, kind:0 about, auth tag).
 type ProfileSyncParams = Vec<(
@@ -120,6 +130,43 @@ type ProfileSyncParams = Vec<(
     Option<String>,
     Option<String>,
 )>;
+
+/// Move each instance that still runs the template's previous access policy
+/// to the new one through the instance edit path (`update_managed_agent`):
+/// a running local agent restarts with the new gate, a deployed remote agent
+/// is redeployed (pending and retried if that fails), and kind:30177 is
+/// republished. Each edit is fenced on the previous policy, so an instance
+/// whose access changed meanwhile is left alone.
+///
+/// The template edit is already saved, so a failure here does not fail it:
+/// every failure leaves durable state on the instance (its saved policy, and
+/// for a remote agent the pending redeploy plus `last_error`) and is logged.
+async fn apply_access_propagation(
+    app: &AppHandle,
+    community_relay: &str,
+    propagation: &access_propagation::AccessPropagation,
+) {
+    use tauri::Manager;
+
+    let state = app.state::<AppState>();
+    for pubkey in &propagation.pubkeys {
+        match crate::commands::update_managed_agent_scoped(
+            propagation.request_for(pubkey),
+            app.clone(),
+            &state,
+            community_relay,
+            Some(propagation.previous.clone()),
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(error) if error == crate::commands::ACCESS_PRECONDITION_FAILED => {}
+            Err(error) => eprintln!(
+                "buzz-desktop: applying the template access change to agent {pubkey} failed: {error}"
+            ),
+        }
+    }
+}
 
 #[tauri::command]
 pub async fn update_persona(
@@ -164,10 +211,11 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
 ) -> Result<(AgentDefinition, R), String> {
     use tauri::Manager;
 
+    let access_relay = community_relay.clone();
     // Phase 1: synchronous save (persona record + linked agent avatar updates)
-    let (result, retained, profile_sync_params) = tokio::task::spawn_blocking({
+    let (result, retained, profile_sync_params, propagation) = tokio::task::spawn_blocking({
         let app = app.clone();
-        move || -> Result<(AgentDefinition, R, ProfileSyncParams), String> {
+        move || -> Result<PersonaSaved<R>, String> {
             let state = app.state::<AppState>();
             let display_name = trim_required(&input.display_name, "Display name")?;
             let system_prompt = input.system_prompt.clone();
@@ -220,7 +268,9 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
                 crate::managed_agents::validate_user_env_keys(&env_vars)?;
                 persona.env_vars = env_vars;
             }
+            let previous_access = access_propagation::definition_access_policy(persona);
             apply_persona_behavior(persona, input.behavior)?;
+            let next_access = access_propagation::definition_access_policy(persona);
             persona.updated_at = now_iso();
 
             let result = persona.clone();
@@ -305,11 +355,24 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
                 Vec::new()
             };
 
-            Ok((result, retained, sync_params))
+            // Instances still on the template's previous access policy
+            // follow the edit; it is applied after this lock is released.
+            let access_propagation = access_propagation::plan_access_propagation(
+                &load_managed_agents(&app)?,
+                &result.id,
+                previous_access,
+                next_access,
+            );
+
+            Ok((result, retained, sync_params, access_propagation))
         }
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))??;
+
+    if let Some(propagation) = &propagation {
+        apply_access_propagation(&app, &access_relay, propagation).await;
+    }
 
     // Phase 2: await relay profile sync for linked agents whose avatar,
     // display_name, or effective description (kind:0 about) was just
