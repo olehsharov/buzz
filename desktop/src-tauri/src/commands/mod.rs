@@ -2,7 +2,7 @@ pub mod admin;
 mod agent_access;
 mod agent_auth;
 mod agent_config;
-mod agent_discovery;
+pub(crate) mod agent_discovery;
 mod agent_logs;
 mod agent_metric_archive;
 mod agent_model_process;
@@ -45,7 +45,7 @@ mod media_voice_note;
 pub(crate) mod mesh_llm;
 #[cfg(feature = "mesh-llm")]
 pub(crate) mod mesh_readiness;
-mod messages;
+pub(crate) mod messages;
 mod notifications;
 mod observer_archive;
 mod os_idle;

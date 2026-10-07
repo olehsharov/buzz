@@ -1023,7 +1023,7 @@ pub async fn discover_managed_agent_prereqs(
     .map_err(|e| format!("spawn_blocking failed: {e}"))
 }
 
-mod relay_directory;
+pub(crate) mod relay_directory;
 #[cfg(test)]
 use relay_directory::advance_relay_cursor;
 pub use relay_directory::{list_relay_agents, revalidate_relay_agents};

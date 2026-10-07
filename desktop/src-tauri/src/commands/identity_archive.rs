@@ -19,9 +19,8 @@ use crate::{
     events,
     managed_agents::try_regenerate_nest,
     relay::{
-        classify_request_error, query_relay, query_relay_at, relay_api_base_url,
-        relay_http_base_url, relay_ws_url, relay_ws_url_with_override, submit_event,
-        workspace_relay_override, SubmitEventResponse,
+        classify_request_error, query_relay_at, relay_api_base_url, relay_http_base_url,
+        relay_ws_url, submit_event_at, workspace_relay_override, SubmitEventResponse,
     },
 };
 
@@ -40,6 +39,16 @@ pub(crate) struct RelayTarget {
     pub ws_url: String,
     /// Relay HTTP API base URL (drives `/query`).
     pub api_base_url: String,
+}
+
+impl RelayTarget {
+    /// The target for a command invoked from a window (its bound relay).
+    pub(crate) fn for_window(relay: &crate::window_relay::WindowRelay) -> Self {
+        Self {
+            ws_url: relay.ws_url().to_string(),
+            api_base_url: relay.api_base(),
+        }
+    }
 }
 
 /// Capture the effective relay target once, before any network work.
@@ -93,10 +102,12 @@ pub(crate) fn extract_oa_owner(target_kind0: &nostr::Event) -> Option<(String, [
 
 pub(crate) async fn fetch_kind0(
     state: &AppState,
+    api_base_url: &str,
     pubkey: &str,
 ) -> Result<Option<nostr::Event>, String> {
-    let events = query_relay(
+    let events = query_relay_at(
         state,
+        api_base_url,
         &[serde_json::json!({
             "kinds": [0],
             "authors": [pubkey.to_ascii_lowercase()],
@@ -127,9 +138,10 @@ pub struct OwnerOfAgent {
 #[tauri::command]
 pub async fn resolve_oa_owner(
     target_pubkey: String,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<Option<OwnerOfAgent>, String> {
-    let Some(kind0) = fetch_kind0(&state, &target_pubkey).await? else {
+    let Some(kind0) = fetch_kind0(&state, &relay.api_base(), &target_pubkey).await? else {
         return Ok(None);
     };
 
@@ -188,8 +200,8 @@ impl NestRegenTrigger for AppHandle {
     }
 }
 
-/// Submit `builder` to the active workspace relay, then trigger `on_success`
-/// exactly once iff the relay accepted the event.
+/// Submit `builder` to `api_base_url`, then trigger `on_success` exactly once
+/// iff the relay accepted the event.
 ///
 /// This pins the shared half of the archive/unarchive → AGENTS.md-regeneration
 /// contract: regeneration is best-effort roster maintenance, so it must fire on
@@ -198,9 +210,10 @@ impl NestRegenTrigger for AppHandle {
 async fn submit_then_regenerate(
     builder: nostr::EventBuilder,
     state: &AppState,
+    api_base_url: &str,
     on_success: impl FnOnce(),
 ) -> Result<SubmitEventResponse, String> {
-    let response = submit_event(builder, state).await?;
+    let response = submit_event_at(builder, state, api_base_url).await?;
     on_success();
     Ok(response)
 }
@@ -220,9 +233,10 @@ async fn submit_then_regenerate(
 async fn archive_identity_core(
     req: &ArchiveRequest,
     state: &AppState,
+    api_base_url: &str,
     regen: &impl NestRegenTrigger,
 ) -> Result<SubmitEventResponse, String> {
-    let auth_tag = maybe_owner_auth_tag(state, &req.target_pubkey).await?;
+    let auth_tag = maybe_owner_auth_tag(state, api_base_url, &req.target_pubkey).await?;
     let builder = events::build_archive_identity_request(
         &req.target_pubkey,
         &req.content,
@@ -230,7 +244,7 @@ async fn archive_identity_core(
         req.replaced_by.as_deref(),
         auth_tag.as_ref(),
     )?;
-    submit_then_regenerate(builder, state, || regen.trigger()).await
+    submit_then_regenerate(builder, state, api_base_url, || regen.trigger()).await
 }
 
 /// `AppHandle`-free core of [`unarchive_identity`]: builds the real `kind:9036`
@@ -241,16 +255,17 @@ async fn archive_identity_core(
 async fn unarchive_identity_core(
     req: &UnarchiveRequest,
     state: &AppState,
+    api_base_url: &str,
     regen: &impl NestRegenTrigger,
 ) -> Result<SubmitEventResponse, String> {
-    let auth_tag = maybe_owner_auth_tag(state, &req.target_pubkey).await?;
+    let auth_tag = maybe_owner_auth_tag(state, api_base_url, &req.target_pubkey).await?;
     let builder = events::build_unarchive_identity_request(
         &req.target_pubkey,
         &req.content,
         req.reason.as_deref(),
         auth_tag.as_ref(),
     )?;
-    submit_then_regenerate(builder, state, || regen.trigger()).await
+    submit_then_regenerate(builder, state, api_base_url, || regen.trigger()).await
 }
 
 /// Submit a `kind:9035` archive request to the relay. Consent path is selected
@@ -267,9 +282,10 @@ async fn unarchive_identity_core(
 pub async fn archive_identity(
     req: ArchiveRequest,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<SubmitEventResponse, String> {
-    archive_identity_core(&req, &state, &app).await
+    archive_identity_core(&req, &state, &relay.api_base(), &app).await
 }
 
 /// Submit a `kind:9036` unarchive request to the relay. See
@@ -279,9 +295,10 @@ pub async fn archive_identity(
 pub async fn unarchive_identity(
     req: UnarchiveRequest,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<SubmitEventResponse, String> {
-    unarchive_identity_core(&req, &state, &app).await
+    unarchive_identity_core(&req, &state, &relay.api_base(), &app).await
 }
 
 /// If the current user is the verified NIP-OA owner of `target`, return the
@@ -292,6 +309,7 @@ pub async fn unarchive_identity(
 /// against it; this tag is intent + freshness evidence, not the authority.
 async fn maybe_owner_auth_tag(
     state: &AppState,
+    api_base_url: &str,
     target_pubkey: &str,
 ) -> Result<Option<[String; 4]>, String> {
     let my_pubkey = {
@@ -305,7 +323,7 @@ async fn maybe_owner_auth_tag(
         return Ok(None);
     }
 
-    let Some(kind0) = fetch_kind0(state, target_pubkey).await? else {
+    let Some(kind0) = fetch_kind0(state, api_base_url, target_pubkey).await? else {
         return Ok(None);
     };
     let Some((owner_hex, raw_tag)) = extract_oa_owner(&kind0) else {
@@ -332,10 +350,6 @@ struct RelayInformationDocument {
     self_: Option<String>,
 }
 
-pub(crate) async fn fetch_relay_self(state: &AppState) -> Result<Option<String>, String> {
-    fetch_relay_self_at(state, &relay_ws_url_with_override(state)).await
-}
-
 /// How long a fetched NIP-11 `self` pubkey stays valid in
 /// [`AppState::relay_self_cache`]. The relay's signing identity changes only
 /// on an operator-driven key rotation, so minutes of staleness are safe; the
@@ -350,7 +364,7 @@ fn cached_relay_self(state: &AppState, relay_url: &str) -> Option<String> {
     (fetched_at.elapsed() < RELAY_SELF_CACHE_TTL).then(|| relay_self.clone())
 }
 
-/// Like [`fetch_relay_self`] but reads NIP-11 from an explicit relay WS URL
+/// Read a relay's NIP-11 `self` pubkey from an explicit relay WS URL
 /// instead of re-resolving the workspace override. Used by
 /// [`fetch_archived_pubkeys_at`] so the advertised signer and the snapshot
 /// query belong to the same captured relay target.
@@ -422,23 +436,19 @@ fn archived_pubkeys_from_snapshot(snapshot: &nostr::Event) -> Vec<String> {
 
 /// Read the relay's latest valid `kind:13535` archive snapshot as lowercase
 /// hex pubkeys. Shared by the `list_archived_identities` command (frontend
-/// flair) and the backend nest regen (excluding archived agents from
-/// `AGENTS.md`).
+/// flair, against the invoking window's relay) and the backend nest regen
+/// (excluding archived agents from `AGENTS.md`).
 ///
 /// Per NIP-IA §Client Behavior and §Snapshot and Delta Consistency, only a
 /// snapshot signed by the relay identity advertised in NIP-11 `self` can affect
 /// archive state. Every failure path — no stable `self`, no snapshot, a bad
 /// signature or wrong author, or a query error — **fails open** with an empty
 /// set rather than trusting unauthenticated relay-authoritative state.
-pub(crate) async fn fetch_archived_pubkeys(state: &AppState) -> Vec<String> {
-    fetch_archived_pubkeys_at(state, &capture_relay_target(state)).await
-}
-
-/// Like [`fetch_archived_pubkeys`] but resolves both the NIP-11 signer and the
-/// snapshot query against one captured [`RelayTarget`] instead of re-reading
-/// the workspace override for each. This keeps a regeneration's advertised
-/// signer and its snapshot query on the same relay even if the workspace
-/// override changes between the two awaits.
+///
+/// Both the NIP-11 signer and the snapshot query resolve against one captured
+/// [`RelayTarget`] instead of re-reading the workspace override for each, so a
+/// regeneration's advertised signer and its snapshot query stay on the same
+/// relay even if the workspace override changes between the two awaits.
 pub(crate) async fn fetch_archived_pubkeys_at(
     state: &AppState,
     target: &RelayTarget,
@@ -481,10 +491,11 @@ pub(crate) async fn fetch_archived_pubkeys_at(
 /// caches this and tests membership client-side to drive the "Archived" flair.
 #[tauri::command]
 pub async fn list_archived_identities(
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<ArchivedIdentitiesSnapshot, String> {
     Ok(ArchivedIdentitiesSnapshot {
-        archived: fetch_archived_pubkeys(&state).await,
+        archived: fetch_archived_pubkeys_at(&state, &RelayTarget::for_window(&relay)).await,
     })
 }
 
@@ -496,8 +507,11 @@ pub async fn list_archived_identities(
 /// return `None`, and callers must treat that as "not the relay" — the disable
 /// is an affordance, not enforcement, so a false negative is the safe failure.
 #[tauri::command]
-pub async fn get_relay_self(state: State<'_, AppState>) -> Result<Option<String>, String> {
-    fetch_relay_self(&state).await
+pub async fn get_relay_self(
+    relay: crate::window_relay::WindowRelay,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    fetch_relay_self_at(&state, relay.ws_url()).await
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -918,9 +932,14 @@ mod tests {
         // Accepted archive → hook fires exactly once.
         *state.relay_url_override.lock().unwrap() = Some(spawn_submit_relay(true).await);
         let regen = CountingRegen::default();
-        let response = archive_identity_core(&req, &state, &regen)
-            .await
-            .expect("accepted archive returns Ok");
+        let response = archive_identity_core(
+            &req,
+            &state,
+            &crate::relay::relay_api_base_url_with_override(&state),
+            &regen,
+        )
+        .await
+        .expect("accepted archive returns Ok");
         assert!(response.accepted);
         assert_eq!(
             regen.count(),
@@ -931,7 +950,13 @@ mod tests {
         // Rejected submit → error propagates, hook never fires.
         *state.relay_url_override.lock().unwrap() = Some(spawn_submit_relay(false).await);
         let regen = CountingRegen::default();
-        let result = archive_identity_core(&req, &state, &regen).await;
+        let result = archive_identity_core(
+            &req,
+            &state,
+            &crate::relay::relay_api_base_url_with_override(&state),
+            &regen,
+        )
+        .await;
         assert!(result.is_err(), "a rejected archive must return an error");
         assert_eq!(
             regen.count(),
@@ -967,9 +992,14 @@ mod tests {
         // Accepted unarchive → hook fires exactly once.
         *state.relay_url_override.lock().unwrap() = Some(spawn_submit_relay(true).await);
         let regen = CountingRegen::default();
-        let response = unarchive_identity_core(&req, &state, &regen)
-            .await
-            .expect("accepted unarchive returns Ok");
+        let response = unarchive_identity_core(
+            &req,
+            &state,
+            &crate::relay::relay_api_base_url_with_override(&state),
+            &regen,
+        )
+        .await
+        .expect("accepted unarchive returns Ok");
         assert!(response.accepted);
         assert_eq!(
             regen.count(),
@@ -980,7 +1010,13 @@ mod tests {
         // Rejected submit → error propagates, hook never fires.
         *state.relay_url_override.lock().unwrap() = Some(spawn_submit_relay(false).await);
         let regen = CountingRegen::default();
-        let result = unarchive_identity_core(&req, &state, &regen).await;
+        let result = unarchive_identity_core(
+            &req,
+            &state,
+            &crate::relay::relay_api_base_url_with_override(&state),
+            &regen,
+        )
+        .await;
         assert!(result.is_err(), "a rejected unarchive must return an error");
         assert_eq!(
             regen.count(),

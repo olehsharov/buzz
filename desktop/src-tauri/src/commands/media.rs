@@ -6,7 +6,7 @@ use tauri::State;
 use tokio_util::sync::CancellationToken;
 
 use crate::app_state::AppState;
-use crate::relay::{parse_json_response, relay_api_base_url_with_override, relay_error_message};
+use crate::relay::{parse_json_response, relay_error_message};
 
 use super::media_filename::sanitize_filename;
 use super::media_transcode::{
@@ -397,19 +397,21 @@ fn should_retry_legacy_upload(status: reqwest::StatusCode) -> bool {
 pub(crate) async fn upload_image_bytes(
     body: Vec<u8>,
     state: &AppState,
+    api_base_url: &str,
 ) -> Result<BlobDescriptor, String> {
     let mime = detect_and_validate_mime(&body)?;
     if !mime.starts_with("image/") {
         return Err("profile avatar must be an image".to_string());
     }
     let body = sanitize_image_for_upload(body, &mime)?;
-    do_upload(body, &mime, state, None, None).await
+    do_upload(body, &mime, state, api_base_url, None, None).await
 }
 
 async fn do_upload(
     body: Vec<u8>,
     mime: &str,
     state: &AppState,
+    api_base_url: &str,
     progress: Option<(tauri::AppHandle, String)>,
     cancellation: Option<&CancellationToken>,
 ) -> Result<BlobDescriptor, String> {
@@ -421,7 +423,7 @@ async fn do_upload(
     // reasonable connection (the body is already hashed and ready to send).
     // The server-side window is also 60s in Strict mode, matching this value.
     let expiry_secs = 60u64;
-    let base_url = relay_api_base_url_with_override(state);
+    let base_url = api_base_url.trim_end_matches('/').to_string();
     let auth_event = {
         let keys = state.signing_keys()?;
         sign_blossom_upload_auth(&keys, &sha256, expiry_secs, &base_url)?
@@ -481,6 +483,7 @@ async fn do_upload(
 pub async fn upload_media(
     file_path: String,
     is_temp: bool,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<BlobDescriptor, String> {
     let path = std::path::Path::new(&file_path);
@@ -506,7 +509,7 @@ pub async fn upload_media(
 
     let mime = detect_and_validate_mime(&body)?;
     let body = sanitize_image_for_upload(body, &mime)?;
-    do_upload(body, &mime, &state, None, None).await
+    do_upload(body, &mime, &state, &relay.api_base(), None, None).await
 }
 
 /// Read a picked path through the TOCTOU-safe pipeline (fd pin → sniff →
@@ -519,6 +522,7 @@ pub async fn upload_media(
 async fn process_picked_path(
     path: std::path::PathBuf,
     state: &AppState,
+    api_base_url: &str,
     images_only: bool,
     progress: Option<(tauri::AppHandle, String)>,
 ) -> Result<BlobDescriptor, String> {
@@ -587,9 +591,9 @@ async fn process_picked_path(
 
     // Upload video first, then poster (best-effort). If poster upload fails,
     // the video descriptor is returned without an image field.
-    let mut descriptor = do_upload(body, &mime, state, progress, None).await?;
+    let mut descriptor = do_upload(body, &mime, state, api_base_url, progress, None).await?;
     if let Some(poster) = poster_bytes {
-        match do_upload(poster, "image/jpeg", state, None, None).await {
+        match do_upload(poster, "image/jpeg", state, api_base_url, None, None).await {
             Ok(poster_desc) => descriptor.image = Some(poster_desc.url),
             Err(e) => eprintln!("buzz-desktop: poster upload failed (non-fatal): {e}"),
         }
@@ -623,6 +627,7 @@ async fn process_picked_path(
 pub async fn pick_and_upload_media(
     app: tauri::AppHandle,
     progress_id: Option<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<Vec<BlobDescriptor>, String> {
     use tauri_plugin_dialog::DialogExt;
@@ -643,7 +648,8 @@ pub async fn pick_and_upload_media(
     for file_path in file_paths {
         let path = file_path.as_path().ok_or("invalid path")?.to_path_buf();
         let progress = progress_id.clone().map(|id| (app.clone(), id));
-        let descriptor = process_picked_path(path, &state, false, progress).await?;
+        let descriptor =
+            process_picked_path(path, &state, &relay.api_base(), false, progress).await?;
         descriptors.push(descriptor);
     }
 
@@ -663,6 +669,7 @@ pub async fn pick_and_upload_media(
 #[tauri::command]
 pub async fn pick_and_upload_image(
     app: tauri::AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<Option<BlobDescriptor>, String> {
     use tauri_plugin_dialog::DialogExt;
@@ -684,7 +691,7 @@ pub async fn pick_and_upload_image(
     };
 
     let path = file_path.as_path().ok_or("invalid path")?.to_path_buf();
-    let descriptor = process_picked_path(path, &state, true, None).await?;
+    let descriptor = process_picked_path(path, &state, &relay.api_base(), true, None).await?;
     Ok(Some(descriptor))
 }
 
@@ -694,6 +701,7 @@ pub(super) async fn upload_media_bytes_inner(
     progress_id: Option<String>,
     app: tauri::AppHandle,
     state: State<'_, AppState>,
+    api_base_url: &str,
     cancellation: Option<&CancellationToken>,
 ) -> Result<BlobDescriptor, String> {
     if data.is_empty() {
@@ -769,11 +777,21 @@ pub(super) async fn upload_media_bytes_inner(
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
         return Err("upload cancelled".to_string());
     }
-    let mut descriptor = do_upload(body, &mime, &state, progress, cancellation).await?;
+    let mut descriptor =
+        do_upload(body, &mime, &state, api_base_url, progress, cancellation).await?;
 
     emit_media_upload_phase(&app, progress_id.as_deref(), "finishing");
     if let Some(poster) = poster_bytes {
-        match do_upload(poster, "image/jpeg", &state, None, cancellation).await {
+        match do_upload(
+            poster,
+            "image/jpeg",
+            &state,
+            api_base_url,
+            None,
+            cancellation,
+        )
+        .await
+        {
             Ok(poster_desc) => descriptor.image = Some(poster_desc.url),
             Err(e) => eprintln!("buzz-desktop: poster upload failed (non-fatal): {e}"),
         }

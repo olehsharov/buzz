@@ -32,6 +32,10 @@ pub struct AppState {
     /// validated relay origin.
     pub media_fetch_client: reqwest::Client,
     pub relay_url_override: Mutex<Option<String>>,
+    /// Per-window relay bindings for community windows (`community-<id>`),
+    /// keyed by window label. A bound window's commands target this relay
+    /// instead of `relay_url_override`; see `window_relay`.
+    pub window_relays: Mutex<HashMap<String, String>>,
     /// User-configured communities, supplied by narrow workspace IPC, never learned
     /// from profile URLs. Only these origins may supply portable agent media.
     pub agent_avatar_communities: Mutex<Vec<String>>,
@@ -220,6 +224,7 @@ pub fn build_app_state() -> AppState {
              header across origins (redirect-hop SSRF)",
         ),
         relay_url_override: Mutex::new(None),
+        window_relays: Mutex::new(HashMap::new()),
         agent_avatar_communities: Mutex::new(Vec::new()),
         workspace_apply_lock: Arc::new(AsyncMutex::new(())),
         workspace_apply_generation: AtomicU64::new(0),

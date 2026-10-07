@@ -713,26 +713,9 @@ pub use get::get_relay_json;
 
 mod submit;
 pub use submit::{
-    submit_event, submit_event_at_created_at, submit_event_at_with_keys,
-    submit_event_with_keys_created_at, submit_signed_event_at_with_keys, SubmitEventResponse,
+    submit_event, submit_event_at, submit_event_at_created_at, submit_event_at_with_keys,
+    submit_event_with_keys_at_created_at, submit_signed_event_at_with_keys, SubmitEventResponse,
 };
-
-/// Sign an event with explicit keys and POST it to `/events` with NIP-98 auth.
-///
-/// Managed-agent flows use this to publish as the agent itself while still
-/// including the stored NIP-OA auth tag when the relay requires owner-backed
-/// membership.
-pub async fn submit_event_with_keys(
-    builder: nostr::EventBuilder,
-    state: &AppState,
-    keys: &Keys,
-    auth_tag: Option<&str>,
-) -> Result<SubmitEventResponse, String> {
-    let event = builder
-        .sign_with_keys(keys)
-        .map_err(|e| format!("failed to sign event: {e}"))?;
-    submit_signed_event_with_keys(&event, state, keys, auth_tag).await
-}
 
 /// POST an already-signed event using the same explicit identity for NIP-98.
 pub async fn submit_signed_event_with_keys(
@@ -741,11 +724,30 @@ pub async fn submit_signed_event_with_keys(
     keys: &Keys,
     auth_tag: Option<&str>,
 ) -> Result<SubmitEventResponse, String> {
+    submit_signed_event_with_keys_at(
+        event,
+        state,
+        &relay_api_base_url_with_override(state),
+        keys,
+        auth_tag,
+    )
+    .await
+}
+
+/// Like [`submit_signed_event_with_keys`] but to an explicit relay HTTP API
+/// base (a window-scoped command's relay).
+pub async fn submit_signed_event_with_keys_at(
+    event: &nostr::Event,
+    state: &AppState,
+    api_base_url: &str,
+    keys: &Keys,
+    auth_tag: Option<&str>,
+) -> Result<SubmitEventResponse, String> {
     if event.pubkey != keys.public_key() {
         return Err("signed event does not match the publishing identity".to_string());
     }
     crate::relay_admission::wait_for_rate_limit().await;
-    let url = format!("{}/events", relay_api_base_url_with_override(state));
+    let url = format!("{}/events", api_base_url.trim_end_matches('/'));
     let body_bytes = event.as_json().into_bytes();
     crate::egress_guard::assert_no_key_backup_bytes(&body_bytes, "signed event submit (keys)")?;
     let auth_header = build_nip98_auth_header_for_keys(keys, &Method::POST, &url, &body_bytes)?;

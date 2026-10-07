@@ -148,7 +148,11 @@ fn roster(keys: &Keys, id: &str, members: &[&str]) -> Event {
 async fn fetch(state: &AppState, scope: DirectoryScope) -> Result<Vec<ChannelInfo>, String> {
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        fetch_channels(state, scope),
+        fetch_channels(
+            state,
+            &crate::relay::relay_api_base_url_with_override(state),
+            scope,
+        ),
     )
     .await
     .expect("bounded channel fetch")

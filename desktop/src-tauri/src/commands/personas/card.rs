@@ -30,7 +30,6 @@ use super::snapshot::{
 };
 use crate::{
     app_state::AppState,
-    commands::engrams::get_agent_memory,
     managed_agents::{
         agent_snapshot::{
             build_snapshot, decode_avatar_data_url, decode_snapshot_png, encode_snapshot_png,
@@ -630,7 +629,13 @@ pub async fn mint_agent_card(
                     .to_string(),
             );
         }
-        let listing = get_agent_memory(record.pubkey.clone(), app.clone(), state.clone()).await?;
+        let listing = crate::commands::engrams::load_agent_memory(
+            record.pubkey.clone(),
+            &app,
+            &state,
+            &crate::relay::relay_api_base_url_with_override(&state),
+        )
+        .await?;
         memory_entries_from_listing(listing, memory_level)
     };
 

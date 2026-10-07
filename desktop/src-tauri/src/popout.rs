@@ -47,11 +47,14 @@ pub(crate) fn is_popout_label(label: &str) -> bool {
 }
 
 /// Whether the window-state plugin should save and restore geometry for the
-/// window with `label`. Only the main window is persisted: pop-out and huddle
-/// windows carry per-instance labels, so persisting them would grow the state
-/// file by one entry per window ever opened.
+/// window with `label`. The main window and community windows are persisted:
+/// a community window's label is stable per community (`community-<id>`), so
+/// it reopens where the user left it and the state file grows by at most one
+/// entry per community. Pop-out and huddle windows carry per-instance labels,
+/// so persisting them would grow the state file by one entry per window ever
+/// opened.
 pub(crate) fn persists_window_state(label: &str) -> bool {
-    label == MAIN_WINDOW_LABEL
+    label == MAIN_WINDOW_LABEL || crate::window_relay::is_community_window_label(label)
 }
 
 /// Validate an app-relative route (path plus optional query/fragment).

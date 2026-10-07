@@ -57,6 +57,7 @@ mod unread_catch_up;
 mod util;
 #[cfg(target_os = "linux")]
 pub mod webkit_rendering;
+mod window_relay;
 use app_state::{build_app_state, resolve_persisted_identity, AppState};
 use builderlab::*;
 #[doc(hidden)]
@@ -154,7 +155,9 @@ pub fn run() {
         .plugin(
             tauri::plugin::Builder::<_, ()>::new("initial-window-reveal")
                 .on_webview_ready(|webview| {
-                    if popout::is_popout_label(webview.label()) {
+                    if popout::is_popout_label(webview.label())
+                        || window_relay::is_community_window_label(webview.label())
+                    {
                         // Pop-outs host the same composer (voice notes) as
                         // the main window; they are revealed by their builder.
                         linux_media::enable_media_capture(&webview);
@@ -553,6 +556,9 @@ pub fn run() {
             popout::open_popout_window,
             popout::take_popout_launch,
             popout::focus_main_window_route,
+            window_relay::bind_window_community,
+            window_relay::open_community_window,
+            window_relay::focus_community_window,
             take_pending_community_deep_link,
             acknowledge_pending_community_deep_link,
             take_pending_navigation_deep_link,
@@ -987,6 +993,13 @@ pub fn run() {
             ..
         } if popout::is_popout_label(&label) => {
             app_handle.state::<popout::PopoutRegistry>().release(&label);
+        }
+        RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::Destroyed,
+            ..
+        } if window_relay::is_community_window_label(&label) => {
+            window_relay::release_window_relay(&app_handle.state::<AppState>(), &label);
         }
         RunEvent::ExitRequested { code, .. } => {
             if is_restart_request(code) {

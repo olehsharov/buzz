@@ -340,16 +340,23 @@ pub(crate) use provider_deploy::deploy_to_provider;
 // from the owned AppHandle inside the closure because `State<'_, _>` is borrowed
 // and `std::sync::MutexGuard` is not `Send`.
 #[tauri::command]
-pub async fn list_managed_agents(app: AppHandle) -> Result<Vec<ManagedAgentSummary>, String> {
-    tokio::task::spawn_blocking(move || list_community_managed_agents(&app))
+pub async fn list_managed_agents<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    relay: crate::window_relay::WindowRelay,
+) -> Result<Vec<ManagedAgentSummary>, String> {
+    // The invoking window's community: a community window lists its own
+    // community's agents, the main window the active community's.
+    let community_relay = relay.ws_url().to_string();
+    tokio::task::spawn_blocking(move || list_community_managed_agents(&app, &community_relay))
         .await
         .map_err(|e| format!("spawn_blocking failed: {e}"))?
 }
 
-/// Blocking body of [`list_managed_agents`]: summaries of the ACTIVE
-/// community's agents only.
+/// Blocking body of [`list_managed_agents`]: summaries of the agents of the
+/// community on `community_relay` only.
 pub(crate) fn list_community_managed_agents<R: tauri::Runtime>(
     app: &AppHandle<R>,
+    community_relay: &str,
 ) -> Result<Vec<ManagedAgentSummary>, String> {
     use tauri::Manager;
     let state = app.state::<AppState>();
@@ -378,10 +385,11 @@ pub(crate) fn list_community_managed_agents<R: tauri::Runtime>(
     // does not re-read them per record.
     let teams = load_teams(app).unwrap_or_default();
     let global_config = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
-    // Agents belong to ONE community: list only the active community's.
-    // Every UI surface (agents page, pickers, mentions, tray, machines)
-    // reads this list, so this is the one place other communities' agents
-    // are hidden.
+    // Agents belong to ONE community: list only the invoking window's
+    // community's. Every UI surface (agents page, pickers, mentions, tray,
+    // machines) reads this list, so this is the one place other communities'
+    // agents are hidden. An unassigned record resolves to the active
+    // workspace, as everywhere else.
     let workspace_relay = crate::relay::relay_ws_url_with_override(&state);
     records
         .iter()
@@ -389,7 +397,7 @@ pub(crate) fn list_community_managed_agents<R: tauri::Runtime>(
             crate::managed_agents::community_scope::record_in_community(
                 record,
                 &workspace_relay,
-                &workspace_relay,
+                community_relay,
             )
         })
         .map(|record| {

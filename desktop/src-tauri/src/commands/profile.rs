@@ -11,16 +11,20 @@ use crate::{
     models::{ProfileInfo, SearchUsersResponse, UserNotesResponse, UsersBatchResponse},
     nostr_convert,
     relay::{
-        query_relay, query_relay_at_with_keys, relay_http_base_url, submit_event,
+        query_relay_at, query_relay_at_with_keys, relay_http_base_url, submit_event_at,
         submit_event_at_with_keys,
     },
 };
 
 #[tauri::command]
-pub async fn get_profile(state: State<'_, AppState>) -> Result<ProfileInfo, String> {
+pub async fn get_profile(
+    relay: crate::window_relay::WindowRelay,
+    state: State<'_, AppState>,
+) -> Result<ProfileInfo, String> {
     let my_pubkey = current_pubkey_hex(&state)?;
-    let events = query_relay(
+    let events = query_relay_at(
         &state,
+        &relay.api_base(),
         &[serde_json::json!({
             "kinds": [0],
             "authors": [my_pubkey],
@@ -42,12 +46,14 @@ pub async fn update_profile(
     avatar_url: Option<String>,
     about: Option<String>,
     nip05_handle: Option<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<ProfileInfo, String> {
     // Read-merge-write: kind 0 is a full profile snapshot.
     let my_pubkey = current_pubkey_hex(&state)?;
-    let prior_events = query_relay(
+    let prior_events = query_relay_at(
         &state,
+        &relay.api_base(),
         &[serde_json::json!({
             "kinds": [0],
             "authors": [my_pubkey],
@@ -78,11 +84,12 @@ pub async fn update_profile(
         .or_else(|| current.get("nip05").and_then(Value::as_str));
 
     let builder = events::build_profile(dn, name, picture, ab, nip05)?;
-    submit_event(builder, &state).await?;
+    submit_event_at(builder, &state, &relay.api_base()).await?;
 
     // Re-fetch to return canonical profile.
-    let events = query_relay(
+    let events = query_relay_at(
         &state,
+        &relay.api_base(),
         &[serde_json::json!({
             "kinds": [0],
             "authors": [current_pubkey_hex(&state)?],
@@ -180,6 +187,7 @@ fn normalized_avatar_url(avatar_url: Option<&str>) -> Option<&str> {
 #[tauri::command]
 pub async fn get_user_profile(
     pubkey: Option<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<ProfileInfo, String> {
     let target = match pubkey {
@@ -187,8 +195,9 @@ pub async fn get_user_profile(
         None => current_pubkey_hex(&state)?,
     };
 
-    let events = query_relay(
+    let events = query_relay_at(
         &state,
+        &relay.api_base(),
         &[serde_json::json!({
             "kinds": [0],
             "authors": [target.clone()],
@@ -207,6 +216,7 @@ pub async fn get_user_profile(
 #[tauri::command]
 pub async fn get_users_batch(
     pubkeys: Vec<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<UsersBatchResponse, String> {
     if pubkeys.is_empty() {
@@ -215,8 +225,9 @@ pub async fn get_users_batch(
             missing: Vec::new(),
         });
     }
-    let events = query_relay(
+    let events = query_relay_at(
         &state,
+        &relay.api_base(),
         &[serde_json::json!({
             "kinds": [0],
             "authors": pubkeys,
@@ -233,6 +244,7 @@ pub async fn get_user_notes(
     limit: Option<u32>,
     before: Option<i64>,
     before_id: Option<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<UserNotesResponse, String> {
     let _ = before_id; // pure-nostr filter does not use the id-based cursor
@@ -247,7 +259,7 @@ pub async fn get_user_notes(
         filter.insert("until".to_string(), serde_json::json!(t));
     }
 
-    let events = query_relay(&state, &[Value::Object(filter)]).await?;
+    let events = query_relay_at(&state, &relay.api_base(), &[Value::Object(filter)]).await?;
     Ok(nostr_convert::user_notes_from_events(&events))
 }
 
@@ -262,22 +274,22 @@ fn build_user_search_filter(query: &str, limit: usize, page: u32) -> serde_json:
 }
 
 #[tauri::command]
-pub async fn search_users(
+pub async fn search_users<R: tauri::Runtime>(
     query: String,
     limit: Option<u32>,
     cursor: Option<String>,
-    app: tauri::AppHandle,
+    app: tauri::AppHandle<R>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<SearchUsersResponse, String> {
-    // Read before the query so the filter matches the relay queried.
-    let workspace_relay = crate::relay::relay_ws_url_with_override(&state);
-    let mut response = search_users_on_relay(query, limit, cursor, &state).await?;
+    let mut response =
+        search_users_on_relay(query, limit, cursor, &state, &relay.api_base()).await?;
     // An agent belongs to ONE community: this device's agents from another
     // community stay out of every people search here (pickers, mentions, DM
     // recipients, topbar), even where an older build left a profile here.
     let hidden = crate::managed_agents::community_scope::load_other_community_agent_pubkeys(
         &app,
-        &workspace_relay,
+        relay.ws_url(),
     )?;
     response
         .users
@@ -290,6 +302,7 @@ async fn search_users_on_relay(
     limit: Option<u32>,
     cursor: Option<String>,
     state: &AppState,
+    api_base_url: &str,
 ) -> Result<SearchUsersResponse, String> {
     let trimmed = query.trim();
     let max = limit.unwrap_or(8).min(500) as usize;
@@ -307,8 +320,9 @@ async fn search_users_on_relay(
     }
 
     if trimmed.is_empty() {
-        let events = query_relay(
+        let events = query_relay_at(
             state,
+            api_base_url,
             &[serde_json::json!({
                 "kinds": [0],
                 "limit": max,
@@ -348,7 +362,12 @@ async fn search_users_on_relay(
     // the relay runs whole-word `websearch_to_tsquery` matching and "tyl"
     // returns zero results for "Tyler". Same bridge-only extension the topbar
     // message search uses (see `build_search_messages_filter`).
-    let events = query_relay(state, &[build_user_search_filter(trimmed, max, page)]).await?;
+    let events = query_relay_at(
+        state,
+        api_base_url,
+        &[build_user_search_filter(trimmed, max, page)],
+    )
+    .await?;
 
     let mut response = nostr_convert::rank_user_search_results(&events, trimmed, max);
     if events.len() >= max {
@@ -360,6 +379,7 @@ async fn search_users_on_relay(
 #[tauri::command]
 pub async fn get_presence(
     pubkeys: Vec<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<HashMap<String, PresenceStatus>, String> {
     if pubkeys.is_empty() {
@@ -369,8 +389,9 @@ pub async fn get_presence(
     // Presence is published as kind:20001 ephemeral events. Query the most
     // recent per author. Only a successful empty snapshot establishes absence;
     // transport/auth/storage failures must reject so consumers remain unknown.
-    let events = query_relay(
+    let events = query_relay_at(
         &state,
+        &relay.api_base(),
         &[serde_json::json!({
             "kinds": [20001],
             "authors": pubkeys,

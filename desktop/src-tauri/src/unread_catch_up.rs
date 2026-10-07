@@ -135,6 +135,7 @@ impl From<Event> for EventView {
 #[tauri::command]
 pub(crate) async fn unread_catch_up(
     request: UnreadCatchUpRequest,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
     relay_client: State<'_, NativeRelayClient>,
     app: AppHandle,
@@ -144,7 +145,7 @@ pub(crate) async fn unread_catch_up(
     if !owner.eq_ignore_ascii_case(&request.self_pubkey) {
         return Err("unread catch-up identity does not match active scope".to_string());
     }
-    let relay_url = crate::relay::relay_ws_url_with_override(&state);
+    let relay_url = relay.ws_url().to_string();
     // The lease must outlive every task below: when the leased session is
     // private (a scope switch landed mid-command), dropping the lease shuts
     // that session down, and a `handle()` clone still held by a running fetch
@@ -155,12 +156,7 @@ pub(crate) async fn unread_catch_up(
 
     let (fetched, failures) = fetch_channels(session.handle(), &request).await?;
 
-    let current_keys = state.signing_keys()?;
-    if current_keys.public_key().to_hex() != owner
-        || crate::relay::relay_ws_url_with_override(&state) != relay_url
-    {
-        return Err("unread catch-up scope changed while fetching".to_string());
-    }
+    ensure_catch_up_scope_current(&state, &relay, &owner)?;
 
     let membership = crate::observed_unread::load_membership(
         &app,
@@ -172,6 +168,23 @@ pub(crate) async fn unread_catch_up(
     let mut channels = classify_batch(&request, fetched, &membership);
     channels.extend(failures);
     Ok(UnreadCatchUpResponse { channels })
+}
+
+/// Stale-result fence for [`unread_catch_up`]: after the awaited fetch, the
+/// signer and the invoking window's relay must still be the scope the command
+/// started on. A main-window workspace switch, a community-window rebind, or an
+/// identity swap during the fetch discards the batch instead of classifying it
+/// against the wrong community's membership.
+pub(crate) fn ensure_catch_up_scope_current(
+    state: &AppState,
+    relay: &crate::window_relay::WindowRelay,
+    owner: &str,
+) -> Result<(), String> {
+    let current_keys = state.signing_keys()?;
+    if current_keys.public_key().to_hex() != owner || !relay.is_current(state) {
+        return Err("unread catch-up scope changed while fetching".to_string());
+    }
+    Ok(())
 }
 
 // Shared production boundary: original per-channel filters, finite requests,

@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window and its trusted huddle and pop-out companions, which load the same bundled app",
-  "windows": ["main", "huddle-*", "popout-*"],
+  "description": "Capability for the main window and its trusted huddle, pop-out, and community companions, which load the same bundled app",
+  "windows": ["main", "huddle-*", "popout-*", "community-*"],
   "permissions": [
     "core:default",
     "core:webview:allow-set-webview-zoom",

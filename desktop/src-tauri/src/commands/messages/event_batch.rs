@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use tauri::State;
 
-use crate::{app_state::AppState, relay::query_relay};
+use crate::{app_state::AppState, relay::query_relay_at};
 
 // The relay clamps a single filter to this many events. Keep exact-ID reads in
 // chunks so a large workflow list cannot silently lose late presentations.
@@ -27,9 +27,14 @@ const GET_EVENT_KINDS: [u32; 15] = [
 ];
 
 #[tauri::command]
-pub async fn get_event(event_id: String, state: State<'_, AppState>) -> Result<String, String> {
-    let events = query_relay(
+pub async fn get_event(
+    event_id: String,
+    relay: crate::window_relay::WindowRelay,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let events = query_relay_at(
         &state,
+        &relay.api_base(),
         &[serde_json::json!({
             "ids": [event_id],
             "kinds": GET_EVENT_KINDS,
@@ -63,6 +68,7 @@ fn normalized_event_id_chunks(event_ids: Vec<String>) -> Vec<Vec<String>> {
 #[tauri::command]
 pub async fn get_events(
     event_ids: Vec<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let event_id_chunks = normalized_event_id_chunks(event_ids);
@@ -72,8 +78,9 @@ pub async fn get_events(
 
     let mut events_by_id = std::collections::HashMap::new();
     for event_ids in event_id_chunks {
-        let events = query_relay(
+        let events = query_relay_at(
             &state,
+            &relay.api_base(),
             &[serde_json::json!({
                 "ids": event_ids,
                 "kinds": GET_EVENT_KINDS,

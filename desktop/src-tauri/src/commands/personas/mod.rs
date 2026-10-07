@@ -76,8 +76,12 @@ pub use inbound::reconcile_inbound_persona_event;
 pub(crate) use inbound::retain_inbound_catalog_witness;
 
 #[tauri::command]
-pub async fn list_personas(app: AppHandle) -> Result<Vec<AgentDefinition>, String> {
+pub async fn list_personas(
+    app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
+) -> Result<Vec<AgentDefinition>, String> {
     use tauri::Manager;
+    let community_relay = relay.ws_url().to_string();
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let _store_guard = state
@@ -85,7 +89,7 @@ pub async fn list_personas(app: AppHandle) -> Result<Vec<AgentDefinition>, Strin
             .lock()
             .map_err(|error| error.to_string())?;
         let mut personas = load_personas(&app)?;
-        retain_community_personas(&app, &mut personas)?;
+        retain_community_personas(&app, &community_relay, &mut personas)?;
         pending::project_active_persona_sharing(&app, &state, &mut personas);
         Ok(personas)
     })
@@ -94,9 +98,10 @@ pub async fn list_personas(app: AppHandle) -> Result<Vec<AgentDefinition>, Strin
 }
 
 /// Definitions belong to ONE community like their agents (built-ins are
-/// global templates): keep only the active community's.
+/// global templates): keep only the community on `community_relay`.
 pub(crate) fn retain_community_personas<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
+    community_relay: &str,
     personas: &mut Vec<AgentDefinition>,
 ) -> Result<(), String> {
     use tauri::Manager;
@@ -108,7 +113,7 @@ pub(crate) fn retain_community_personas<R: tauri::Runtime>(
                 !crate::managed_agents::community_scope::record_in_community(
                     record,
                     &workspace_relay,
-                    &workspace_relay,
+                    community_relay,
                 )
             })
             .filter_map(|record| record.slug)

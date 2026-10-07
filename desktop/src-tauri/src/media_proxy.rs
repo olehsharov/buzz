@@ -20,6 +20,59 @@ use crate::relay;
 /// requests for seeking, so this only catches edge cases.
 const MAX_PROXY_RESPONSE: u64 = 20 * 1024 * 1024;
 
+/// Where a proxied media request must go upstream.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct MediaTarget<'a> {
+    /// The relay authority (`host[:port]`) encoded in the path, or `None` for
+    /// the legacy un-prefixed form, which targets the main workspace relay.
+    pub authority: Option<&'a str>,
+    /// The upstream path and query (`/media/<file>[?query]`).
+    pub upstream_path: String,
+}
+
+fn is_authority_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b':' | b'[' | b']')
+}
+
+/// Parse a proxied media path. Every window has its own relay, so the webview
+/// encodes the relay the media belongs to in the path:
+/// `/media/<relay host[:port]>/<file>[?query]`. The legacy `/media/<file>`
+/// form (one segment) still resolves against the main workspace relay.
+/// Returns `None` for anything that is not a media path.
+pub(crate) fn parse_media_path(path_and_query: &str) -> Option<MediaTarget<'_>> {
+    let rest = path_and_query.strip_prefix("/media/")?;
+    let (path, query) = match rest.find('?') {
+        Some(index) => rest.split_at(index),
+        None => (rest, ""),
+    };
+    let (authority, file) = match path.split_once('/') {
+        Some((authority, file)) => (Some(authority), file),
+        None => (None, path),
+    };
+    if file.is_empty() || file.contains('/') {
+        return None;
+    }
+    if let Some(authority) = authority {
+        if authority.is_empty() || !authority.bytes().all(is_authority_char) {
+            return None;
+        }
+    }
+    Some(MediaTarget {
+        authority,
+        upstream_path: format!("/media/{file}{query}"),
+    })
+}
+
+/// Resolve the relay HTTP base a parsed media path targets: the bound relay
+/// (main workspace or a community window) whose authority matches, so media
+/// auth is only ever minted for a relay this app is connected to.
+fn media_relay_base(state: &AppState, target: &MediaTarget<'_>) -> Option<String> {
+    match target.authority {
+        Some(authority) => crate::window_relay::bound_relay_base_for_authority(state, authority),
+        None => Some(relay::relay_api_base_url_with_override(state)),
+    }
+}
+
 #[derive(Clone)]
 struct ProxyState {
     client: reqwest::Client,
@@ -45,10 +98,16 @@ async fn proxy_handler(AxumState(state): AxumState<ProxyState>, req: Request) ->
         .map(|pq| pq.as_str())
         .unwrap_or("/");
 
-    // Resolve relay URL dynamically so workspace switches take effect immediately.
+    // Resolve the relay per request from the path so workspace switches take
+    // effect immediately and each window's media goes to its own relay.
     let app_state = state.app_handle.state::<AppState>();
-    let base_url = relay::relay_api_base_url_with_override(&app_state);
-    let upstream_url = format!("{base_url}{path_and_query}");
+    let Some(target) = parse_media_path(path_and_query) else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    let Some(base_url) = media_relay_base(&app_state, &target) else {
+        return (StatusCode::NOT_FOUND, "unknown relay").into_response();
+    };
+    let upstream_url = format!("{base_url}{}", target.upstream_path);
 
     let has_range = req.headers().contains_key("range");
 
@@ -194,7 +253,6 @@ pub async fn handle_buzz_media(
     use tauri::Manager;
 
     let state = app.state::<AppState>();
-    let base = relay::relay_api_base_url_with_override(&state);
 
     // Preserve path + query (thumbnails may have query params).
     // Only proxy /media/ paths — reject anything else.
@@ -204,12 +262,15 @@ pub async fn handle_buzz_media(
         .map(|pq| pq.as_str())
         .unwrap_or("/");
 
-    if !path_and_query.starts_with("/media/") {
+    let Some(target) = parse_media_path(path_and_query) else {
         return error_response(404, "not found");
-    }
+    };
+    let Some(base) = media_relay_base(&state, &target) else {
+        return error_response(404, "unknown relay");
+    };
 
     let has_range = request.headers().contains_key("range");
-    let upstream_url = format!("{base}{path_and_query}");
+    let upstream_url = format!("{base}{}", target.upstream_path);
 
     // Forward Range header if present — enables video seeking through the proxy.
     let mut upstream = state
@@ -369,3 +430,7 @@ fn error_response(status: u16, msg: &str) -> http::Response<Vec<u8>> {
                 .unwrap()
         })
 }
+
+#[cfg(test)]
+#[path = "media_proxy_tests.rs"]
+mod tests;

@@ -180,6 +180,10 @@ mod app_seams {
         *state.relay_url_override.lock().unwrap() = Some(relay.into());
     }
 
+    fn active_relay(test: &TestApp) -> String {
+        crate::relay::relay_ws_url_with_override(&test.app.state::<crate::app_state::AppState>())
+    }
+
     fn base_dir(test: &TestApp) -> PathBuf {
         crate::managed_agents::managed_agents_base_dir(test.app.handle()).unwrap()
     }
@@ -230,13 +234,15 @@ mod app_seams {
             .unwrap();
 
         let listed = |test: &TestApp| {
-            let agents = crate::commands::list_community_managed_agents(test.app.handle())
+            let relay = active_relay(test);
+            let agents = crate::commands::list_community_managed_agents(test.app.handle(), &relay)
                 .unwrap()
                 .into_iter()
                 .map(|agent| agent.pubkey)
                 .collect::<Vec<_>>();
             let mut personas = crate::managed_agents::load_personas(test.app.handle()).unwrap();
-            crate::commands::retain_community_personas(test.app.handle(), &mut personas).unwrap();
+            crate::commands::retain_community_personas(test.app.handle(), &relay, &mut personas)
+                .unwrap();
             let definitions = personas
                 .into_iter()
                 .filter(|persona| !persona.is_builtin)

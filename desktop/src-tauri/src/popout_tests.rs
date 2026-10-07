@@ -99,8 +99,13 @@ fn reserve_is_capped_and_release_frees_a_slot() {
 }
 
 #[test]
-fn only_main_window_state_is_persisted() {
+fn only_main_and_community_window_state_is_persisted() {
     assert!(persists_window_state("main"));
+    assert!(persists_window_state(
+        "community-0b6c3a9e-2f5f-4f9e-9a43-0b8b2a6f3c11"
+    ));
+    assert!(!persists_window_state("community-"));
+    assert!(!persists_window_state("community-a/b"));
     assert!(!persists_window_state(
         "popout-0b6c3a9e-2f5f-4f9e-9a43-0b8b2a6f3c11"
     ));

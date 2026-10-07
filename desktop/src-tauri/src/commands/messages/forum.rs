@@ -6,11 +6,12 @@ use crate::{
         ForumMessageInfo, ForumPostsResponse, ForumThreadReplyInfo, ForumThreadResponse,
         ThreadSummary,
     },
-    relay::query_relay,
+    relay::query_relay_at,
 };
 
 pub(super) async fn fetch_agent_owner_pubkeys(
     state: &AppState,
+    api_base_url: &str,
     events: &[nostr::Event],
 ) -> std::collections::HashMap<String, String> {
     let authors = events
@@ -23,8 +24,9 @@ pub(super) async fn fetch_agent_owner_pubkeys(
         return std::collections::HashMap::new();
     }
 
-    super::query_relay(
+    query_relay_at(
         state,
+        api_base_url,
         &[serde_json::json!({ "kinds": [0], "authors": authors })],
     )
     .await
@@ -159,6 +161,7 @@ pub async fn get_forum_posts(
     channel_id: String,
     limit: Option<u32>,
     before: Option<i64>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<ForumPostsResponse, String> {
     let cap = limit.unwrap_or(20).min(100);
@@ -170,7 +173,12 @@ pub async fn get_forum_posts(
         filter.insert("until".to_string(), serde_json::json!(t));
     }
 
-    let events = query_relay(&state, &[serde_json::Value::Object(filter)]).await?;
+    let events = query_relay_at(
+        &state,
+        &relay.api_base(),
+        &[serde_json::Value::Object(filter)],
+    )
+    .await?;
     let ids = events
         .iter()
         .map(|event| event.id.to_hex())
@@ -178,14 +186,15 @@ pub async fn get_forum_posts(
     let edits = if ids.is_empty() {
         Vec::new()
     } else {
-        query_relay(
+        query_relay_at(
             &state,
+            &relay.api_base(),
             &[serde_json::json!({ "kinds": [40003], "#e": ids })],
         )
         .await
         .unwrap_or_default()
     };
-    let owner_pubkeys = fetch_agent_owner_pubkeys(&state, &events).await;
+    let owner_pubkeys = fetch_agent_owner_pubkeys(&state, &relay.api_base(), &events).await;
     let suppressed = link_preview_suppression_targets(&events, &edits, &owner_pubkeys);
     let messages: Vec<ForumMessageInfo> = events
         .iter()
@@ -209,13 +218,15 @@ pub async fn get_forum_thread(
     event_id: String,
     limit: Option<u32>,
     cursor: Option<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<ForumThreadResponse, String> {
     let _ = (limit, cursor);
     // Two filters: the root event itself, plus any reply (kinds 9/45003)
     // that references it via #e.
-    let events = query_relay(
+    let events = query_relay_at(
         &state,
+        &relay.api_base(),
         &[
             serde_json::json!({ "ids": [event_id.clone()], "kinds": [9, 40002, 45001, 45003] }),
             serde_json::json!({
@@ -233,14 +244,15 @@ pub async fn get_forum_thread(
     let edits = if ids.is_empty() {
         Vec::new()
     } else {
-        query_relay(
+        query_relay_at(
             &state,
+            &relay.api_base(),
             &[serde_json::json!({ "kinds": [40003], "#e": ids })],
         )
         .await
         .unwrap_or_default()
     };
-    let owner_pubkeys = fetch_agent_owner_pubkeys(&state, &events).await;
+    let owner_pubkeys = fetch_agent_owner_pubkeys(&state, &relay.api_base(), &events).await;
     let suppressed = link_preview_suppression_targets(&events, &edits, &owner_pubkeys);
 
     let mut root: Option<ForumMessageInfo> = None;

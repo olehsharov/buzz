@@ -495,10 +495,14 @@ pub async fn confirm_agent_snapshot_import(
         snapshot.profile.avatar_data_url.as_deref(),
         snapshot.profile.avatar_url.as_deref(),
         |avatar_bytes| async {
-            crate::commands::media::upload_image_bytes(avatar_bytes, &state)
-                .await
-                .map(|descriptor| descriptor.url)
-                .map_err(|error| format!("Could not upload the imported avatar: {error}"))
+            crate::commands::media::upload_image_bytes(
+                avatar_bytes,
+                &state,
+                &crate::relay::relay_api_base_url_with_override(&state),
+            )
+            .await
+            .map(|descriptor| descriptor.url)
+            .map_err(|error| format!("Could not upload the imported avatar: {error}"))
         },
     )
     .await?;

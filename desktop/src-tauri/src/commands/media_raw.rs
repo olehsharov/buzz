@@ -25,6 +25,7 @@ pub async fn upload_media_bytes(
     filename: Option<String>,
     progress_id: Option<String>,
     app: tauri::AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<BlobDescriptor, String> {
     let cancellation = begin_media_upload(progress_id.as_deref());
@@ -34,6 +35,7 @@ pub async fn upload_media_bytes(
         progress_id.clone(),
         app,
         state,
+        &relay.api_base(),
         cancellation.as_ref(),
     )
     .await;
@@ -78,6 +80,7 @@ pub fn release_media_upload(progress_id: String) {
 pub async fn upload_media_bytes_raw(
     request: Request<'_>,
     app: tauri::AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<BlobDescriptor, String> {
     let data = match request.body() {
@@ -94,6 +97,7 @@ pub async fn upload_media_bytes_raw(
         progress_id.clone(),
         app,
         state,
+        &relay.api_base(),
         cancellation.as_ref(),
     )
     .await;

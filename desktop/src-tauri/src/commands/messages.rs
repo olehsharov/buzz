@@ -1,7 +1,7 @@
 use nostr::{Event, EventId, Keys, PublicKey};
 use tauri::{AppHandle, State};
 
-mod forum;
+pub(crate) mod forum;
 
 use forum::{
     apply_link_preview_suppression, fetch_agent_owner_pubkeys, link_preview_suppression_targets,
@@ -18,8 +18,8 @@ use crate::{
     },
     nostr_convert,
     relay::{
-        assert_expected_relay_scope, assert_expected_signer, query_relay, submit_event,
-        submit_event_at_created_at, submit_event_with_keys_created_at,
+        assert_expected_relay_scope, assert_expected_signer, query_relay_at, submit_event_at,
+        submit_event_at_created_at, submit_event_with_keys_at_created_at,
     },
 };
 
@@ -51,6 +51,7 @@ pub async fn get_feed(
     since: Option<i64>,
     limit: Option<u32>,
     types: Option<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<FeedResponse, String> {
     let cap = limit.unwrap_or(50).min(100);
@@ -104,14 +105,14 @@ pub async fn get_feed(
     }
 
     let mention_events = if want_mentions {
-        query_relay(&state, &[mention_filter])
+        query_relay_at(&state, &relay.api_base(), &[mention_filter])
             .await
             .unwrap_or_default()
     } else {
         Vec::new()
     };
     let approval_events = if want_needs_action {
-        query_relay(&state, &[approval_filter])
+        query_relay_at(&state, &relay.api_base(), &[approval_filter])
             .await
             .unwrap_or_default()
     } else {
@@ -125,14 +126,16 @@ pub async fn get_feed(
     let mention_edits = if mention_ids.is_empty() {
         Vec::new()
     } else {
-        query_relay(
+        query_relay_at(
             &state,
+            &relay.api_base(),
             &[serde_json::json!({ "kinds": [40003], "#e": mention_ids })],
         )
         .await
         .unwrap_or_default()
     };
-    let mention_owner_pubkeys = fetch_agent_owner_pubkeys(&state, &mention_events).await;
+    let mention_owner_pubkeys =
+        fetch_agent_owner_pubkeys(&state, &relay.api_base(), &mention_events).await;
     let suppressed_mentions =
         link_preview_suppression_targets(&mention_events, &mention_edits, &mention_owner_pubkeys);
     let mentions: Vec<FeedItemInfo> = mention_events
@@ -216,6 +219,7 @@ pub async fn search_messages(
     authors: Option<Vec<String>>,
     since: Option<i64>,
     until: Option<i64>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<SearchResponse, String> {
     let cap = search_messages_limit(limit);
@@ -228,7 +232,7 @@ pub async fn search_messages(
         until,
     );
 
-    let events = query_relay(&state, &[filter]).await?;
+    let events = query_relay_at(&state, &relay.api_base(), &[filter]).await?;
     Ok(nostr_convert::search_response_from_events(&events))
 }
 
@@ -248,6 +252,7 @@ pub async fn get_thread_replies(
     limit: Option<u32>,
     depth_limit: Option<u32>,
     cursor: Option<crate::models::ThreadCursor>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<ThreadRepliesResponse, String> {
     let cap = limit.unwrap_or(200).min(500);
@@ -259,7 +264,12 @@ pub async fn get_thread_replies(
         cursor.as_ref(),
     );
 
-    let events = query_relay(&state, &[serde_json::Value::Object(filter)]).await?;
+    let events = query_relay_at(
+        &state,
+        &relay.api_base(),
+        &[serde_json::Value::Object(filter)],
+    )
+    .await?;
 
     // A full page implies there may be more; hand back the last event's
     // composite key as the next cursor (the DB returns replies strictly after
@@ -366,13 +376,19 @@ pub async fn get_channel_messages_before(
     before: i64,
     before_id: Option<String>,
     limit: Option<u32>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<crate::models::ChannelMessagesPageResponse, String> {
     let cap = limit.unwrap_or(200).min(500);
     let filter =
         build_channel_messages_before_filter(&channel_id, before, before_id.as_deref(), cap);
 
-    let events = query_relay(&state, &[serde_json::Value::Object(filter)]).await?;
+    let events = query_relay_at(
+        &state,
+        &relay.api_base(),
+        &[serde_json::Value::Object(filter)],
+    )
+    .await?;
 
     // Relay order is created_at DESC, id ASC — the last event is the oldest, so
     // it is the cursor for the next (older) page when a full page returned.
@@ -396,7 +412,7 @@ pub async fn get_channel_messages_before(
     })
 }
 
-mod event_batch;
+pub(crate) mod event_batch;
 pub use event_batch::{get_event, get_events};
 
 // ── Writes ──────────────────────────────────────────────────────────────────
@@ -420,6 +436,7 @@ pub async fn send_channel_message(
     kind: Option<u32>,
     expected_relay_url: Option<String>,
     expected_signer_pubkey: Option<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<SendChannelMessageResponse, String> {
     let channel_uuid = uuid::Uuid::parse_str(&channel_id)
@@ -440,7 +457,7 @@ pub async fn send_channel_message(
     // catch the latter: relay and keys mutate under separate locks during a
     // workspace switch, so the keys are snapshotted here, asserted, and that
     // exact snapshot signs the event and its NIP-98 auth below.
-    let relay_base = crate::relay::relay_api_base_url_with_override(&state);
+    let relay_base = relay.api_base();
     assert_expected_relay_scope(expected_relay_url.as_deref(), &relay_base)?;
     let signing_keys = state.signing_keys()?;
     assert_expected_signer(
@@ -551,6 +568,7 @@ fn event_has_client_marker(event: &Event, marker: &str) -> bool {
 
 async fn find_managed_agent_channel_message_by_marker(
     state: &AppState,
+    api_base_url: &str,
     agent_pubkey: Option<&str>,
     channel_id: &str,
     marker: &str,
@@ -575,7 +593,7 @@ async fn find_managed_agent_channel_message_by_marker(
             filter["until"] = serde_json::json!(until);
         }
 
-        let events = query_relay(state, &[filter]).await?;
+        let events = query_relay_at(state, api_base_url, &[filter]).await?;
         if let Some(existing) = events
             .iter()
             .find(|event| event_has_client_marker(event, marker))
@@ -618,6 +636,7 @@ pub async fn has_managed_agent_channel_message_marker(
     marker: String,
     agent_pubkey: Option<String>,
     marker_scope: Option<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
     uuid::Uuid::parse_str(&channel_id)
@@ -632,9 +651,15 @@ pub async fn has_managed_agent_channel_message_marker(
         .filter(|value| !value.is_empty());
 
     let marker_author = marker_author_for_scope(marker_scope.as_deref(), agent_pubkey)?;
-    find_managed_agent_channel_message_by_marker(&state, marker_author, &channel_id, marker)
-        .await
-        .map(|event| event.is_some())
+    find_managed_agent_channel_message_by_marker(
+        &state,
+        &relay.api_base(),
+        marker_author,
+        &channel_id,
+        marker,
+    )
+    .await
+    .map(|event| event.is_some())
 }
 
 fn stored_managed_agent_auth_tag(auth_tag: Option<&str>) -> Option<String> {
@@ -705,6 +730,7 @@ pub async fn send_managed_agent_channel_message(
     parent_event_id: Option<String>,
     additional_markers: Option<Vec<String>>,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<SendChannelMessageResponse, String> {
     let channel_uuid = uuid::Uuid::parse_str(&channel_id)
@@ -742,16 +768,9 @@ pub async fn send_managed_agent_channel_message(
         managed_agent_submission_auth_tag(&record, &state, &keys.public_key())?;
     let thread_ref = match parent_event_id.as_deref() {
         Some(parent_id) => Some(
-            // Same active-relay resolution as before — this path has no
-            // caller-captured tenant scope (yet), so resolve the override
-            // here and read through it with the active identity.
-            resolve_thread_ref(
-                parent_id,
-                &state,
-                &crate::relay::relay_api_base_url_with_override(&state),
-                None,
-            )
-            .await?,
+            // The invoking window's relay — this path has no caller-captured
+            // tenant scope (yet) — read through it with the active identity.
+            resolve_thread_ref(parent_id, &state, &relay.api_base(), None).await?,
         ),
         None => None,
     };
@@ -759,6 +778,7 @@ pub async fn send_managed_agent_channel_message(
     if let Some(marker) = marker.as_deref() {
         if let Some(existing) = find_managed_agent_channel_message_by_marker(
             &state,
+            &relay.api_base(),
             marker_author_for_scope(marker_scope.as_deref(), Some(&record.pubkey))?,
             &channel_id,
             marker,
@@ -799,9 +819,14 @@ pub async fn send_managed_agent_channel_message(
     )?;
     // Same contract as `send_channel_message`: `created_at` is the signed
     // event's, not a post-publication clock read.
-    let (result, created_at) =
-        submit_event_with_keys_created_at(builder, &state, &keys, submission_auth_tag.as_deref())
-            .await?;
+    let (result, created_at) = submit_event_with_keys_at_created_at(
+        builder,
+        &state,
+        &relay.api_base(),
+        &keys,
+        submission_auth_tag.as_deref(),
+    )
+    .await?;
 
     Ok(SendChannelMessageResponse {
         event_id: result.event_id,
@@ -817,6 +842,7 @@ pub async fn add_reaction(
     event_id: String,
     emoji: String,
     emoji_url: Option<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let target_eid = EventId::from_hex(&event_id).map_err(|e| format!("invalid event ID: {e}"))?;
@@ -828,7 +854,7 @@ pub async fn add_reaction(
             .map_err(|e| format!("invalid custom emoji reaction: {e}"))?,
         None => events::build_reaction(target_eid, emoji.trim())?,
     };
-    submit_event(builder, &state).await?;
+    submit_event_at(builder, &state, &relay.api_base()).await?;
     Ok(())
 }
 
@@ -836,6 +862,7 @@ pub async fn add_reaction(
 pub async fn remove_reaction(
     event_id: String,
     emoji: String,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     // Find our own kind:7 reaction event referencing the target.
@@ -846,8 +873,9 @@ pub async fn remove_reaction(
     let target = event_id.trim();
     let trimmed_emoji = emoji.trim();
 
-    let reactions = query_relay(
+    let reactions = query_relay_at(
         &state,
+        &relay.api_base(),
         &[serde_json::json!({
             "kinds": [7],
             "#e": [target],
@@ -862,7 +890,7 @@ pub async fn remove_reaction(
         .ok_or("could not find your reaction event for this emoji")?;
 
     let builder = events::build_remove_reaction(reaction_event.id)?;
-    submit_event(builder, &state).await?;
+    submit_event_at(builder, &state, &relay.api_base()).await?;
     Ok(())
 }
 
@@ -891,6 +919,7 @@ pub struct EditMessageInput {
 #[tauri::command]
 pub async fn edit_message(
     input: EditMessageInput,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let channel_uuid = uuid::Uuid::parse_str(&input.channel_id)
@@ -916,7 +945,7 @@ pub async fn edit_message(
         },
         input.suppress_link_previews,
     )?;
-    submit_event(builder, &state).await?;
+    submit_event_at(builder, &state, &relay.api_base()).await?;
     Ok(())
 }
 
@@ -924,13 +953,14 @@ pub async fn edit_message(
 pub async fn delete_message(
     channel_id: String,
     event_id: String,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let channel_uuid = uuid::Uuid::parse_str(&channel_id)
         .map_err(|_| format!("invalid channel UUID: {channel_id}"))?;
     let target_eid = EventId::from_hex(&event_id).map_err(|e| format!("invalid event ID: {e}"))?;
     let builder = events::build_delete_compat(channel_uuid, target_eid)?;
-    submit_event(builder, &state).await?;
+    submit_event_at(builder, &state, &relay.api_base()).await?;
     Ok(())
 }
 

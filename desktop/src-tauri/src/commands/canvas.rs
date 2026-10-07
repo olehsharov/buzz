@@ -3,16 +3,18 @@ use tauri::State;
 use crate::{
     app_state::AppState,
     events,
-    relay::{query_relay, submit_event},
+    relay::{query_relay_at, submit_event_at},
 };
 
 /// Read the most recent canvas event (kind:40100) for a channel.
 #[tauri::command]
 pub async fn get_canvas(
     channel_id: String,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    let events = query_relay(&state, &[get_canvas_filter(&channel_id)]).await?;
+    let events =
+        query_relay_at(&state, &relay.api_base(), &[get_canvas_filter(&channel_id)]).await?;
 
     let Some(event) = events.first() else {
         // Explicit nulls: the TS caller distinguishes "no canvas yet" from
@@ -39,6 +41,7 @@ pub async fn set_canvas(
     channel_id: String,
     content: String,
     expected_revision: Option<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     let uuid = uuid::Uuid::parse_str(&channel_id)
@@ -64,7 +67,8 @@ pub async fn set_canvas(
     // also refuses a head timestamped far in the future, so a poisoned timeline
     // fails loudly here rather than being silently extended. The no-head /
     // unconditional-append case has no floor and keeps the default `now`.
-    let head = current_canvas_head(&state, &channel_id).await?;
+    let api_base = relay.api_base();
+    let head = current_canvas_head(&state, &api_base, &channel_id).await?;
     let prior_head_created_at = check_canvas_precondition(expected_revision.as_deref(), head)?;
 
     let mut builder = events::build_set_canvas(uuid, &content, expected_revision.as_deref())?;
@@ -73,7 +77,7 @@ pub async fn set_canvas(
             buzz_sdk_pkg::canvas_write_created_at(floor as u64).map_err(|e| e.to_string())?,
         ));
     }
-    let result = submit_event(builder, &state).await?;
+    let result = submit_event_at(builder, &state, &api_base).await?;
 
     // Post-write supersession detection (only for conflict-checked writes). The
     // precondition above closes the stale-edit case; this closes the narrower
@@ -87,7 +91,7 @@ pub async fn set_canvas(
     // (frozen conflict marker); our head or a descendant is verified success.
     let mut verified = true;
     if expected_revision.is_some() {
-        let ancestry = current_canvas_head_ancestry(&state, &channel_id).await;
+        let ancestry = current_canvas_head_ancestry(&state, &api_base, &channel_id).await;
         verified = classify_post_write(&result.event_id, ancestry)?;
     }
 
@@ -243,9 +247,10 @@ fn canvas_ancestry_filter(channel_id: &str) -> serde_json::Value {
 /// `limit: 1` query returns exactly the head every surface agrees on.
 async fn current_canvas_head(
     state: &AppState,
+    api_base_url: &str,
     channel_id: &str,
 ) -> Result<Option<(String, i64)>, String> {
-    let events = query_relay(state, &[canvas_head_filter(channel_id)]).await?;
+    let events = query_relay_at(state, api_base_url, &[canvas_head_filter(channel_id)]).await?;
     Ok(events
         .first()
         .map(|event| (event.id.to_hex(), event.created_at.as_secs() as i64)))
@@ -261,9 +266,10 @@ async fn current_canvas_head(
 /// channel has no canvas.
 async fn current_canvas_head_ancestry(
     state: &AppState,
+    api_base_url: &str,
     channel_id: &str,
 ) -> Result<Vec<(String, Option<String>)>, String> {
-    let events = query_relay(state, &[canvas_ancestry_filter(channel_id)]).await?;
+    let events = query_relay_at(state, api_base_url, &[canvas_ancestry_filter(channel_id)]).await?;
     Ok(events
         .iter()
         .map(|event| {
@@ -294,6 +300,7 @@ pub async fn get_canvas_history(
     limit: Option<usize>,
     until: Option<u64>,
     before_id: Option<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     if before_id.is_some() && until.is_none() {
@@ -316,7 +323,7 @@ pub async fn get_canvas_history(
         filter["before_id"] = serde_json::json!(value);
     }
 
-    let events = query_relay(&state, &[filter]).await?;
+    let events = query_relay_at(&state, &relay.api_base(), &[filter]).await?;
 
     let revisions: Vec<serde_json::Value> = events
         .iter()

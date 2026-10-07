@@ -357,10 +357,11 @@ async fn materialize_team_snapshot_bytes(
                     && r.persona_id.as_deref() == Some(persona_id.as_str())
             });
             if let Some(instance) = instance {
-                let listing = crate::commands::engrams::get_agent_memory(
+                let listing = crate::commands::engrams::load_agent_memory(
                     instance.pubkey.clone(),
-                    app.clone(),
-                    state.clone(),
+                    &app,
+                    &state,
+                    &crate::relay::relay_api_base_url_with_override(&state),
                 )
                 .await?;
                 let mut entries = Vec::new();

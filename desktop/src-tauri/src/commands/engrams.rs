@@ -29,7 +29,7 @@ use buzz_core_pkg::engram::{self, extract_refs, select_head, validate_and_decryp
 use buzz_core_pkg::kind::KIND_AGENT_ENGRAM;
 
 use crate::commands::identity_archive::{extract_oa_owner, fetch_kind0};
-use crate::{app_state::AppState, managed_agents::load_managed_agents, relay::query_relay};
+use crate::{app_state::AppState, managed_agents::load_managed_agents, relay::query_relay_at};
 
 /// Hard cap on engrams returned per (agent, owner) pair. Matches the CLI
 /// `mem ls` reference. If the relay returns this many we set
@@ -106,7 +106,19 @@ fn kind0_declares_viewer_owner(kind0: Option<&nostr::Event>, viewer_pubkey: &str
 pub async fn get_agent_memory(
     agent_pubkey: String,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
+) -> Result<AgentMemoryListing, String> {
+    load_agent_memory(agent_pubkey, &app, &state, &relay.api_base()).await
+}
+
+/// Core of [`get_agent_memory`] against an explicit relay HTTP API base.
+/// Exports (persona cards, snapshots) pass the main workspace relay.
+pub(crate) async fn load_agent_memory(
+    agent_pubkey: String,
+    app: &AppHandle,
+    state: &AppState,
+    api_base_url: &str,
 ) -> Result<AgentMemoryListing, String> {
     // ── Owner gating ────────────────────────────────────────────────────
     // The viewer (this desktop's identity) is the prospective owner. The
@@ -142,13 +154,13 @@ pub async fn get_agent_memory(
         keys.public_key().to_hex()
     };
 
-    let managed = load_managed_agents(&app)?;
+    let managed = load_managed_agents(app)?;
     let is_managed = managed.iter().any(|m| m.pubkey == agent_pubkey);
     let is_declared_owner = if is_managed {
         false // already authorized; skip the relay roundtrip
     } else {
         // Verify the agent's live `kind:0` declares the viewer as owner.
-        let kind0 = fetch_kind0(&state, &agent_pubkey).await?;
+        let kind0 = fetch_kind0(state, api_base_url, &agent_pubkey).await?;
         kind0_declares_viewer_owner(kind0.as_ref(), &viewer_pubkey)
     };
 
@@ -176,7 +188,7 @@ pub async fn get_agent_memory(
         "#p": [owner_pubkey.to_hex()],
         "limit": ENGRAM_FETCH_LIMIT,
     });
-    let events = query_relay(&state, &[filter]).await?;
+    let events = query_relay_at(state, api_base_url, &[filter]).await?;
     // `>=` is intentional and accepts a false-positive at exactly
     // ENGRAM_FETCH_LIMIT events: if the relay returned the cap, we can't
     // distinguish "exactly cap" from "cap because clipped". The banner copy

@@ -12,7 +12,6 @@ use tauri::{AppHandle, State};
 use super::super::export_util::save_bytes_with_dialog;
 use crate::{
     app_state::AppState,
-    commands::engrams::get_agent_memory,
     managed_agents::{
         agent_snapshot::{
             build_snapshot, encode_snapshot_json, encode_snapshot_png, AgentSnapshotMemoryEntry,
@@ -312,7 +311,13 @@ pub(crate) async fn materialize_snapshot_bytes(
 
     // ── Fetch memory ─────────────────────────────────────────────────────────
     let memory_entries: Vec<AgentSnapshotMemoryEntry> = if let Some(pubkey) = memory_pubkey {
-        let listing = get_agent_memory(pubkey, app.clone(), state).await?;
+        let listing = crate::commands::engrams::load_agent_memory(
+            pubkey,
+            &app,
+            &state,
+            &crate::relay::relay_api_base_url_with_override(&state),
+        )
+        .await?;
         memory_entries_from_listing(listing, memory_level)
     } else {
         Vec::new()

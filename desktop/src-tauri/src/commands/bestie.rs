@@ -175,6 +175,7 @@ pub async fn resolve_bestie_conversation(
     let owner_pubkey = scope.owner_keys.public_key().to_hex();
     let channel = super::dms::open_dm_with_scope(
         vec![assignment.agent_pubkey.clone()],
+        &crate::relay::relay_http_base_url(&scope.relay_url),
         Some(&scope.relay_url),
         Some(&owner_pubkey),
         &state,

@@ -130,14 +130,24 @@ async fn remote_owned_discovery_and_membership_do_not_require_local_records() {
         .unwrap();
     events.lock().unwrap().push(membership);
     let requested = std::collections::HashSet::from([agent_key.clone()]);
-    let admitted = list_relay_agents_for_selection(&state, Some(&requested), Some("general"))
-        .await
-        .unwrap();
+    let admitted = list_relay_agents_for_selection(
+        &state,
+        &identity_archive::capture_relay_target(&state),
+        Some(&requested),
+        Some("general"),
+    )
+    .await
+    .unwrap();
     assert_eq!(admitted.len(), 1);
     assert_eq!(admitted[0].channel_ids, vec!["general".to_string()]);
-    let outside = list_relay_agents_for_selection(&state, Some(&requested), Some("private-other"))
-        .await
-        .unwrap();
+    let outside = list_relay_agents_for_selection(
+        &state,
+        &identity_archive::capture_relay_target(&state),
+        Some(&requested),
+        Some("private-other"),
+    )
+    .await
+    .unwrap();
     assert_eq!(outside.len(), 1);
     assert!(
         outside[0].channel_ids.is_empty(),
@@ -156,9 +166,14 @@ async fn remote_owned_discovery_and_membership_do_not_require_local_records() {
         .sign_with_keys(&relay)
         .unwrap();
     events.lock().unwrap().push(removed);
-    let revoked = list_relay_agents_for_selection(&state, Some(&requested), Some("general"))
-        .await
-        .unwrap();
+    let revoked = list_relay_agents_for_selection(
+        &state,
+        &identity_archive::capture_relay_target(&state),
+        Some(&requested),
+        Some("general"),
+    )
+    .await
+    .unwrap();
     assert!(revoked[0].channel_ids.is_empty());
 
     let deny = EventBuilder::new(
@@ -172,9 +187,14 @@ async fn remote_owned_discovery_and_membership_do_not_require_local_records() {
     .sign_with_keys(&owner)
     .unwrap();
     events.lock().unwrap().push(deny);
-    let denied = list_relay_agents_for_selection(&state, Some(&requested), Some("general"))
-        .await
-        .unwrap();
+    let denied = list_relay_agents_for_selection(
+        &state,
+        &identity_archive::capture_relay_target(&state),
+        Some(&requested),
+        Some("general"),
+    )
+    .await
+    .unwrap();
     assert!(
         denied.is_empty(),
         "latest unsupported policy cannot fall back to an older allow"
