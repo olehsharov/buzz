@@ -32,6 +32,20 @@ export function runLocationForRunOn(
 }
 
 /**
+ * The shared-access modes widen who can instruct the agent in channels only.
+ * In a direct message buzz-acp answers just the agent's owner and the owner's
+ * other agents whatever the mode (`author_allowed`, PR #2591), so the field
+ * must not read as permission to DM someone else's agent.
+ */
+export const AGENT_DM_SCOPE_NOTE =
+  "In direct messages the agent still answers only its owner and the owner's agents — @mention it in a shared channel.";
+
+/** The DM scope note for `mode`, or `null` for modes that share nothing. */
+export function agentDmScopeNote(mode: RespondToMode): string | null {
+  return mode === "anyone" || mode === "allowlist" ? AGENT_DM_SCOPE_NOTE : null;
+}
+
+/**
  * Copy for the shared-access warning in the respond-to field, or `null` for
  * modes that share nothing.
  *
