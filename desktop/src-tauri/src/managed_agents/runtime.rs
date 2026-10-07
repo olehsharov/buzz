@@ -502,9 +502,11 @@ pub fn spawn_agent_child<R: tauri::Runtime>(
     // frozen record snapshot. Mirrors the model resolution below.
     let personas = super::load_personas(app).unwrap_or_default();
     let teams = super::load_teams(app).unwrap_or_default();
-    // Load global config once; used for runtime_metadata_env_vars (model/provider fallback)
-    // and for the env-var merge at spawn time.
-    let global = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
+    // Load the defaults of the agent's OWN community once (the record's relay;
+    // the spawn relay only names the community of an unassigned record); used
+    // for runtime_metadata_env_vars (model/provider fallback) and for the
+    // env-var merge at spawn time. Never the active community's defaults.
+    let global = crate::managed_agents::load_agent_defaults_for_record(app, record, relay_url);
 
     // Resolve model/provider/prompt ONCE, here, at the shared spawn boundary —
     // the single source both the env writes below and the spawn-config snapshot

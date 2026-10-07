@@ -50,7 +50,7 @@ pub(super) fn summarize_from_disk(
         runtimes,
         &load_personas(app).unwrap_or_default(),
         &load_teams(app).unwrap_or_default(),
-        &crate::managed_agents::load_global_agent_config(app).unwrap_or_default(),
+        &crate::managed_agents::load_agent_defaults_for_agent(app, record),
     )
 }
 
@@ -101,7 +101,7 @@ pub(super) async fn start_local_agent_pairs_with_preflight(
     }
     let personas_for_preflight = load_personas(app).unwrap_or_default();
     let global_for_preflight =
-        crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
+        crate::managed_agents::load_agent_defaults_for_agent(app, &record_snapshot);
     let mesh_model_id =
         crate::managed_agents::effective_config::resolve_effective_relay_mesh_model_id(
             &record_snapshot,
@@ -243,7 +243,7 @@ where
     // for a global-inherited blank definition, it also folds in the global
     // default, which record-byte sniffing could never see.
     let personas = load_personas(app).unwrap_or_default();
-    let global = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
+    let global = crate::managed_agents::load_agent_defaults_for_agent(app, &record_snapshot);
     let mesh_model_id =
         crate::managed_agents::effective_config::resolve_effective_relay_mesh_model_id(
             &record_snapshot,
@@ -333,7 +333,7 @@ where
         &runtimes,
         &personas,
         &load_teams(app).unwrap_or_default(),
-        &crate::managed_agents::load_global_agent_config(app).unwrap_or_default(),
+        &crate::managed_agents::load_agent_defaults_for_agent(app, record),
     )
 }
 
@@ -390,7 +390,8 @@ pub(crate) fn list_community_managed_agents<R: tauri::Runtime>(
     // teams and config as parameters precisely so this poll-every-5s call
     // does not re-read them per record.
     let teams = load_teams(app).unwrap_or_default();
-    let global_config = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
+    // Every community's defaults; each summary reads its own agent's.
+    let defaults = crate::managed_agents::load_community_agent_defaults(app).unwrap_or_default();
     // Agents belong to ONE community: list only the invoking window's
     // community's. Every UI surface (agents page, pickers, mentions, tray,
     // machines) reads this list, so this is the one place other communities'
@@ -408,7 +409,14 @@ pub(crate) fn list_community_managed_agents<R: tauri::Runtime>(
             )
         })
         .map(|record| {
-            build_managed_agent_summary(app, record, &runtimes, &personas, &teams, &global_config)
+            build_managed_agent_summary(
+                app,
+                record,
+                &runtimes,
+                &personas,
+                &teams,
+                defaults.for_record(record, &workspace_relay),
+            )
         })
         .collect()
 }

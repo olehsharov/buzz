@@ -103,6 +103,11 @@ const SCOPED_FILES: &[(&str, &str)] = &[
         "commands/agent_models.rs",
         include_str!("commands/agent_models.rs"),
     ),
+    // Agent defaults are per community: the settings edit the window's.
+    (
+        "commands/global_agent_config.rs",
+        include_str!("commands/global_agent_config.rs"),
+    ),
     (
         "commands/agent_models_update.rs",
         include_str!("commands/agent_models_update.rs"),

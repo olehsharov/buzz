@@ -271,6 +271,23 @@ fn assign_legacy_agent_communities<R: tauri::Runtime>(app: &AppHandle<R>, home_r
     }
 }
 
+/// Run [`crate::managed_agents::global_config::migrate_legacy_global_agent_config`].
+/// Failures are logged; the missing marker makes the next workspace apply
+/// retry.
+fn migrate_legacy_agent_defaults<R: tauri::Runtime>(app: &AppHandle<R>, home_relay_url: &str) {
+    let result = crate::managed_agents::managed_agents_base_dir(app).and_then(|base_dir| {
+        crate::managed_agents::global_config::migrate_legacy_global_agent_config(
+            &base_dir,
+            home_relay_url.trim(),
+        )
+    });
+    match result {
+        Ok(false) => {}
+        Ok(true) => eprintln!("buzz-desktop: moved agent defaults to their home community"),
+        Err(error) => eprintln!("buzz-desktop: agent defaults migration failed: {error}"),
+    }
+}
+
 /// Apply a workspace's configuration to the backend session.
 ///
 /// Called by the frontend on app init (after reload) to configure the
@@ -379,6 +396,14 @@ pub async fn apply_workspace(
         // the user started from), never to whichever community is active.
         // Non-fatal: without the marker it simply retries on the next apply.
         assign_legacy_agent_communities(
+            &app,
+            first_community_relay_url.as_deref().unwrap_or(&relay_url),
+        );
+        // One-time move of the legacy app-wide agent defaults to that same
+        // first community; every other community starts with none. Runs
+        // before launch restore spawns anything. Non-fatal: without its
+        // marker it retries on the next apply.
+        migrate_legacy_agent_defaults(
             &app,
             first_community_relay_url.as_deref().unwrap_or(&relay_url),
         );

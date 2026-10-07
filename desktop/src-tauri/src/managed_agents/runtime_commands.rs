@@ -4,12 +4,12 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use super::{
     agent_readiness, append_log_marker, current_instance_id, find_managed_agent_mut,
-    load_global_agent_config, load_managed_agents, load_personas, managed_agent_runtime_log_path,
-    process_is_running, record_agent_command, resolve_effective_agent_env, save_managed_agents,
-    spawn_agent_child, terminate_process, terminate_untracked_pair_runtime,
-    write_agent_runtime_receipt, AgentReadiness, BackendKind, ManagedAgentPairRuntime,
-    ManagedAgentRuntimeKey, ManagedAgentRuntimeLifecycle, ManagedAgentRuntimeReceipt,
-    ManagedAgentRuntimeStatus,
+    load_community_agent_defaults, load_managed_agents, load_personas,
+    managed_agent_runtime_log_path, process_is_running, record_agent_command,
+    resolve_effective_agent_env, save_managed_agents, spawn_agent_child, terminate_process,
+    terminate_untracked_pair_runtime, write_agent_runtime_receipt, AgentReadiness, BackendKind,
+    ManagedAgentPairRuntime, ManagedAgentRuntimeKey, ManagedAgentRuntimeLifecycle,
+    ManagedAgentRuntimeReceipt, ManagedAgentRuntimeStatus,
 };
 use crate::app_state::AppState;
 
@@ -23,7 +23,7 @@ fn status_for<R: tauri::Runtime>(
     requested_relay_url: Option<String>,
 ) -> ManagedAgentRuntimeStatus {
     let personas = load_personas(app).unwrap_or_default();
-    let global = load_global_agent_config(app).unwrap_or_default();
+    let defaults = load_community_agent_defaults(app).unwrap_or_default();
     status_for_with(
         app,
         record,
@@ -32,7 +32,7 @@ fn status_for<R: tauri::Runtime>(
         requested_relay_url,
         StatusInputs {
             personas: &personas,
-            global: &global,
+            defaults: &defaults,
         },
     )
 }
@@ -41,7 +41,8 @@ fn status_for<R: tauri::Runtime>(
 /// callers (list, reconcile) hit disk once instead of once per row.
 struct StatusInputs<'a> {
     personas: &'a [super::AgentDefinition],
-    global: &'a super::GlobalAgentConfig,
+    /// Every community's defaults; each row reads its own agent's community.
+    defaults: &'a super::CommunityAgentDefaults,
 }
 
 fn status_for_with<R: tauri::Runtime>(
@@ -52,7 +53,8 @@ fn status_for_with<R: tauri::Runtime>(
     requested_relay_url: Option<String>,
     inputs: StatusInputs<'_>,
 ) -> ManagedAgentRuntimeStatus {
-    let StatusInputs { personas, global } = inputs;
+    let StatusInputs { personas, defaults } = inputs;
+    let global = defaults.for_record(record, &key.relay_url);
     let command = record_agent_command(record, personas);
     let metadata = super::known_acp_runtime(&command);
     let effective = resolve_effective_agent_env(record, personas, metadata, global);
@@ -147,7 +149,7 @@ pub async fn list_managed_agent_runtimes(
         // on every status event — load the per-row status inputs once, outside
         // the locks, instead of hitting disk per row while holding them.
         let personas = load_personas(&app).unwrap_or_default();
-        let global = load_global_agent_config(&app).unwrap_or_default();
+        let defaults = load_community_agent_defaults(&app).unwrap_or_default();
         let state = app.state::<AppState>();
         let _transition = state
             .managed_agent_runtime_transition
@@ -189,7 +191,7 @@ pub async fn list_managed_agent_runtimes(
                     None,
                     StatusInputs {
                         personas: &personas,
-                        global: &global,
+                        defaults: &defaults,
                     },
                 );
                 emit_status(&app, &status);
@@ -208,7 +210,7 @@ pub async fn list_managed_agent_runtimes(
                 None,
                 StatusInputs {
                     personas: &personas,
-                    global: &global,
+                    defaults: &defaults,
                 },
             ))
         }));
@@ -625,7 +627,7 @@ pub async fn reconcile_managed_agent_runtimes(
     // restart flows.
     tokio::task::spawn_blocking(move || {
         let personas = load_personas(&app).unwrap_or_default();
-        let global = load_global_agent_config(&app).unwrap_or_default();
+        let defaults = load_community_agent_defaults(&app).unwrap_or_default();
         let mut rows = Vec::new();
         for probe in probes {
             match probe {
@@ -653,7 +655,7 @@ pub async fn reconcile_managed_agent_runtimes(
                                 Some(requested),
                                 StatusInputs {
                                     personas: &personas,
-                                    global: &global,
+                                    defaults: &defaults,
                                 },
                             );
                             status.lifecycle = ManagedAgentRuntimeLifecycle::Failed;
@@ -678,7 +680,7 @@ pub async fn reconcile_managed_agent_runtimes(
                                     Some(requested),
                                     StatusInputs {
                                         personas: &personas,
-                                        global: &global,
+                                        defaults: &defaults,
                                     },
                                 );
                                 status.lifecycle = ManagedAgentRuntimeLifecycle::Failed;
@@ -686,7 +688,11 @@ pub async fn reconcile_managed_agent_runtimes(
                                 status
                             }
                             Err(_) => unkeyable_failed_status(
-                                &record, requested, error, &personas, &global,
+                                &record,
+                                requested.clone(),
+                                error,
+                                &personas,
+                                defaults.for_record(&record, &requested),
                             ),
                         };
                     rows.push(status);

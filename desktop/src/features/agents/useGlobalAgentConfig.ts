@@ -1,5 +1,10 @@
 /**
- * React hook: load the global agent configuration defaults.
+ * React hook: load the agent defaults of this window's community.
+ *
+ * Defaults are per community. The cache needs no community in its key: the
+ * QueryClient itself is per community (`CommunityQueryProvider` is keyed on
+ * the community and remounts on every switch, and each community window has
+ * its own), so a switch always refetches the new community's defaults.
  *
  * Backed by TanStack Query with a stable query key so the config is fetched
  * once per QueryClient lifetime and shared across all callers — dialogs always

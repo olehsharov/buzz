@@ -629,6 +629,21 @@ type E2eConfig = {
       model: string | null;
       preferred_runtime?: string | null;
     };
+    /**
+     * Agent defaults per community relay, mirroring the native per-community
+     * store: when set, `get_global_agent_config` / `set_global_agent_config`
+     * read and write the applied community's entry (empty when absent) and
+     * `globalAgentConfig` is ignored.
+     */
+    globalAgentConfigByRelay?: Record<
+      string,
+      {
+        env_vars: Record<string, string>;
+        provider: string | null;
+        model: string | null;
+        preferred_runtime?: string | null;
+      }
+    >;
     /** Explicit owner-only agent-access capability; independent of baked defaults. */
     ownerOnlyAccessBuild?: boolean;
     /** File-layer config returned by runtime id. */
@@ -8751,12 +8766,28 @@ let installCallCount = 0;
 const installCallCountByRuntime: Record<string, number> = {};
 let addChannelMembersCallCount = 0;
 let setGlobalAgentConfigCallCount = 0;
-let mockGlobalAgentConfig: {
+type MockGlobalAgentConfig = {
   env_vars: Record<string, string>;
   provider: string | null;
   model: string | null;
   preferred_runtime?: string | null;
-} | null = null;
+};
+let mockGlobalAgentConfig: MockGlobalAgentConfig | null = null;
+/** Per-community defaults (see `globalAgentConfigByRelay`); null = app-wide mock. */
+let mockGlobalAgentConfigByRelay: Record<string, MockGlobalAgentConfig> | null =
+  null;
+
+/**
+ * Key of the invoking window's community in `mockGlobalAgentConfigByRelay`:
+ * a community window's bound relay, else the applied (active) community —
+ * the native `WindowRelay` resolution.
+ */
+function mockAgentDefaultsRelayKey(): string {
+  return (mockWindowBoundRelayUrl ?? mockAppliedRelayUrl ?? "")
+    .trim()
+    .replace(/\/+$/, "")
+    .toLowerCase();
+}
 
 // Per-page get_nsec call counter for sequenced error testing.
 let nsecCallCount = 0;
@@ -11563,6 +11594,16 @@ export function maybeInstallE2eTauriMocks() {
   window.__BUZZ_E2E_USERS_BATCH_PENDING__ = () => heldUsersBatchReleases.length;
   mockGlobalAgentConfig = config.mock?.globalAgentConfig
     ? { ...config.mock.globalAgentConfig }
+    : null;
+  mockGlobalAgentConfigByRelay = config.mock?.globalAgentConfigByRelay
+    ? Object.fromEntries(
+        Object.entries(config.mock.globalAgentConfigByRelay).map(
+          ([relay, value]) => [
+            relay.trim().replace(/\/+$/, "").toLowerCase(),
+            { ...value },
+          ],
+        ),
+      )
     : null;
   resetMockRelayMembers(config);
   resetMockRelayAgents(config);
@@ -14459,6 +14500,16 @@ export function maybeInstallE2eTauriMocks() {
       }
       case "get_global_agent_config": {
         // Return the mutable persisted mock value, seeded from the test config.
+        if (mockGlobalAgentConfigByRelay) {
+          return (
+            mockGlobalAgentConfigByRelay[mockAgentDefaultsRelayKey()] ?? {
+              env_vars: {},
+              provider: null,
+              model: null,
+              preferred_runtime: null,
+            }
+          );
+        }
         return (
           mockGlobalAgentConfig ?? {
             env_vars: {},
@@ -14502,7 +14553,12 @@ export function maybeInstallE2eTauriMocks() {
         if (saveDelayMs > 0) {
           await new Promise((resolve) => setTimeout(resolve, saveDelayMs));
         }
-        mockGlobalAgentConfig = savedConfig;
+        if (mockGlobalAgentConfigByRelay) {
+          mockGlobalAgentConfigByRelay[mockAgentDefaultsRelayKey()] =
+            savedConfig;
+        } else {
+          mockGlobalAgentConfig = savedConfig;
+        }
         // In the E2E environment there are no running agents to restart, so
         // the counts default to 0 unless a spec drives them explicitly.
         return {
