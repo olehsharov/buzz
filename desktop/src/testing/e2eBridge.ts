@@ -142,6 +142,8 @@ export type MockManagedAgentSeed = {
   envVars?: Record<string, string>;
   /** Community relay the agent belongs to (default: the default relay). */
   relayUrl?: string;
+  /** Saved access policy not yet delivered by a remote redeploy. */
+  providerPolicyPending?: boolean;
 };
 
 type MockManagedAgentRuntimeSeed = {
@@ -1033,6 +1035,7 @@ type RawManagedAgent = {
     | { type: "provider"; id: string; config: Record<string, unknown> }
     | { type: "host"; host_pubkey: string };
   backend_agent_id: string | null;
+  provider_policy_pending?: boolean;
   respond_to: "owner-only" | "allowlist" | "anyone";
   respond_to_allowlist: string[];
 };
@@ -2054,6 +2057,7 @@ function cloneManagedAgent(agent: MockManagedAgent): RawManagedAgent {
     auto_restart_on_config_change: agent.auto_restart_on_config_change ?? true,
     backend: agent.backend ?? { type: "local" as const },
     backend_agent_id: agent.backend_agent_id ?? null,
+    provider_policy_pending: agent.provider_policy_pending ?? false,
     respond_to: agent.respond_to ?? "owner-only",
     respond_to_allowlist: agent.respond_to_allowlist
       ? [...agent.respond_to_allowlist]
@@ -2617,6 +2621,7 @@ function buildSeededManagedAgent(seed: MockManagedAgentSeed): MockManagedAgent {
       seed.backend?.type === "host" && status === "deployed"
         ? seed.backend.host_pubkey
         : null,
+    provider_policy_pending: seed.providerPolicyPending ?? false,
     respond_to: seed.respondTo ?? "owner-only",
     respond_to_allowlist: seed.respondToAllowlist ?? [],
     private_key_nsec: `nsec1mock${seed.pubkey.slice(0, 20)}`,
@@ -9974,6 +9979,8 @@ async function handleStartManagedAgent(
     agent.pid = null;
     agent.backend_agent_id =
       agent.backend_agent_id ?? `mock-provider-${agent.pubkey.slice(0, 12)}`;
+    // A successful redeploy delivers the saved access policy.
+    agent.provider_policy_pending = false;
   } else {
     agent.status = "running";
     agent.pid = agent.pid ?? 42000 + mockManagedAgents.indexOf(agent);

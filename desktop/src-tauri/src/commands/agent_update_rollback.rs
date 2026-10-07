@@ -32,6 +32,9 @@ fn copy_runtime_state(from: &ManagedAgentRecord, to: &mut ManagedAgentRecord) {
     to.runtime_pid = from.runtime_pid;
     to.backend = from.backend.clone();
     to.backend_agent_id.clone_from(&from.backend_agent_id);
+    // Deployment acknowledgement: set with an access change, cleared only by
+    // a deployment that delivered it, never by a configuration rollback.
+    to.provider_policy_pending = from.provider_policy_pending;
     to.provider_binary_path
         .clone_from(&from.provider_binary_path);
     to.last_started_at.clone_from(&from.last_started_at);
@@ -227,5 +230,49 @@ mod tests {
         assert_eq!(records[0].last_exit_code, Some(1));
         assert_eq!(records[0].last_error.as_deref(), Some("harness exited"));
         assert_eq!(records[0].updated_at, "runtime-change");
+    }
+
+    #[test]
+    fn failed_profile_sync_keeps_a_pending_remote_policy_redeploy() {
+        let previous = record("Old name", "before");
+        let mut attempted = previous.clone();
+        attempted.name = "New name".to_string();
+        attempted.respond_to = crate::managed_agents::RespondTo::Anyone;
+        attempted.provider_policy_pending = true;
+        attempted.updated_at = "attempt".to_string();
+        let rollback = AgentUpdateRollback::new(previous, &attempted, true);
+        let mut records = vec![attempted];
+
+        restore_agent_update(&mut records, "abcd1234", rollback)
+            .expect("matching attempted update rolls back non-access fields");
+
+        assert_eq!(records[0].name, "Old name");
+        assert_eq!(
+            records[0].respond_to,
+            crate::managed_agents::RespondTo::Anyone
+        );
+        assert!(
+            records[0].provider_policy_pending,
+            "the kept policy still needs its redeploy acknowledged"
+        );
+    }
+
+    #[test]
+    fn a_redeploy_acknowledgement_does_not_block_rollback() {
+        let previous = record("Old name", "before");
+        let mut attempted = previous.clone();
+        attempted.name = "New name".to_string();
+        attempted.provider_policy_pending = true;
+        attempted.updated_at = "attempt".to_string();
+        let rollback = AgentUpdateRollback::new(previous, &attempted, true);
+        let mut acknowledged = attempted;
+        acknowledged.provider_policy_pending = false;
+        let mut records = vec![acknowledged];
+
+        restore_agent_update(&mut records, "abcd1234", rollback)
+            .expect("a redeploy acknowledgement is runtime churn, not a newer edit");
+
+        assert_eq!(records[0].name, "Old name");
+        assert!(!records[0].provider_policy_pending);
     }
 }

@@ -357,6 +357,7 @@ pub fn build_managed_agent_summary<R: tauri::Runtime>(
         env_vars: record.env_vars.clone(),
         backend: record.backend.clone(),
         backend_agent_id: record.backend_agent_id.clone(),
+        provider_policy_pending: record.provider_policy_pending,
         status,
         pid,
         created_at: record.created_at.clone(),

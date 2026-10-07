@@ -278,6 +278,12 @@ pub async fn deploy_agent_to_host<R: Runtime>(
     };
     let request_id = frames::new_request_id();
     let frame = frames::deploy_frame(&request_id, agent, &auth_tag, &payload)?;
+    // Only the access policy outlives the payload (it carries the agent nsec):
+    // the ack acknowledges a pending policy only if it is still the saved one.
+    let delivered_policy = serde_json::json!({
+        "respond_to": payload.get("respond_to"),
+        "respond_to_allowlist": payload.get("respond_to_allowlist"),
+    });
     drop(payload);
     let outcome = send_expecting_ack(
         channel,
@@ -298,6 +304,14 @@ pub async fn deploy_agent_to_host<R: Runtime>(
             record.start_on_app_launch = false;
             record.last_started_at = Some(now_iso());
             record.last_error = None;
+            // The machine restarted the agent with this payload's policy. A
+            // newer policy saved while the frame was in flight stays pending.
+            if crate::managed_agents::access_policy::deployed_policy_matches_record(
+                record,
+                &delivered_policy,
+            ) {
+                record.provider_policy_pending = false;
+            }
         }),
         Err(error) => {
             let message = format!("Deploy to {} failed: {error}", host_record.name);

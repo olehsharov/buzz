@@ -199,7 +199,7 @@ pub fn ingest_host_telemetry(
     }
 }
 
-fn summary_for(
+pub(crate) fn summary_for(
     app: &AppHandle,
     state: &AppState,
     pubkey: &str,

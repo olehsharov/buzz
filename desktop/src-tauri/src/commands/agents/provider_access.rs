@@ -1,6 +1,9 @@
-//! Upgrade reconciliation for provider-backed managed-agent access.
+//! Workspace-apply reconciliation for remote managed-agent access: redeploys
+//! deployed agents whose saved access policy no successful deployment has
+//! acknowledged yet (`provider_policy_pending`), and every provider agent on
+//! owner-only builds.
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 use crate::{
     app_state::AppState,
@@ -11,13 +14,22 @@ use crate::{
     util::now_iso,
 };
 
+/// Whether workspace apply must redeploy `record` to enforce its access
+/// policy. Provider agents: on owner-only builds always, otherwise while a
+/// saved policy is pending. Paired-machine agents: while pending (owner-only
+/// builds project owner-only into every host deploy already).
 pub(super) fn needs_reconciliation_with_policy(
     record: &ManagedAgentRecord,
     owner_only_access: bool,
 ) -> bool {
-    (owner_only_access || record.provider_policy_pending)
-        && matches!(record.backend, BackendKind::Provider { .. })
-        && record.backend_agent_id.is_some()
+    if record.backend_agent_id.is_none() {
+        return false;
+    }
+    match record.backend {
+        BackendKind::Provider { .. } => owner_only_access || record.provider_policy_pending,
+        BackendKind::Host { .. } => record.provider_policy_pending,
+        BackendKind::Local => false,
+    }
 }
 
 #[derive(Debug)]
@@ -37,31 +49,35 @@ fn collect_targets_with(
     records
         .into_iter()
         .filter(|record| needs_reconciliation_with_policy(record, owner_only_access))
-        .map(|record| match record.backend.clone() {
-            BackendKind::Provider { id, config } => ProviderAccessTarget {
+        .filter_map(|record| match record.backend.clone() {
+            BackendKind::Provider { id, config } => Some(ProviderAccessTarget {
                 agent_json: build_payload(&record),
                 pubkey: record.pubkey,
                 provider_id: id,
                 config,
                 cached_binary_path: record.provider_binary_path,
-            },
-            BackendKind::Local | BackendKind::Host { .. } => {
-                unreachable!("provider access reconciliation selected a non-provider agent")
-            }
+            }),
+            // Paired machines are retried in the background by
+            // `spawn_pending_host_redeploys`.
+            BackendKind::Local | BackendKind::Host { .. } => None,
         })
         .collect()
 }
 
-/// Redeploy existing provider agents whose access policy requires enforcement.
+/// Redeploy existing remote agents whose access policy requires enforcement.
 ///
-/// Owner-only builds refresh every existing deployment before each community UI
-/// load. All builds also retry records whose saved policy has not yet been
-/// acknowledged by a successful provider deployment. Workspace apply fails
-/// closed if any selected provider rejects the current policy.
+/// Owner-only builds refresh every existing provider deployment before each
+/// community UI load. All builds also retry records whose saved policy has not
+/// yet been acknowledged by a successful deployment. Workspace apply fails
+/// closed if any selected provider rejects the current policy. Paired machines
+/// are user computers that may legitimately be offline, so their retries run
+/// in the background instead of blocking the community load; a failure stays
+/// on the record (pending flag + `last_error`) for the next apply or Deploy.
 pub(crate) async fn reconcile_on_workspace_apply(
     app: &AppHandle,
     state: &AppState,
 ) -> Result<(), String> {
+    spawn_pending_host_redeploys(app, state)?;
     let owner_only_access = crate::managed_agents::owner_only_access_build();
     let targets = {
         let _store_guard = state
@@ -113,8 +129,42 @@ pub(crate) async fn reconcile_on_workspace_apply(
     Ok(())
 }
 
-pub(crate) fn persist_failure(
-    app: &AppHandle,
+/// Retry pending paired-machine access redeploys for the applied community,
+/// once per apply, without blocking it.
+fn spawn_pending_host_redeploys(app: &AppHandle, state: &AppState) -> Result<(), String> {
+    // window-relay: workspace apply runs for the main window's community.
+    let community_relay = crate::relay::relay_ws_url_with_override(state);
+    let targets = {
+        let _store_guard = state
+            .managed_agents_store_lock
+            .lock()
+            .map_err(|error| error.to_string())?;
+        super::access_transition::pending_host_redeploys(
+            &load_managed_agents(app)?,
+            &community_relay,
+        )
+    };
+    if targets.is_empty() {
+        return Ok(());
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        for (pubkey, target) in targets {
+            if let Err(error) =
+                super::access_transition::redeploy_for_access_policy(&app, &state, &pubkey, &target)
+                    .await
+            {
+                eprintln!("buzz-desktop: access redeploy to the paired machine for agent {pubkey} failed: {error}");
+            }
+        }
+        let _ = tauri::Emitter::emit(&app, "agents-data-changed", ());
+    });
+    Ok(())
+}
+
+pub(crate) fn persist_failure<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
     pubkey: &str,
     error: &str,
@@ -242,7 +292,23 @@ mod tests {
             Some(&"ab".repeat(32)),
         );
         host.provider_policy_pending = true;
-        // Selecting it would hit the non-provider `unreachable!` arm.
         assert!(collect_targets_with(vec![host], true, |_| Ok(serde_json::Value::Null)).is_empty());
+    }
+
+    #[test]
+    fn pending_host_agents_need_reconciliation_only_while_deployed() {
+        let host = BackendKind::Host {
+            host_pubkey: "ab".repeat(32),
+        };
+        let mut pending = record(host.clone(), Some(&"ab".repeat(32)));
+        pending.provider_policy_pending = true;
+        assert!(needs_reconciliation_with_policy(&pending, false));
+
+        let acknowledged = record(host.clone(), Some(&"ab".repeat(32)));
+        assert!(!needs_reconciliation_with_policy(&acknowledged, true));
+
+        let mut undeployed = record(host, None);
+        undeployed.provider_policy_pending = true;
+        assert!(!needs_reconciliation_with_policy(&undeployed, false));
     }
 }

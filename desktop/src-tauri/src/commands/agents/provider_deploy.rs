@@ -20,7 +20,12 @@ use super::build_deploy_payload;
 /// again. Providers are expected to handle this as an update-in-place or no-op.
 /// The protocol has no explicit `undeploy` operation or acknowledgement that an
 /// existing process stopped, so a successful redeploy delegates access-policy
-/// revocation semantics to the provider implementation (deferred to v2).
+/// revocation to the provider implementation (renderilla's deploy restarts the
+/// agent's unit with the new environment). An access-policy edit on a deployed
+/// provider agent is saved with `provider_policy_pending` in the same write,
+/// published, and then applied by a redeploy through this function; the flag
+/// clears only when a deploy succeeds with a payload matching the saved policy,
+/// and workspace apply retries it until then.
 /// Returns Ok(()) on success, Err(message) on failure. Either way the record is
 /// updated and saved before returning.
 ///
@@ -39,8 +44,8 @@ use super::build_deploy_payload;
 /// message exactly like a local spawn. Per-invocation only — never persisted
 /// on the record, so later redeploys do not carry a stale floor.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn deploy_to_provider(
-    app: &AppHandle,
+pub(crate) async fn deploy_to_provider<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
     pubkey: &str,
     _provider_id: &str,
@@ -224,18 +229,6 @@ fn apply_replay_floor(agent_json: &mut serde_json::Value, replay_floor_unix: Opt
     }
 }
 
-fn policy_matches_payload(
-    record: &crate::managed_agents::ManagedAgentRecord,
-    deployed_agent_json: &serde_json::Value,
-) -> bool {
-    deployed_agent_json
-        .get("respond_to")
-        .and_then(serde_json::Value::as_str)
-        == Some(record.respond_to.as_str())
-        && deployed_agent_json.get("respond_to_allowlist")
-            == Some(&serde_json::json!(record.respond_to_allowlist))
-}
-
 fn apply_deploy_result(
     record: &mut crate::managed_agents::ManagedAgentRecord,
     deploy_result: Result<String, String>,
@@ -244,7 +237,10 @@ fn apply_deploy_result(
     match deploy_result {
         Ok(backend_agent_id) => {
             record.backend_agent_id = Some(backend_agent_id);
-            if policy_matches_payload(record, deployed_agent_json) {
+            if crate::managed_agents::access_policy::deployed_policy_matches_record(
+                record,
+                deployed_agent_json,
+            ) {
                 record.provider_policy_pending = false;
             }
             record.last_started_at = Some(now_iso());
