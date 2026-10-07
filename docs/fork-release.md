@@ -239,3 +239,58 @@ same time, so expect one mic/camera and keychain re-prompt.
 4. **Linux update.** Run the fork AppImage, publish the next fork release, and
    update in-app. The AppImage file is replaced in place and starts at the new
    version.
+
+## Troubleshooting
+
+### "Import signing certificate" fails or times out
+
+codesign refuses an untrusted self-signed identity (`Buzz Local Code Signing:
+no identity found`). So the step must mark the certificate as trusted for code
+signing in the runner's System keychain. It does this through
+[`scripts/fork-release-trust-signing-cert.sh`](../scripts/fork-release-trust-signing-cert.sh).
+
+Apple blocks non-interactive admin trust changes. Hosted runner images differ
+in how they handle this, and an image update can break it without notice:
+
+- `security authorizationdb write com.apple.trust-settings.admin allow` was
+  reported failing on `macos-15` with `NO (-60005)` while working on
+  `macos-14`
+  ([actions/runner-images#11893](https://github.com/actions/runner-images/issues/11893)).
+  The script only warns here and still tries the trust change.
+- `security add-trusted-cert` then fails with
+  `SecTrustSettingsSetTrustSettings: The authorization was denied since no user
+  interaction was possible`.
+- Trust-settings commands were also reported hanging on macOS 14.7.5+ images
+  ([actions/runner-images#12116](https://github.com/actions/runner-images/issues/12116)).
+
+Every trust call is capped at 40 seconds and the step at 5 minutes. A hang
+therefore fails within minutes instead of using the job's 120-minute timeout.
+On any failure, the step logs `sw_vers`, `security dump-trust-settings -d`, and
+`security find-identity -p codesigning` (which includes untrusted identities)
+before it exits.
+
+`runs-on: macos-latest` moves to new macOS versions over time. If the step
+fails, the log shows which image ran. There are two ways out.
+
+1. **Pin an older image.** Change the `macos-arm64` job to an image where the
+   trust change still works, such as `runs-on: macos-14` if GitHub still
+   offers it. This is the smallest change, but it only lasts until that image
+   is retired or updated.
+2. **Sign on your Mac.** The certificate is already trusted on your Mac, and
+   this option also removes the need to export the p12. It requires a
+   workflow change, done the way upstream `release.yml` does it:
+   1. In CI, build with `pnpm tauri build --no-sign` and drop the
+      p12-import step.
+   2. On your Mac, download the built `Buzz.app` and sign it with hardened
+      runtime and the entitlements:
+      `codesign --force --deep --options runtime --entitlements desktop/src-tauri/Entitlements.plist -s "Buzz Local Code Signing" Buzz.app`.
+      Then check the designated requirement with `codesign -d -r- Buzz.app`
+      and run `desktop/scripts/verify-macos-entitlements.sh Buzz.app`.
+   3. Pack and minisign the update archive:
+      `tar -czf Buzz.app.tar.gz Buzz.app`, then
+      `(cd desktop && pnpm tauri signer sign /abs/path/Buzz.app.tar.gz)` with
+      `TAURI_SIGNING_PRIVATE_KEY` and its password set.
+   4. Upload the archive and its `.sig` with `gh release upload`. The
+      `darwin-aarch64` signature in `latest.json` must be regenerated from
+      the new `.sig`. The DMG must also be rebuilt from the signed app,
+      because the CI DMG contains the unsigned one.

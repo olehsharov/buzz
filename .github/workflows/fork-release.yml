@@ -127,7 +127,12 @@ jobs:
       - name: Generate release config
         run: cd desktop && node scripts/build-release-config.mjs
 
+      # Bounded: trust-settings commands can hang on hosted images, and the
+      # job timeout alone would burn two hours with no diagnostic. Each of the
+      # script's six trust/diagnostic calls is capped at 40s, so even if all
+      # hang, its diagnostics print before this step times out.
       - name: Import signing certificate
+        timeout-minutes: 5
         env:
           MACOS_SIGNING_P12_BASE64: ${{ secrets.MACOS_SIGNING_P12_BASE64 }}
           MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
@@ -154,12 +159,7 @@ jobs:
           fi
           # codesign refuses an untrusted self-signed leaf; trust it for code signing.
           security find-certificate -c "$APPLE_SIGNING_IDENTITY" -p "$KC" > "$RUNNER_TEMP/sign.pem"
-          sudo security add-trusted-cert -d -r trustRoot -p codeSign -k /Library/Keychains/System.keychain "$RUNNER_TEMP/sign.pem"
-          security find-identity -v -p codesigning "$KC" | grep -q "$APPLE_SIGNING_IDENTITY" || {
-            echo "::error::'$APPLE_SIGNING_IDENTITY' is not a valid codesigning identity after import"
-            security find-identity -v -p codesigning "$KC"
-            exit 1
-          }
+          BUZZ_TRUST_TIMEOUT_SECONDS=40 scripts/fork-release-trust-signing-cert.sh "$KC" "$RUNNER_TEMP/sign.pem" "$APPLE_SIGNING_IDENTITY"
           echo "SIGNING_KEYCHAIN=$KC" >> "$GITHUB_ENV"
 
       - name: Build sidecars
