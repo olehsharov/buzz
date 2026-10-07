@@ -150,3 +150,82 @@ fn the_definition_policy_defaults_to_owner_only_and_drops_a_stray_allowlist() {
     definition.respond_to = Some("future-mode".into());
     assert_eq!(definition_access_policy(&definition), None);
 }
+
+#[test]
+fn only_a_readable_policy_change_is_queued() {
+    assert_eq!(
+        access_change(TEMPLATE, "wss://c.example", owner_only(), owner_only()),
+        None
+    );
+    assert_eq!(
+        access_change(TEMPLATE, "wss://c.example", None, anyone()),
+        None
+    );
+    assert_eq!(
+        access_change(TEMPLATE, "wss://c.example", owner_only(), anyone()),
+        Some(AccessChange {
+            definition_id: TEMPLATE.into(),
+            community_relay: "wss://c.example".into(),
+            previous: (RespondTo::OwnerOnly, Vec::new()),
+            next: (RespondTo::Anyone, Vec::new()),
+        })
+    );
+}
+
+/// Two quick template edits (owner-only → anyone → allowlist) queued before
+/// either reaches the instances: applied in save order, each selecting its
+/// instances when it runs, every inheriting instance ends on the latest
+/// policy and an individually set one is untouched.
+#[test]
+fn queued_template_edits_apply_in_save_order_and_select_when_they_run() {
+    let member = "a".repeat(64);
+    let allowlist = (RespondTo::Allowlist, vec![member.clone()]);
+    let queue = AccessChangeQueue::new();
+    queue.push(access_change(TEMPLATE, "wss://c.example", owner_only(), anyone()).unwrap());
+    queue.push(
+        access_change(
+            TEMPLATE,
+            "wss://c.example",
+            anyone(),
+            Some(allowlist.clone()),
+        )
+        .unwrap(),
+    );
+    let mut custom = instance("custom", TEMPLATE, RespondTo::Allowlist);
+    custom.respond_to_allowlist = vec!["b".repeat(64)];
+    let records = std::cell::RefCell::new(vec![
+        instance("one", TEMPLATE, RespondTo::OwnerOnly),
+        deployed_provider(instance("two", TEMPLATE, RespondTo::OwnerOnly)),
+        custom,
+    ]);
+
+    tauri::async_runtime::block_on(queue.drain(|change| {
+        let planned = plan_access_propagation(
+            &records.borrow(),
+            &change.definition_id,
+            Some(change.previous.clone()),
+            Some(change.next.clone()),
+        );
+        if let Some(propagation) = planned {
+            for record in records.borrow_mut().iter_mut() {
+                if propagation.pubkeys.contains(&record.pubkey) {
+                    record.respond_to = propagation.next.0;
+                    record.respond_to_allowlist = propagation.next.1.clone();
+                }
+            }
+        }
+        std::future::ready(())
+    }));
+
+    let records = records.into_inner();
+    for record in &records[..2] {
+        assert_eq!(
+            (record.respond_to, record.respond_to_allowlist.clone()),
+            allowlist,
+            "{} follows both edits",
+            record.pubkey
+        );
+    }
+    assert_eq!(records[2].respond_to_allowlist, vec!["b".repeat(64)]);
+    assert!(queue.pop().is_none(), "every queued change was applied");
+}
