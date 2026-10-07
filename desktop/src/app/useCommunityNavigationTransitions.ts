@@ -19,6 +19,7 @@ import {
   stopManagedAgentPairsOnRelay,
 } from "@/features/agents/managedAgentRelayCleanup";
 import { markCommunityDiscoveryAfterLeave } from "@/features/communities/communityStorage";
+import { focusCommunityWindowInsteadOfSwitch } from "@/features/community-window/communityWindowGuard";
 import type { useCommunities } from "@/features/communities/useCommunities";
 import { leaveCommunity } from "@/features/communities/leaveCommunity";
 
@@ -55,6 +56,9 @@ export function useCommunityNavigationTransitions({
     async (id: string) => {
       const activeCommunityId = communities.activeCommunity?.id;
       if (id === activeCommunityId) return;
+      // A community with its own window is focused there instead: one
+      // community never runs in two windows at once (two-writer guard).
+      if (await focusCommunityWindowInsteadOfSwitch(id)) return;
       if (!activeCommunityId) {
         communities.switchCommunity(id);
         return;

@@ -212,6 +212,7 @@ fn build_search_messages_filter(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn search_messages(
     q: String,
     limit: Option<u32>,

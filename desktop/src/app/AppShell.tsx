@@ -2,7 +2,11 @@ import * as React from "react";
 import { ProtectedGlobalOverlay } from "@protected-feature-components";
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useLocation } from "@tanstack/react-router";
-import { deriveShellRoute, markAllReadSources } from "@/app/AppShell.helpers";
+import {
+  appShellWindowRoles,
+  deriveShellRoute,
+  markAllReadSources,
+} from "@/app/AppShell.helpers";
 import { useTerminalContext } from "@/app/useTerminalContext";
 import { AppShellProvider } from "@/app/AppShellContext";
 import { AppShellOverlays, TerminalBootstrap } from "@/app/AppShellOverlays";
@@ -116,6 +120,8 @@ import { useMainWindowPopoutNavigation } from "@/features/popout/useMainWindowPo
 import { openSearchResultInNewWindow } from "@/features/popout/searchResultNewWindow";
 import type { SearchResult } from "@/features/search/ui/SearchResultItem";
 import { currentWindowKind } from "@/shared/lib/windowKind";
+import { isMainWindowOnlyPath } from "@/features/community-window/communityWindowRoutes";
+import { MainWindowOnlyState } from "@/features/community-window/ui/MainWindowOnlyState";
 const EMPTY_CHANNELS: Channel[] = [];
 const EMPTY_COMMUNITIES: never[] = [];
 export function AppShell() {
@@ -142,8 +148,16 @@ export function AppShell() {
   // Huddle companions and pop-outs load this same shell but own no
   // app-global work: unread tracking, notifications, badge, deep links,
   // settings, sidebar, and community rail stay with the main window.
-  const isPopout = currentWindowKind() === "popout";
-  const isAuxWindow = isHuddleRoom || isPopout;
+  // A community window shows the whole chat surface of its own community
+  // (sidebar, channels, composer, search, profiles) but, like a pop-out,
+  // owns no app-global work and no agent/workflow/project management.
+  const {
+    isPopout,
+    isAuxWindow,
+    isCommunityWindowShell,
+    isSecondaryWindow,
+    ownsAppGlobals,
+  } = appShellWindowRoles(currentWindowKind(), isHuddleRoom);
   const hasCommunityRail = communitiesHook.communities.length > 1;
   const addCommunityDialog = useAddCommunityDialogState();
   const [isChannelManagementOpen, setIsChannelManagementOpen] =
@@ -160,7 +174,7 @@ export function AppShell() {
   const location = useLocation();
   const queryClient = useQueryClient();
   useManagedAgentRuntimeReconciliation(
-    isPopout ? EMPTY_COMMUNITIES : communitiesHook.communities,
+    isSecondaryWindow ? EMPTY_COMMUNITIES : communitiesHook.communities,
   ); // sync storage snapshot
   const {
     goAgents,
@@ -192,7 +206,7 @@ export function AppShell() {
     selectedView,
   });
   // Settings lives in history so back returns to the previous app entry.
-  const settingsOpen = !isPopout && location.pathname === "/settings";
+  const settingsOpen = !isSecondaryWindow && location.pathname === "/settings";
   const rawLocationSearchSection = (location.search as { section?: unknown })
     .section;
   // Migrate the legacy "moderation" token to "relay-admin" (renamed section
@@ -220,12 +234,15 @@ export function AppShell() {
     communitiesHook.activeCommunity?.relayUrl,
   );
   usePersonaSync(
-    isPopout ? undefined : identityQuery.data?.pubkey,
+    isSecondaryWindow ? undefined : identityQuery.data?.pubkey,
     communitiesHook.activeCommunity?.relayUrl,
   );
   useAgentsDataRefresh();
   // Chunk F: auto-restart drifted idle agents (per-agent opt-out, default ON).
-  useAutoRestartPolicy(communitiesHook.activeCommunity?.relayUrl, !isPopout);
+  useAutoRestartPolicy(
+    communitiesHook.activeCommunity?.relayUrl,
+    !isSecondaryWindow,
+  );
   // Owner-global observer ingestion: receives + decrypts agent observer
   // frames and keeps derived active-turn liveness in sync app-wide, so no
   // individual screen/panel has to mount its own bridge for ingestion.
@@ -239,7 +256,7 @@ export function AppShell() {
   // deferred): seeds kind 24200 for fresh identities, no-ops for explicit
   // opt-outs. Frames before the listener opens are permanently lost.
   const observerReconciled = useObserverArchiveReconciliation(
-    isPopout ? undefined : identityQuery.data?.pubkey,
+    isSecondaryWindow ? undefined : identityQuery.data?.pubkey,
   );
   // useArchiveSync must wait for reconciliation, or listeners could open
   // before kind 24200 is guaranteed present in the subscription.
@@ -250,7 +267,7 @@ export function AppShell() {
   // Kind 44200 is relay-persisted (durable) and stays deferred: missed
   // startup frames can be replayed, so there's no ordering constraint.
   const deferredPubkey = startupReady ? identityQuery.data?.pubkey : undefined;
-  useAgentMetricArchiveSeed(isPopout ? undefined : deferredPubkey);
+  useAgentMetricArchiveSeed(isSecondaryWindow ? undefined : deferredPubkey);
   const profileQuery = useProfileQuery();
   useRelayAutoHeal();
   usePresenceSubscription();
@@ -259,7 +276,7 @@ export function AppShell() {
   useMembershipNotifications(identityQuery.data?.pubkey);
   // Presence is published by the main window only.
   const presenceSession = usePresenceSession(
-    isPopout ? undefined : deferredPubkey,
+    isSecondaryWindow ? undefined : deferredPubkey,
   );
   const selfStatusQuery = useUserStatusQuery(
     deferredPubkey ? [deferredPubkey] : [],
@@ -271,7 +288,7 @@ export function AppShell() {
   const channelsQuery = useChannelsQuery();
   const channels = channelsQuery.data ?? [];
   useReminderNotifications(
-    isPopout ? undefined : identityQuery.data?.pubkey,
+    isSecondaryWindow ? undefined : identityQuery.data?.pubkey,
     notificationSettings.settings,
     channels,
   );
@@ -313,7 +330,7 @@ export function AppShell() {
   React.useEffect(() => {
     const activeCommunityId = communitiesHook.activeCommunity?.id;
     if (
-      isPopout ||
+      isSecondaryWindow ||
       hasRestoredCommunityDestinationRef.current ||
       !channelsQuery.isSuccess ||
       channelsQuery.dataUpdatedAt === 0 ||
@@ -355,7 +372,7 @@ export function AppShell() {
     communitiesHook.activeCommunity?.id,
     goChannel,
     goHome,
-    isPopout,
+    isSecondaryWindow,
     selectedView,
     sidebarChannels,
   ]);
@@ -388,7 +405,7 @@ export function AppShell() {
     handleThreadReplyDesktopNotification,
   } = useAppShellDesktopNotifications({
     channels,
-    enabled: !isAuxWindow,
+    enabled: ownsAppGlobals,
     goChannel,
     goHome,
     notificationSettings: notificationSettings.settings,
@@ -491,7 +508,7 @@ export function AppShell() {
       identityQuery.data?.pubkey,
       notificationSettings.settings,
       notificationSettings.setDesktopEnabled,
-      !isAuxWindow,
+      ownsAppGlobals,
       selectedView === "home" && !settingsOpen,
       getChannelReadAt,
       readStateVersion,
@@ -669,14 +686,15 @@ export function AppShell() {
   const handleOpenSettings = React.useCallback(
     (section: SettingsSection = DEFAULT_SETTINGS_SECTION) => {
       setIsChannelManagementOpen(false);
-      // Settings belong to the main window; a pop-out just brings it forward.
-      if (isPopout) {
+      // Settings belong to the main window; a pop-out or community window
+      // just brings it forward.
+      if (isSecondaryWindow) {
         openInMainWindow(null, true);
         return;
       }
       void goSettings(section);
     },
-    [goSettings, isPopout],
+    [goSettings, isSecondaryWindow],
   );
   const handleCloseSettings = React.useCallback(
     () => closeSettings(),
@@ -710,14 +728,14 @@ export function AppShell() {
     [openDmAsync, openInNewWindow],
   );
   useAppShellLifecycleEffects({
-    desktopBadgeEnabled: !isAuxWindow,
+    desktopBadgeEnabled: ownsAppGlobals,
     homeBadgeCountExcludingHighPriority,
     topLevelUnreadChannelIds,
     unreadChannelNotificationCount,
   });
   // Dispatch `buzz://` deep links only from the main window; the companion is dedicated to its active Huddle route.
-  useAppDeepLinks(!isAuxWindow);
-  useMainWindowPopoutNavigation(!isAuxWindow);
+  useAppDeepLinks(ownsAppGlobals);
+  useMainWindowPopoutNavigation(ownsAppGlobals);
   const handleOpenCreateChannel = React.useCallback(
     () => setIsCreateChannelOpen(true),
     [],
@@ -737,12 +755,12 @@ export function AppShell() {
   useSettingsShortcuts({
     onClose: handleCloseSettings,
     onOpenSettings: handleOpenSettings,
-    open: isAuxWindow ? undefined : settingsOpen,
+    open: ownsAppGlobals ? settingsOpen : undefined,
   });
   useMarkAsReadShortcuts({
     // Escape still marks the visible channel read in a pop-out; Shift+Escape
     // (mark everything read) is a main-window action.
-    allowMarkAll: !isAuxWindow,
+    allowMarkAll: ownsAppGlobals,
     activeChannelId: activeChannel?.id ?? null,
     activeChannelLastMessageAt: activeChannel?.lastMessageAt,
     markAllChannelsRead,
@@ -751,7 +769,7 @@ export function AppShell() {
   });
   return (
     <PreventSleepProvider>
-      {!isAuxWindow ? (
+      {ownsAppGlobals ? (
         <AppShellTrayMenu
           channels={channels}
           goChannel={goChannel}
@@ -802,7 +820,7 @@ export function AppShell() {
             currentPubkey={identityQuery.data?.pubkey}
             isCompanionOpen={isHuddleCompanionOpen}
             isDrawerOpen={isHuddleDrawerOpen}
-            isPopout={isPopout}
+            isPopout={isSecondaryWindow}
             isRoom={isHuddleRoom}
             onCompanionOpen={handleHuddleCompanionOpen}
             onHuddleStartPendingChange={handleHuddleStartPendingChange}
@@ -811,7 +829,7 @@ export function AppShell() {
             onViewHuddleChannel={viewHuddleChannel}
             onVisibilityChange={handleHuddleVisibilityChange}
           >
-            {hasCommunityRail && !isAuxWindow ? (
+            {hasCommunityRail && ownsAppGlobals ? (
               <CommunityRail
                 activeCommunityId={communitiesHook.activeCommunity?.id ?? null}
                 onAddCommunity={addCommunityDialog.openDialog}
@@ -837,7 +855,12 @@ export function AppShell() {
                     <AppTopChrome
                       canGoBack={canGoBack}
                       canGoForward={canGoForward}
-                      hasCommunityRail={hasCommunityRail}
+                      communityWindowName={
+                        isCommunityWindowShell
+                          ? (communitiesHook.activeCommunity?.name ?? null)
+                          : undefined
+                      }
+                      hasCommunityRail={hasCommunityRail && ownsAppGlobals}
                       onGoBack={goBack}
                       onGoForward={goForward}
                     />
@@ -1007,6 +1030,9 @@ export function AppShell() {
                         >
                           {isPopout && location.pathname === "/" ? (
                             <PopoutUnavailableState kind="empty" />
+                          ) : isCommunityWindowShell &&
+                            isMainWindowOnlyPath(location.pathname) ? (
+                            <MainWindowOnlyState />
                           ) : (
                             <Outlet />
                           )}
@@ -1022,8 +1048,12 @@ export function AppShell() {
                       ) : null}
                     </div>
                   )}
-                  <RequestedAgentCreateDialogs />
-                  <AgentManagementDialogs />
+                  {isCommunityWindowShell ? null : (
+                    <>
+                      <RequestedAgentCreateDialogs />
+                      <AgentManagementDialogs />
+                    </>
+                  )}
                   <AppShellOverlays
                     activeChannel={managedChannel}
                     browseDialogType={browseDialogType}

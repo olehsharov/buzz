@@ -40,7 +40,7 @@ export function usePopoutWindowTitle(
   currentPubkey: string | undefined,
 ): string {
   const channel =
-    destination && destination.kind !== "profile"
+    destination && "channelId" in destination
       ? (channels.find((entry) => entry.id === destination.channelId) ?? null)
       : null;
   const dmPubkeys =

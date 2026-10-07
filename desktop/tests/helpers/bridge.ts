@@ -150,6 +150,8 @@ type MockBridgeOptions = {
   windowLabel?: string;
   /** One-time `take_popout_launch` payload for a `popout-<uuid>` window. */
   popoutLaunch?: { route: string; community: unknown } | null;
+  /** Community ids whose `community-<id>` window is already open. */
+  openCommunityWindowIds?: string[];
   ttsSettings?: {
     version: number;
     agentTextToSpeech: boolean;

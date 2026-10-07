@@ -584,9 +584,9 @@ test("sent link preview media uses the authenticated proxy in compact and rich c
 }) => {
   const previewUrl = "https://github.com/block/buzz/pull/3246?proxy=1";
   const fallbackMediaPattern =
-    /^buzz-media:\/\/localhost\/media\/[\da-f]{64}\.png$/;
+    /^buzz-media:\/\/localhost\/media\/localhost:3000\/[\da-f]{64}\.png$/;
   const proxyMediaPattern =
-    /^http:\/\/127\.0\.0\.1:54321\/media\/[\da-f]{64}\.png$/;
+    /^http:\/\/127\.0\.0\.1:54321\/media\/localhost:3000\/[\da-f]{64}\.png$/;
   await page.route("http://127.0.0.1:54321/media/**", (route) =>
     route.fulfill({
       body: '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20"><rect width="40" height="20" fill="#22c55e"/></svg>',

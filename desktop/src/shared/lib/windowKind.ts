@@ -10,11 +10,33 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
  * - `huddle`: the dedicated huddle companion (`huddle-<channel uuid>`).
  * - `popout`: a "open in new window" view (`popout-<uuid>`) showing one
  *   destination of one community.
+ * - `community`: a whole second community running side by side with the main
+ *   window (`community-<community id>`, Cmd/Ctrl-click on the community
+ *   rail). Its relay commands are bound to that community natively; it owns
+ *   no app-global work either.
  */
-export type WindowKind = "main" | "huddle" | "popout";
+export type WindowKind = "main" | "huddle" | "popout" | "community";
 
 export const HUDDLE_WINDOW_LABEL_PREFIX = "huddle-";
 export const POPOUT_WINDOW_LABEL_PREFIX = "popout-";
+export const COMMUNITY_WINDOW_LABEL_PREFIX = "community-";
+
+// Mirrors `is_safe_community_id` in window_relay.rs (Tauri label charset).
+const COMMUNITY_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+
+/** The community id a community window label names, or null. */
+export function communityIdFromWindowLabel(
+  label: string | null,
+): string | null {
+  if (!label?.startsWith(COMMUNITY_WINDOW_LABEL_PREFIX)) return null;
+  const id = label.slice(COMMUNITY_WINDOW_LABEL_PREFIX.length);
+  return COMMUNITY_ID_PATTERN.test(id) ? id : null;
+}
+
+/** Whether `communityId` can own a community window. */
+export function isCommunityWindowId(communityId: string): boolean {
+  return COMMUNITY_ID_PATTERN.test(communityId);
+}
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -34,6 +56,7 @@ export function windowKindFromLabel(label: string | null): WindowKind {
   ) {
     return "popout";
   }
+  if (communityIdFromWindowLabel(label)) return "community";
   return "main";
 }
 
@@ -61,4 +84,14 @@ export function isMainWindow(): boolean {
 /** True for an "open in new window" pop-out. */
 export function isPopoutWindow(): boolean {
   return currentWindowKind() === "popout";
+}
+
+/** True for a community window (`community-<id>`). */
+export function isCommunityWindow(): boolean {
+  return currentWindowKind() === "community";
+}
+
+/** The community this window is bound to, when it is a community window. */
+export function currentCommunityWindowId(): string | null {
+  return communityIdFromWindowLabel(currentWindowLabel());
 }

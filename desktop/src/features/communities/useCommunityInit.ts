@@ -15,6 +15,7 @@ import {
   setAgentAvatarCommunities,
 } from "@/shared/api/tauriWorkspace";
 import { getIdentity } from "@/shared/api/tauriIdentity";
+import { bindWindowCommunity } from "@/features/community-window/communityWindowApi";
 import { clearTrayAgentActivity } from "@/shared/api/trayMenu";
 import { getOverrides } from "@/shared/features";
 import { resetMediaCaches } from "@/shared/lib/mediaUrl";
@@ -142,6 +143,12 @@ type CommunityInitResult =
  * popoutCommunityGate), refresh avatar trust, auto-connect a default relay,
  * or touch the native deep-link queue / tray. A null community just tears
  * down this window's singletons (the pause path).
+ *
+ * `options.communityWindow`: a community window (`community-<id>`) runs its
+ * own community beside the main window. Like a pop-out it owns no native
+ * app-global state; instead of applying the workspace it binds its own relay
+ * natively (`bind_window_community`), so every relay command it invokes
+ * targets its community while the main window keeps the workspace.
  */
 export function useCommunityInit(
   activeCommunity: Community | null,
@@ -149,9 +156,11 @@ export function useCommunityInit(
   isSharedIdentity: boolean,
   suppressAutoConnect = false,
   communities: readonly Community[] = [],
-  options: { popout?: boolean } = {},
+  options: { popout?: boolean; communityWindow?: boolean } = {},
 ): CommunityInitResult {
-  const isPopout = options.popout === true;
+  const isCommunityWindow = options.communityWindow === true;
+  // Pop-outs and community windows never touch native app-global state.
+  const isPopout = options.popout === true || isCommunityWindow;
   // Read at apply time, not a dependency: the first saved community only
   // decides the one-time home of legacy (unassigned) agents.
   const communitiesRef = useRef(communities);
@@ -402,8 +411,11 @@ export function useCommunityInit(
         } while (trustUpdate !== avatarTrustUpdateRef.current);
         // The backend workspace is process-global and owned by the main
         // window; a pop-out only renders once its community is already the
-        // applied one (popoutCommunityGate).
-        if (!isPopout) {
+        // applied one (popoutCommunityGate). A community window binds its
+        // own relay instead, before anything in it connects.
+        if (isCommunityWindow) {
+          await bindWindowCommunity(activeCommunity.relayUrl);
+        } else if (!isPopout) {
           await applyCommunity(
             activeCommunity.relayUrl,
             undefined,
@@ -484,6 +496,7 @@ export function useCommunityInit(
     suppressAutoConnect,
     communityKey,
     isPopout,
+    isCommunityWindow,
   ]);
 
   return result;

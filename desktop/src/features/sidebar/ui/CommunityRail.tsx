@@ -27,6 +27,12 @@ import {
   type CommunityUnreadState,
 } from "@/features/communities/useCommunityUnread";
 import { useAppShell } from "@/app/AppShellContext";
+import type { PopoutDestination } from "@/features/popout/popoutRoute";
+import { OpenInNewWindowMenuItem } from "@/features/popout/ui/OpenInNewWindowMenuItem";
+import {
+  type NewWindowGestures,
+  useNewWindowGestures,
+} from "@/features/popout/useOpenInNewWindow";
 import {
   ContextMenu,
   ContextMenuContent,
@@ -85,6 +91,58 @@ export function communityRailIndicators(unread: CommunityUnreadState): {
   };
 }
 
+/**
+ * The "open in its own window" destination for a rail entry. The active
+ * community already runs in this window, so it has none: a second window on
+ * it would make two windows write the same community's read state.
+ */
+export function communityRailNewWindowDestination(
+  communityId: string,
+  activeCommunityId: string | null,
+): PopoutDestination | null {
+  return communityId === activeCommunityId
+    ? null
+    : { kind: "community", communityId };
+}
+
+/**
+ * Merge the rail's new-window gestures into dnd-kit's sortable listeners.
+ * Cmd/Ctrl+Enter must be claimed BEFORE dnd-kit's KeyboardSensor sees it —
+ * Enter is one of its drag-start keys — and Cmd/Ctrl-click or a middle click
+ * must open the window instead of switching. dnd-kit's PointerSensor only
+ * activates on a primary-button press past its distance constraint, so a
+ * middle click or a still Cmd-click never starts a drag.
+ */
+export function mergeCommunityRailHandlers({
+  dragListeners,
+  newWindow,
+  onSwitch,
+}: {
+  dragListeners?: React.HTMLAttributes<HTMLElement>;
+  newWindow: Pick<
+    NewWindowGestures,
+    "handleClick" | "handleKeyDown" | "pointerProps"
+  >;
+  onSwitch: () => void;
+}): React.HTMLAttributes<HTMLElement> {
+  return {
+    ...dragListeners,
+    onClick: (event) => {
+      if (newWindow.handleClick(event)) return;
+      onSwitch();
+    },
+    onKeyDown: (event) => {
+      if (newWindow.handleKeyDown(event)) return;
+      dragListeners?.onKeyDown?.(event);
+    },
+    onAuxClick: newWindow.pointerProps.onAuxClick,
+    onMouseDown: (event) => {
+      newWindow.pointerProps.onMouseDown(event);
+      dragListeners?.onMouseDown?.(event);
+    },
+  };
+}
+
 function CommunityButton({
   community,
   isActive,
@@ -92,6 +150,7 @@ function CommunityButton({
   iconUrl,
   onSwitch,
   menu,
+  newWindow,
   dragListeners,
   dragAttributes,
   isDragging,
@@ -102,6 +161,7 @@ function CommunityButton({
   iconUrl: string | null;
   onSwitch: () => void;
   menu: React.ReactNode;
+  newWindow: NewWindowGestures;
   dragListeners?: React.HTMLAttributes<HTMLElement>;
   dragAttributes?: React.HTMLAttributes<HTMLElement>;
   isDragging?: boolean;
@@ -128,10 +188,13 @@ function CommunityButton({
                 isDragging && "opacity-30",
               )}
               data-testid={`community-rail-button-${community.id}`}
-              onClick={onSwitch}
               type="button"
               {...dragAttributes}
-              {...dragListeners}
+              {...mergeCommunityRailHandlers({
+                dragListeners,
+                newWindow,
+                onSwitch,
+              })}
             >
               {isActive ? (
                 <span
@@ -247,6 +310,11 @@ function SortableCommunityButton({
     transform: CSS.Transform.toString(transform),
     transition,
   };
+  const newWindowDestination = communityRailNewWindowDestination(
+    community.id,
+    activeCommunityId,
+  );
+  const newWindow = useNewWindowGestures(newWindowDestination);
 
   return (
     <div ref={setNodeRef} style={style}>
@@ -257,8 +325,15 @@ function SortableCommunityButton({
         iconUrl={iconsByCommunity[community.id] ?? null}
         isActive={community.id === activeCommunityId}
         isDragging={isDragging}
+        newWindow={newWindow}
         menu={
           <>
+            {newWindow.enabled ? (
+              <>
+                <OpenInNewWindowMenuItem destination={newWindowDestination} />
+                <ContextMenuSeparator />
+              </>
+            ) : null}
             <ContextMenuItem onClick={() => onMarkAllRead(community)}>
               <CheckCheck className="h-4 w-4" />
               Mark all as read

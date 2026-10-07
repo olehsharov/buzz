@@ -297,9 +297,32 @@ export function getCachedMediaProxyPort(): number | null {
  * Build the local proxy URL with an IPv4 literal. The Rust proxy binds
  * `127.0.0.1:0`, not `::1`, and some WebViews resolve `localhost` to IPv6
  * first. Matching the bind address avoids machine-dependent image failures.
+ *
+ * `relayHost` (the media URL's `host[:port]`) is encoded as the first path
+ * segment: every window can be bound to a different community relay, and the
+ * shared proxy resolves the upstream relay from the path (only relays this
+ * app is bound to are accepted). Without it the proxy targets the main
+ * window's relay.
  */
-export function mediaProxyUrl(port: number, mediaPath: string): string {
-  return `http://127.0.0.1:${port}/media/${mediaPath}`;
+export function mediaProxyUrl(
+  port: number,
+  mediaPath: string,
+  relayHost?: string | null,
+): string {
+  return `http://127.0.0.1:${port}/media/${relayMediaPath(mediaPath, relayHost)}`;
+}
+
+function relayMediaPath(mediaPath: string, relayHost?: string | null): string {
+  return relayHost ? `${relayHost}/${mediaPath}` : mediaPath;
+}
+
+/** The lowercased `host[:port]` of `url`, as the native proxy expects it. */
+function mediaRelayHost(url: string): string | null {
+  try {
+    return new URL(url).host.toLowerCase() || null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -327,13 +350,14 @@ export function rewriteRelayUrl(url: string): string {
     }
   }
 
+  const relayHost = mediaRelayHost(url);
   if (cachedPort && cachedPort > 0) {
-    return mediaProxyUrl(cachedPort, m[1]);
+    return mediaProxyUrl(cachedPort, m[1], relayHost);
   }
 
   if (!portPromise && typeof window !== "undefined") {
     ensureRelayOriginFetch();
   }
 
-  return `buzz-media://localhost/media/${m[1]}`;
+  return `buzz-media://localhost/media/${relayMediaPath(m[1], relayHost)}`;
 }

@@ -1,6 +1,7 @@
 import * as React from "react";
 import { ChevronLeft, ChevronRight } from "lucide-react";
 
+import { OpenInMainWindowButton } from "@/features/popout/ui/PopoutChrome";
 import { isMacPlatform } from "@/shared/lib/platform";
 import { useIsFullscreen } from "@/shared/lib/useIsFullscreen";
 import { Button } from "@/shared/ui/button";
@@ -15,6 +16,11 @@ type AppTopChromeProps = {
   onGoBack: () => void;
   onGoForward: () => void;
   hasCommunityRail?: boolean;
+  /**
+   * Set in a community window: names the window's community and offers a
+   * way back to the main window, which owns settings, agents, and the rail.
+   */
+  communityWindowName?: string | null;
 };
 
 // Fixed px on purpose (button box + glyph): these controls sit beside the
@@ -58,6 +64,7 @@ export function AppTopChrome({
   onGoBack,
   onGoForward,
   hasCommunityRail = false,
+  communityWindowName,
 }: AppTopChromeProps) {
   const topChromeRef = React.useRef<HTMLDivElement>(null);
   const isFullscreen = useIsFullscreen();
@@ -160,6 +167,23 @@ export function AppTopChrome({
         data-tauri-drag-region
         id="app-top-chrome-content"
       />
+      {communityWindowName !== undefined ? (
+        <div
+          className={cn(
+            "flex shrink-0 items-center gap-2",
+            navRowAlignmentClass,
+          )}
+          data-testid="community-window-chrome"
+        >
+          <span
+            className="max-w-48 truncate text-sm font-semibold"
+            data-testid="community-window-name"
+          >
+            {communityWindowName ?? ""}
+          </span>
+          <OpenInMainWindowButton destination={null} focusOnly />
+        </div>
+      ) : null}
     </div>
   );
 }

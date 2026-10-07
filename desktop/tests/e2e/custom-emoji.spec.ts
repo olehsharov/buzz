@@ -401,7 +401,7 @@ test("reacting with a custom emoji renders via the loopback media proxy", async 
   await expect(reactionImg).toHaveAttribute(
     "src",
     new RegExp(
-      `^http://127\\.0\\.0\\.1:${MOCK_MEDIA_PROXY_PORT}/media/[\\da-f]{64}\\.png$`,
+      `^http://127\\.0\\.0\\.1:${MOCK_MEDIA_PROXY_PORT}/media/localhost:3000/[\\da-f]{64}\\.png$`,
     ),
   );
   await expect(reactionPill).toHaveCSS("height", "28px");

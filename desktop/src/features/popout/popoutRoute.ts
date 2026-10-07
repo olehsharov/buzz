@@ -3,6 +3,8 @@ import {
   defaultStringifySearch,
 } from "@tanstack/react-router";
 
+import { loadCommunityDestination } from "@/features/communities/communityNavigationStorage";
+
 /**
  * Destinations that may open in a pop-out window (MVP). Channels and DMs share
  * the channel route; projects, workflows, and settings are deliberately not
@@ -24,7 +26,12 @@ export type PopoutDestination =
       postId: string;
       replyId?: string | null;
     }
-  | { kind: "profile"; pubkey: string };
+  | { kind: "profile"; pubkey: string }
+  /**
+   * A whole community in its own community window (`community-<id>`), not a
+   * pop-out. Its route is where that community was last left, else Home.
+   */
+  | { kind: "community"; communityId: string };
 
 export type PopoutDestinationKind = PopoutDestination["kind"];
 
@@ -93,9 +100,24 @@ export function buildPopoutRoute(
     case "profile":
       if (!isSafeId(destination.pubkey)) return null;
       return withSearch("/pulse", { profile: destination.pubkey });
+    case "community":
+      return communityLandingRoute(destination.communityId);
     default:
       return null;
   }
+}
+
+/**
+ * Where a community window opens: the channel that community was last left
+ * on, else Home. Null for an id that cannot own a window.
+ */
+export function communityLandingRoute(communityId: string): string | null {
+  if (!isSafeId(communityId)) return null;
+  const destination = loadCommunityDestination(communityId);
+  if (destination?.kind === "channel" && isSafeId(destination.channelId)) {
+    return `/channels/${destination.channelId}`;
+  }
+  return "/";
 }
 
 const CHANNEL_PATH = /^\/channels\/([A-Za-z0-9_-]{1,128})$/;

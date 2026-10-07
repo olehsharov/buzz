@@ -4,6 +4,7 @@ import { Activity, Bot, Folders, Inbox, Zap } from "lucide-react";
 import { TopbarSearch } from "@/features/search/ui/TopbarSearch";
 import { SidebarProjectsSection } from "@/features/sidebar/ui/SidebarProjectsSection";
 import { FeatureGate } from "@/shared/features";
+import { isCommunityWindow } from "@/shared/lib/windowKind";
 import type { Channel, SearchHit } from "@/shared/api/types";
 import {
   SidebarHeader,
@@ -103,6 +104,9 @@ export function AppSidebarPrimaryMenu({
   projectsOverviewActive,
   selectedView,
 }: AppSidebarPrimaryMenuProps) {
+  // Projects, agents, and workflows are main-window surfaces: a community
+  // window runs chat for its community only.
+  const showsMainOnlySurfaces = !isCommunityWindow();
   return (
     <>
       <SidebarHeader
@@ -145,51 +149,57 @@ export function AppSidebarPrimaryMenu({
               </SidebarMenuButton>
             </SidebarMenuItem>
           </FeatureGate>
-          <FeatureGate feature="projects">
-            <SidebarMenuItem>
-              <SidebarMenuButton
-                data-testid="open-projects-view"
-                isActive={selectedView === "projects" && projectsOverviewActive}
-                onClick={onSelectProjects}
-                tooltip="Projects"
-                type="button"
-              >
-                <Folders className="h-4 w-4" />
-                <SidebarMenuLabel>Projects</SidebarMenuLabel>
-              </SidebarMenuButton>
-            </SidebarMenuItem>
-          </FeatureGate>
-          <SidebarMenuItem>
-            <SidebarMenuButton
-              className="data-[active=true]:font-normal"
-              data-testid="open-agents-view"
-              isActive={selectedView === "agents"}
-              onClick={onSelectAgents}
-              tooltip="Agents"
-              type="button"
-            >
-              <Bot className="h-4 w-4" />
-              <SidebarMenuLabel>Agents</SidebarMenuLabel>
-            </SidebarMenuButton>
-          </SidebarMenuItem>
-          <ProtectedBestieSidebarEntry />
-          <FeatureGate feature="workflows">
-            <SidebarMenuItem>
-              <SidebarMenuButton
-                data-testid="open-workflows-view"
-                isActive={selectedView === "workflows"}
-                onClick={onSelectWorkflows}
-                tooltip="Workflows"
-                type="button"
-              >
-                <Zap className="h-4 w-4" />
-                <SidebarMenuLabel>Workflows</SidebarMenuLabel>
-              </SidebarMenuButton>
-            </SidebarMenuItem>
-          </FeatureGate>
+          {showsMainOnlySurfaces ? (
+            <>
+              <FeatureGate feature="projects">
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    data-testid="open-projects-view"
+                    isActive={
+                      selectedView === "projects" && projectsOverviewActive
+                    }
+                    onClick={onSelectProjects}
+                    tooltip="Projects"
+                    type="button"
+                  >
+                    <Folders className="h-4 w-4" />
+                    <SidebarMenuLabel>Projects</SidebarMenuLabel>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              </FeatureGate>
+              <SidebarMenuItem>
+                <SidebarMenuButton
+                  className="data-[active=true]:font-normal"
+                  data-testid="open-agents-view"
+                  isActive={selectedView === "agents"}
+                  onClick={onSelectAgents}
+                  tooltip="Agents"
+                  type="button"
+                >
+                  <Bot className="h-4 w-4" />
+                  <SidebarMenuLabel>Agents</SidebarMenuLabel>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+              <ProtectedBestieSidebarEntry />
+              <FeatureGate feature="workflows">
+                <SidebarMenuItem>
+                  <SidebarMenuButton
+                    data-testid="open-workflows-view"
+                    isActive={selectedView === "workflows"}
+                    onClick={onSelectWorkflows}
+                    tooltip="Workflows"
+                    type="button"
+                  >
+                    <Zap className="h-4 w-4" />
+                    <SidebarMenuLabel>Workflows</SidebarMenuLabel>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              </FeatureGate>
+            </>
+          ) : null}
         </SidebarMenu>
       </SidebarHeader>
-      <SidebarProjectsSection />
+      {showsMainOnlySurfaces ? <SidebarProjectsSection /> : null}
     </>
   );
 }

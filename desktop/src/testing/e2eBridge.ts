@@ -226,6 +226,11 @@ type E2eConfig = {
      * null/omitted simulates a reloaded pop-out.
      */
     popoutLaunch?: { route: string; community: unknown } | null;
+    /**
+     * Community ids whose community window (`community-<id>`) is already
+     * open: `focus_community_window` reports them as focused.
+     */
+    openCommunityWindowIds?: string[];
     ttsSettings?: {
       version: number;
       agentTextToSpeech: boolean;
@@ -3394,6 +3399,12 @@ const realSockets = new Map<number, WebSocket>();
 let mockManagedAgents: MockManagedAgent[] = [];
 /** Relay of the last `apply_workspace` — the active community. */
 let mockAppliedRelayUrl: string | null = null;
+/**
+ * Relay a community window bound with `bind_window_community`. Like the
+ * native per-window binding, it scopes every relay read of this window
+ * (relay URL commands and the community agent filter).
+ */
+let mockWindowBoundRelayUrl: string | null = null;
 
 function sameMockRelay(left: string, right: string) {
   const canonical = (url: string) =>
@@ -4491,11 +4502,14 @@ function isRelayMode(config: E2eConfig | undefined): boolean {
 }
 
 function getRelayHttpUrl(config: E2eConfig | undefined): string {
+  if (mockWindowBoundRelayUrl) {
+    return mockWindowBoundRelayUrl.replace(/^ws(s?):/, "http$1:");
+  }
   return config?.relayHttpUrl ?? DEFAULT_RELAY_HTTP_URL;
 }
 
 function getRelayWsUrl(config: E2eConfig | undefined): string {
-  return config?.relayWsUrl ?? DEFAULT_RELAY_WS_URL;
+  return mockWindowBoundRelayUrl ?? config?.relayWsUrl ?? DEFAULT_RELAY_WS_URL;
 }
 
 /**
@@ -12316,6 +12330,20 @@ export function maybeInstallE2eTauriMocks() {
       }
       case "focus_main_window_route":
         return null;
+      // Community windows. Calls are recorded in __BUZZ_E2E_COMMAND_LOG__.
+      case "open_community_window":
+        return `community-${(payload as { communityId: string }).communityId}`;
+      case "focus_community_window":
+        return (activeConfig?.mock?.openCommunityWindowIds ?? []).includes(
+          (payload as { communityId: string }).communityId,
+        );
+      case "bind_window_community": {
+        const relayUrl = (payload as { relayUrl: string }).relayUrl;
+        mockWindowBoundRelayUrl = relayUrl;
+        // The window's community is what its agent lists scope to.
+        mockAppliedRelayUrl = relayUrl;
+        return null;
+      }
       case "leave_huddle":
       case "end_huddle":
         mockHuddle = null;

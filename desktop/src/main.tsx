@@ -12,11 +12,17 @@ import { UpdaterProvider } from "@/features/settings/hooks/UpdaterProvider";
 import { migrateLegacyCommunityStorageBeforeRender } from "@/features/communities/legacyCommunityStorage";
 import { CommunitiesProvider } from "@/features/communities/useCommunities";
 import { router } from "@/app/router";
+import { communityLandingRoute } from "@/features/popout/popoutRoute";
 import {
   getPopoutSession,
   initializePopoutSession,
 } from "@/features/popout/popoutSession";
-import { isMainWindow, isPopoutWindow } from "@/shared/lib/windowKind";
+import {
+  currentCommunityWindowId,
+  isCommunityWindow,
+  isMainWindow,
+  isPopoutWindow,
+} from "@/shared/lib/windowKind";
 import { CommunityOnboardingProvider } from "@/features/onboarding/communityOnboarding";
 import { ThemeProvider } from "@/shared/theme/ThemeProvider";
 import { AvatarClipPaths } from "@/shared/ui/AvatarClipPaths";
@@ -95,7 +101,9 @@ function renderApp() {
           pinnedCommunityId={
             isPopoutWindow()
               ? (getPopoutSession()?.communityId ?? null)
-              : undefined
+              : isCommunityWindow()
+                ? currentCommunityWindowId()
+                : undefined
           }
         >
           <CommunityOnboardingProvider enabled={isMainWindow()}>
@@ -149,6 +157,12 @@ async function bootstrap() {
   const popoutSession = await initializePopoutSession();
   if (popoutSession) {
     router.history.replace(popoutSession.initialRoute ?? "/");
+  }
+  // A community window opens where its community was last left. A reload
+  // keeps the route already in this window's URL.
+  const communityWindowId = currentCommunityWindowId();
+  if (communityWindowId && !window.location.hash.startsWith("#/")) {
+    router.history.replace(communityLandingRoute(communityWindowId) ?? "/");
   }
   renderApp();
 }

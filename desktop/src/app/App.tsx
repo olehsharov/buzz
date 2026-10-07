@@ -1,5 +1,6 @@
 import { isTauri } from "@tauri-apps/api/core";
 import { emit } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { RouterProvider } from "@tanstack/react-router";
 import {
@@ -29,7 +30,11 @@ import {
   openInMainWindow,
   PopoutUnavailableState,
 } from "@/features/popout/ui/PopoutChrome";
-import { isMainWindow, isPopoutWindow } from "@/shared/lib/windowKind";
+import {
+  isCommunityWindow,
+  isMainWindow,
+  isPopoutWindow,
+} from "@/shared/lib/windowKind";
 import { useAppOnboardingState } from "@/features/onboarding/hooks";
 import { useMachineOnboardingState } from "@/features/onboarding/machineOnboarding";
 import {
@@ -790,6 +795,87 @@ function PopoutGatedCommunityApp({
   );
 }
 
+/**
+ * Community-window boundary (`community-<id>`): a whole second community
+ * beside the main window. Like a pop-out it never applies the workspace or
+ * persists the active community; instead its community init binds this
+ * window's relay natively, so every relay command it makes targets its own
+ * community while the main window keeps the workspace. It renders only once
+ * that binding has succeeded.
+ */
+function CommunityWindowApp({
+  currentPubkey,
+  sharedIdentity,
+}: {
+  currentPubkey: string | null;
+  sharedIdentity: boolean;
+}) {
+  const { activeCommunity, communities, reinitKey } = useCommunities();
+  const communityKey = `community-window-${activeCommunity?.id ?? "none"}-${activeCommunity?.relayUrl ?? ""}-${reinitKey}-${currentPubkey ?? "anonymous"}`;
+  const community = useCommunityInit(
+    activeCommunity,
+    communityKey,
+    sharedIdentity,
+    true,
+    communities,
+    { communityWindow: true },
+  );
+  useCloseWhenCommunityRemoved(activeCommunity !== null);
+  const communityApplied =
+    activeCommunity !== null &&
+    community.isReady &&
+    community.appliedKey === communityKey;
+
+  if (activeCommunity === null) {
+    return <PopoutUnavailableState kind="missing" />;
+  }
+  if ("error" in community && community.error) {
+    return (
+      <CommunityApplyErrorScreen
+        error={community.error}
+        onChangeCommunity={() => openInMainWindow(null, true)}
+        onRetry={() => window.location.reload()}
+      />
+    );
+  }
+  if (!communityApplied) return <CommunitySwitchGate />;
+  return (
+    <CommunityQueryProvider
+      key={communityKey}
+      pubkey={community.identityPubkey}
+      relayUrl={activeCommunity.relayUrl}
+    >
+      <CommunityThemeController />
+      <AppReady
+        continueOnboarding={false}
+        isCommunitySwitch
+        isSharedIdentity={sharedIdentity}
+        key={communityKey}
+      />
+    </CommunityQueryProvider>
+  );
+}
+
+/**
+ * A community window whose community is removed from this device closes:
+ * its relay binding would otherwise outlive the community it belonged to.
+ */
+function useCloseWhenCommunityRemoved(hasCommunity: boolean) {
+  const hadCommunityRef = useRef(hasCommunity);
+  useEffect(() => {
+    if (hasCommunity) {
+      hadCommunityRef.current = true;
+      return;
+    }
+    if (!hadCommunityRef.current || !isTauri()) return;
+    void getCurrentWindow()
+      .close()
+      .catch((error: unknown) => {
+        console.error("Failed to close the community window:", error);
+      });
+  }, [hasCommunity]);
+}
+
 function MachineBootstrap({ sharedIdentity }: { sharedIdentity: boolean }) {
   const { activeCommunity } = useCommunities();
   const communityOnboarding = useCommunityOnboarding();
@@ -851,6 +937,14 @@ function MachineBootstrap({ sharedIdentity }: { sharedIdentity: boolean }) {
   if (machine.stage === "keyring-locked") return <KeyringLockedScreen />;
   if (machine.stage === "relaunch-required") return <RelaunchRequiredScreen />;
   if (machine.stage === "blocking") return <AppLoadingGate />;
+  if (machine.stage === "ready" && isCommunityWindow()) {
+    return (
+      <CommunityWindowApp
+        currentPubkey={machine.currentPubkey}
+        sharedIdentity={sharedIdentity}
+      />
+    );
+  }
   if (machine.stage === "ready" && isPopoutWindow()) {
     return (
       <PopoutCommunityApp

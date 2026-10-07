@@ -20,6 +20,17 @@ function deferred() {
   return { promise, resolve };
 }
 
+test("mediaProxyUrl: encodes the media's relay host so each window's relay is proxied", () => {
+  assert.equal(
+    mediaProxyUrl(54321, `${HASH}.png`, "relay-b.example:8443"),
+    `http://127.0.0.1:54321/media/relay-b.example:8443/${HASH}.png`,
+  );
+  assert.equal(
+    mediaProxyUrl(54321, `${HASH}.png`, null),
+    `http://127.0.0.1:54321/media/${HASH}.png`,
+  );
+});
+
 test("mediaProxyUrl: uses the IPv4 loopback literal for the localhost proxy", () => {
   assert.equal(
     mediaProxyUrl(54321, `${HASH}.png`),
@@ -310,7 +321,7 @@ test("resetMediaCaches: ignores relay origin lookups from the previous generatio
 
     assert.equal(
       mediaUrl.rewriteRelayUrl(activeUrl),
-      `http://127.0.0.1:54321/media/${HASH}.png`,
+      `http://127.0.0.1:54321/media/active.example/${HASH}.png`,
     );
   } finally {
     globalThis.window = previousWindow;
@@ -341,7 +352,7 @@ test("rewriteRelayUrl: matches relay origin case-insensitively (uppercase saved 
     const relayMediaUrl = `https://pending-seed.communities.buzz.xyz/media/${HASH}.png`;
     assert.equal(
       mediaUrl.rewriteRelayUrl(relayMediaUrl),
-      `http://127.0.0.1:54321/media/${HASH}.png`,
+      `http://127.0.0.1:54321/media/pending-seed.communities.buzz.xyz/${HASH}.png`,
     );
   } finally {
     globalThis.window = previousWindow;

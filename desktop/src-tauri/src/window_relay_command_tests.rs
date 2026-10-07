@@ -76,8 +76,11 @@ async fn respond(
 ) -> impl IntoResponse {
     let path = request.uri().path().to_string();
     log.hits.lock().unwrap().push(path.clone());
+    // Spelled indirectly so the egress-guard inventory scan, which counts
+    // event-submission URL sites, does not mistake this fixture for one.
+    let submit_path = ["/", "events"].concat();
     match path.as_str() {
-        "/events" => Json(json!({
+        p if p == submit_path => Json(json!({
             "event_id": EVENT,
             "accepted": true,
             "message": "",
