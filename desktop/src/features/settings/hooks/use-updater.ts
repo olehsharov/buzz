@@ -30,7 +30,11 @@ const BACKGROUND_BLOCKED_STATES = new Set<UpdateStatus["state"]>([
   "manual-required",
 ]);
 
-const GITHUB_RELEASES_URL = "https://github.com/block/buzz/releases/latest";
+// Release builds may point the manual-download link at another releases page
+// (e.g. a fork's), matching the updater endpoint baked into the same build.
+const GITHUB_RELEASES_URL =
+  import.meta.env.VITE_BUZZ_RELEASES_URL ||
+  "https://github.com/block/buzz/releases/latest";
 
 function toErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
