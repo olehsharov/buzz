@@ -64,7 +64,7 @@ Do this once. **Back up the private key and its password**, for example in
 a manual reinstall. Never commit the private key.
 
 ```bash
-cd /Users/olh/Documents/dev/buzz && . ./bin/activate-hermit && cd desktop
+cd /path/to/buzz && . ./bin/activate-hermit && cd desktop
 pnpm tauri signer generate -w ~/.tauri/buzz-fork.key     # choose a password
 cp ~/.tauri/buzz-fork.key.pub fork-updater.pub            # desktop/fork-updater.pub — commit this
 gh secret set TAURI_SIGNING_PRIVATE_KEY --repo olehsharov/buzz < ~/.tauri/buzz-fork.key
@@ -159,7 +159,7 @@ manually once. Every later release then arrives in-app.
 the first CI release, so that release becomes the first real auto-update.
 
 ```bash
-cd /Users/olh/Documents/dev/buzz && . ./bin/activate-hermit
+cd /path/to/buzz && . ./bin/activate-hermit
 VERSION=0.5.27-fork.0
 (cd desktop && node scripts/set-version-from-tag.mjs "$VERSION" && cd src-tauri && cargo update --workspace)
 export BUZZ_UPDATER_PUBLIC_KEY="$(tr -d '\n' < desktop/fork-updater.pub)"

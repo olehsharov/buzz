@@ -6,7 +6,7 @@ const PUBKEY = "cd".repeat(32);
 const calls = [];
 const rawAgent = {
   pubkey: PUBKEY,
-  name: "Renderilla Scout",
+  name: "Remote Scout",
   persona_id: null,
   relay_url: "wss://relay.example",
   acp_command: "acp",
@@ -29,8 +29,8 @@ const rawAgent = {
   last_error: null,
   log_path: "/tmp/log",
   start_on_app_launch: false,
-  backend: { type: "provider", id: "renderilla", config: {} },
-  backend_agent_id: "renderilla-1",
+  backend: { type: "provider", id: "ssh-host", config: {} },
+  backend_agent_id: "ssh-host-1",
   provider_policy_pending: true,
   respond_to: "anyone",
   respond_to_allowlist: [],
@@ -93,7 +93,7 @@ test("Retry redeploys the agent through Start and owns one labelled action", asy
   const retry = buttons[0];
   assert.equal(
     retry.getAttribute("aria-label"),
-    "Retry applying the access change to Renderilla Scout",
+    "Retry applying the access change to Remote Scout",
   );
 
   await act(async () => {

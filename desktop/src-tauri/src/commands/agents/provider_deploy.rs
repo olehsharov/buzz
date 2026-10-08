@@ -20,9 +20,10 @@ use super::build_deploy_payload;
 /// again. Providers are expected to handle this as an update-in-place or no-op.
 /// The protocol has no explicit `undeploy` operation or acknowledgement that an
 /// existing process stopped, so a successful redeploy delegates access-policy
-/// revocation to the provider implementation (renderilla's deploy restarts the
-/// agent's unit with the new environment). An access-policy edit on a deployed
-/// provider agent is saved with `provider_policy_pending` in the same write,
+/// revocation to the provider implementation (e.g. an SSH host provider's
+/// deploy restarts the agent's unit with the new environment). An access-policy
+/// edit on a deployed provider agent is saved with `provider_policy_pending` in
+/// the same write,
 /// published, and then applied by a redeploy through this function; the flag
 /// clears only when a deploy succeeds with a payload matching the saved policy,
 /// and workspace apply retries it until then.

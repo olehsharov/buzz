@@ -19,7 +19,7 @@ fn instance(pubkey: &str, persona_id: &str, respond_to: RespondTo) -> ManagedAge
 
 fn deployed_provider(mut record: ManagedAgentRecord) -> ManagedAgentRecord {
     record.backend = BackendKind::Provider {
-        id: "renderilla".into(),
+        id: "ssh-host".into(),
         config: serde_json::json!({}),
     };
     record.backend_agent_id = Some("deployment".into());
