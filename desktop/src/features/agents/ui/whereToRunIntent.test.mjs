@@ -129,3 +129,47 @@ test("probe resolution preserves unrelated draft fields", () => {
     "kubernetes",
   );
 });
+
+// ── Agent-draft prefill: the probe must not clobber or hide drafted config ───
+
+const probeWithWorkdir = {
+  ok: true,
+  config_schema: {
+    properties: {
+      workdir: { type: "string", default: "/home/agent" },
+      region: { type: "string", default: "us" },
+    },
+    required: ["workdir"],
+  },
+};
+
+test("probe resolution keeps a draft-prefilled workdir over the schema default", () => {
+  const prefilled = {
+    ...emptyWhereToRunDraft,
+    runOn: "blox",
+    providerConfig: { workdir: "/srv/agents" },
+  };
+  const next = applyProbeResult(prefilled, probeWithWorkdir);
+  assert.deepEqual(next.providerConfig, {
+    workdir: "/srv/agents",
+    region: "us",
+  });
+  assert.equal(canSubmitWhereToRun(next), true);
+});
+
+test("probe resolution drops prefilled keys the schema does not declare", () => {
+  // The dialog renders only declared fields, so an undeclared drafted key
+  // would otherwise reach the provider without the owner ever seeing it.
+  const prefilled = {
+    ...emptyWhereToRunDraft,
+    runOn: "blox",
+    providerConfig: { workdir: "/srv/agents", hidden_flag: "1" },
+  };
+  const next = applyProbeResult(prefilled, probeWithWorkdir);
+  assert.equal("hidden_flag" in next.providerConfig, false);
+  assert.deepEqual(resolveBackendIntent(next), {
+    type: "provider",
+    id: "blox",
+    config: { workdir: "/srv/agents", region: "us" },
+  });
+});

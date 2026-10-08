@@ -10,6 +10,7 @@ import {
   parseChannelLink,
 } from "@/features/messages/lib/channelLink";
 import type { ParsedMessageLink } from "@/features/messages/lib/messageLink";
+import type { PopoutDestination } from "@/features/popout/popoutRoute";
 import type { Channel } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
 import {
@@ -128,6 +129,7 @@ function ChannelPermalinkChipContents({
         title={href}
         aria-label={openable ? `Open channel ${label}` : `Channel ${label}`}
         interactive={openable && interactive}
+        newWindowDestination={openable ? { kind: "channel", channelId } : null}
         onOpenLink={() => {
           if (openable) onOpenChannel(channelId);
         }}
@@ -154,6 +156,20 @@ function ResolvedChannelPermalinkChip(props: ChannelPermalinkChipProps) {
 }
 
 type AuthoredMessageLink = ParsedMessageLink;
+
+function messageLinkDestination(
+  channelId: string,
+  messageLink: AuthoredMessageLink | null,
+): PopoutDestination {
+  return messageLink
+    ? {
+        kind: "channel",
+        channelId: messageLink.channelId,
+        messageId: messageLink.messageId,
+        threadRootId: messageLink.threadRootId,
+      }
+    : { kind: "channel", channelId };
+}
 
 type AuthoredDeepLinkProps = {
   channelId: string;
@@ -190,6 +206,7 @@ function ResolvedAuthoredDeepLink({
       title={href}
       aria-label={`${messageLink ? "Open message" : "Open channel"}: ${label}`}
       interactive={interactive}
+      newWindowDestination={messageLinkDestination(channelId, messageLink)}
       onOpenLink={() =>
         messageLink ? onOpenMessageLink(messageLink) : onOpenChannel(channelId)
       }
@@ -237,6 +254,7 @@ export function AuthoredDeepLinkAnchor({
         title={href}
         aria-label={`${messageLink ? "Open message" : "Open channel"}: ${label}`}
         interactive={interactive}
+        newWindowDestination={messageLinkDestination(channelId, messageLink)}
         onOpenLink={openLink}
       >
         {children}
@@ -418,6 +436,9 @@ function ChannelReferenceChip({
           channel ? `Open channel ${channelName}` : `Channel ${channelName}`
         }
         interactive={Boolean(channel) && interactive}
+        newWindowDestination={
+          channel ? { kind: "channel", channelId: channel.id } : null
+        }
         onOpenLink={() => {
           if (channel) onOpenChannel(channel.id);
         }}

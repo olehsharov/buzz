@@ -41,6 +41,9 @@ uuid = { workspace = true }
 # RFC3339 observer timestamps for owner-reviewed agent draft requests
 chrono = { workspace = true }
 
+# Grapheme counting — `agents draft-create --avatar-emoji` must be one emoji
+unicode-segmentation = "1"
+
 # Typed event builders for all write operations
 buzz-sdk = { workspace = true }
 buzz-core = { workspace = true }
@@ -65,6 +68,9 @@ infer = "0.19"
 
 # URL parsing — extract server domain for Blossom auth tag
 url = { workspace = true }
+
+# `buzz host`: agent-host daemon (pairing, control frames, supervision)
+buzz-host = { path = "../buzz-host" }
 
 # Persona pack parsing, validation, and resolution
 buzz-persona = { path = "../buzz-persona" }

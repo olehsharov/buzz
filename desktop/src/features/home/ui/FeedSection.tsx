@@ -167,11 +167,8 @@ export function FeedSection({
             const canOpenChannel =
               channelId !== null && availableChannelIds.has(channelId);
             const isDone = doneSet.has(item.id);
-            const { mentionNames, mentionPubkeysByName } = resolveMentionProps(
-              item.tags,
-              profiles,
-              item.content,
-            );
+            const { mentionAll, mentionNames, mentionPubkeysByName } =
+              resolveMentionProps(item.tags, profiles, item.content);
 
             return (
               <div
@@ -239,6 +236,7 @@ export function FeedSection({
                     linkPreviewsSuppressed={hasLinkPreviewSuppression(
                       item.tags,
                     )}
+                    mentionAll={mentionAll}
                     mentionNames={mentionNames}
                     mentionPubkeysByName={mentionPubkeysByName}
                   />

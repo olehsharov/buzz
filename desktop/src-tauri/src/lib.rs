@@ -1,4 +1,5 @@
 #![recursion_limit = "256"] // Deep Tauri command futures exceed the default layout query depth.
+mod agent_hosts;
 mod app_menu;
 mod app_state;
 mod archive;
@@ -37,6 +38,7 @@ mod nostr_bind;
 pub mod nostr_convert;
 mod observed_unread;
 mod persona_catalog;
+mod popout;
 mod prevent_sleep;
 mod ptt_shortcut;
 mod relay;
@@ -55,6 +57,7 @@ mod unread_catch_up;
 mod util;
 #[cfg(target_os = "linux")]
 pub mod webkit_rendering;
+mod window_relay;
 use app_state::{build_app_state, resolve_persisted_identity, AppState};
 use builderlab::*;
 #[doc(hidden)]
@@ -143,11 +146,23 @@ pub fn run() {
                 // Visibility is excluded: the native reveal plugin below
                 // shows the window after saved geometry has been restored.
                 .with_state_flags(StateFlags::all() & !StateFlags::VISIBLE)
+                // Only the main window keeps saved geometry. Pop-out and huddle
+                // windows have per-instance labels that would otherwise pile up
+                // in the state file forever.
+                .with_filter(popout::persists_window_state)
                 .build(),
         )
         .plugin(
             tauri::plugin::Builder::<_, ()>::new("initial-window-reveal")
                 .on_webview_ready(|webview| {
+                    if popout::is_popout_label(webview.label())
+                        || window_relay::is_community_window_label(webview.label())
+                    {
+                        // Pop-outs host the same composer (voice notes) as
+                        // the main window; they are revealed by their builder.
+                        linux_media::enable_media_capture(&webview);
+                        return;
+                    }
                     if webview.label() != "main" {
                         return;
                     }
@@ -231,11 +246,13 @@ pub fn run() {
         .manage(BuilderlabSession::default())
         .manage(BuilderlabLogin::default())
         .manage(commands::pairing::PairingHandle::new())
+        .manage(agent_hosts::HostOps::default())
         .manage(terminal_runtime::TerminalSessions::default())
         .manage(archive::sync::ArchiveSyncState::default())
         .manage(native_relay_client::NativeRelayClient::default())
         .manage(observed_unread::ObservedUnreadStore::default())
         .manage(channel_head_cache::ChannelHeadCacheStore::default())
+        .manage(popout::PopoutRegistry::default())
         .setup(move |app| {
             let app_handle = app.handle().clone();
             #[cfg(target_os = "macos")]
@@ -408,7 +425,7 @@ pub fn run() {
                 && !reset_outcome.completed
                 && migration::migrate_legacy_nest()
             {
-                let _ = app_handle.emit("legacy-nest-migrated", ());
+                let _ = app_handle.emit_to(popout::MAIN_WINDOW_LABEL, "legacy-nest-migrated", ());
             }
 
             // One-time migration for dev builds: copy accumulated knowledge
@@ -512,7 +529,7 @@ pub fn run() {
                     use tauri::Manager;
                     loop {
                         let state = flush_handle.state::<AppState>();
-                        if let Err(e) = managed_agents::persona_events::flush_active_pending_events(
+                        if let Err(e) = managed_agents::persona_events::flush_bound_pending_events(
                             &flush_handle,
                             &state,
                         )
@@ -536,6 +553,12 @@ pub fn run() {
             terminal_runtime::terminal_ack,
             terminal_runtime::terminal_viewport_ready,
             terminal_runtime::terminal_focus,
+            popout::open_popout_window,
+            popout::take_popout_launch,
+            popout::focus_main_window_route,
+            window_relay::bind_window_community,
+            window_relay::open_community_window,
+            window_relay::focus_community_window,
             take_pending_community_deep_link,
             acknowledge_pending_community_deep_link,
             take_pending_navigation_deep_link,
@@ -839,6 +862,14 @@ pub fn run() {
             get_audio_output_device,
             start_pairing,
             start_identity_recovery_pairing,
+            start_host_pairing,
+            get_host_install_info,
+            list_agent_hosts,
+            deploy_to_host,
+            undeploy_from_host,
+            request_host_status,
+            forget_host,
+            ingest_host_telemetry,
             confirm_pairing_sas,
             cancel_pairing,
             apply_workspace,
@@ -949,10 +980,28 @@ pub fn run() {
                                 .is_some_and(|channel_id| label == format!("huddle-{channel_id}"))
                     });
             if is_active_huddle_window {
-                if let Err(error) = app_handle.emit("huddle-companion-returned", ()) {
+                if let Err(error) =
+                    app_handle.emit_to(popout::MAIN_WINDOW_LABEL, "huddle-companion-returned", ())
+                {
                     eprintln!("buzz-desktop: failed to restore huddle drawer: {error}");
                 }
             }
+        }
+        RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::Destroyed,
+            ..
+        } if popout::is_popout_label(&label) => {
+            app_handle.state::<popout::PopoutRegistry>().release(&label);
+            // A pop-out that followed a community window held its binding.
+            window_relay::release_window_relay(&app_handle.state::<AppState>(), &label);
+        }
+        RunEvent::WindowEvent {
+            label,
+            event: WindowEvent::Destroyed,
+            ..
+        } if window_relay::is_community_window_label(&label) => {
+            window_relay::release_window_relay(&app_handle.state::<AppState>(), &label);
         }
         RunEvent::ExitRequested { code, .. } => {
             if is_restart_request(code) {

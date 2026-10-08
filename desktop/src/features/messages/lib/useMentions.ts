@@ -10,7 +10,10 @@ import {
   useChannelsQuery,
 } from "@/features/channels/hooks";
 import { useIsArchivedPredicate } from "@/features/identity-archive/hooks";
-import type { MentionSuggestion } from "@/features/messages/ui/MentionAutocomplete";
+import {
+  isMentionSuggestionDisabled,
+  type MentionSuggestion,
+} from "@/features/messages/ui/MentionAutocomplete";
 import {
   filterCachedAgentSuggestions,
   getAgentIdentityPubkeys,
@@ -62,15 +65,34 @@ import { mapMentionCandidateToSuggestion } from "./mentionSuggestionMapping";
 import { getMentionMemberPubkeys } from "./mentionMemberPubkeys";
 import {
   appendUniqueName,
+  buildMentionAllCandidate,
   buildTeamMentionCandidates,
   formatTeamMention,
   type MentionCandidate,
 } from "./mentionCandidates";
 import { buildMentionCandidates } from "./buildMentionCandidates";
+import {
+  containsMentionAllToken,
+  MENTION_ALL_TOKEN,
+  MENTION_GROUP_ALL,
+} from "@/shared/lib/mentionGroup";
+import {
+  MENTION_ALL_AGENT_DIRECTORY_ERROR,
+  MENTION_ALL_AMBIGUOUS_ERROR,
+  type MentionAllSendResolution,
+  mentionAllSendResolution,
+  resolveMentionAllAudience,
+} from "./mentionAllAudience";
 const MENTION_DEBOUNCE_MS = 120,
   MENTION_SUGGESTION_LIMIT = 50;
 type UseMentionsOptions = {
   channelType?: ChannelType | null;
+  /**
+   * Offer and resolve the `@all` group mention. Only meaningful for a new
+   * stream/forum message: DMs already notify every participant, and an edit
+   * never notifies, so neither enables it.
+   */
+  mentionAll?: boolean;
   recentMentionPubkeys?: readonly string[];
 };
 export function useMentions(
@@ -300,6 +322,19 @@ export function useMentions(
       relayAgentsQuery.data,
     ],
   );
+  const mentionAllEnabled =
+    options?.mentionAll === true &&
+    isAgentMentionChannelType(options?.channelType);
+  const mentionAllAudience = React.useMemo(
+    () =>
+      resolveMentionAllAudience({
+        admittedAgentPubkeys: mentionableAgentPubkeys,
+        agentPubkeys: agentIdentityPubkeys,
+        currentPubkey,
+        members,
+      }),
+    [agentIdentityPubkeys, currentPubkey, members, mentionableAgentPubkeys],
+  );
   const mentionCandidatesWithTeams = React.useMemo(
     () => [
       ...mentionCandidates,
@@ -308,8 +343,17 @@ export function useMentions(
         personasQuery.data ?? [],
         mentionCandidates,
       ),
+      ...(mentionAllEnabled
+        ? [buildMentionAllCandidate(mentionAllAudience)]
+        : []),
     ],
-    [mentionCandidates, personasQuery.data, teamsQuery.data],
+    [
+      mentionAllAudience,
+      mentionAllEnabled,
+      mentionCandidates,
+      personasQuery.data,
+      teamsQuery.data,
+    ],
   );
   const ownerPubkeys = React.useMemo(
     () => [
@@ -331,6 +375,12 @@ export function useMentions(
   const highlightNames = React.useMemo<string[]>(() => {
     const names: string[] = [];
     const seen = new Set<string>();
+    // `@all` resolves from its literal token, so it is highlighted whenever
+    // this composer would actually send it as a group mention.
+    if (mentionAllEnabled && mentionAllAudience.status === "available") {
+      names.push(MENTION_GROUP_ALL);
+      seen.add(MENTION_GROUP_ALL);
+    }
     for (const name of selectedMentionNames) {
       const trimmed = name.trim();
       if (trimmed && !seen.has(trimmed.toLowerCase())) {
@@ -339,7 +389,7 @@ export function useMentions(
       }
     }
     return names;
-  }, [selectedMentionNames]);
+  }, [mentionAllAudience.status, mentionAllEnabled, selectedMentionNames]);
   const agentHighlightNames = React.useMemo<string[]>(() => {
     const names: string[] = [];
     const seen = new Set<string>();
@@ -490,9 +540,26 @@ export function useMentions(
   });
   const insertMention = React.useCallback(
     (suggestion: MentionSuggestion, selectionEnd: number): AutocompleteEdit => {
+      // Disabled (explanatory) entries never reach here: the pointer handler
+      // and `handleMentionKeyDown` refuse them on every selection modality.
       if (debounceTimerRef.current !== null) {
         clearTimeout(debounceTimerRef.current);
         debounceTimerRef.current = null;
+      }
+      if (suggestion.kind === "group") {
+        // The group binds by its reserved literal token, not by a key, so it
+        // writes no label → pubkey entry. Send re-resolves the live roster.
+        mentionPickerOriginRef.current = null;
+        setMentionQuery(null);
+        setSelected(0);
+        const startIndex =
+          flushedMentionStartIndexRef.current ?? mentionStartIndex;
+        flushedMentionStartIndexRef.current = null;
+        return {
+          replaceFromOffset: startIndex,
+          replaceToOffset: selectionEnd,
+          insertText: `${MENTION_ALL_TOKEN} `,
+        };
       }
       const [boundSuggestion] = selectedMentionLabels(
         [suggestion],
@@ -789,6 +856,110 @@ export function useMentions(
       ),
     [activePersonaById, mentionCandidates],
   );
+  const refetchMembers = membersQuery.refetch;
+  /**
+   * Send-time `@all` re-check against a fresh roster (it may have changed
+   * since the picker rendered). Never truncates: an unavailable audience
+   * blocks the send with a visible reason and the caller keeps the draft.
+   */
+  const resolveMentionAllForSend = React.useCallback(
+    async (text: string): Promise<MentionAllSendResolution> => {
+      if (!mentionAllEnabled) return { status: "none" };
+      const competingLabels = mentionMatchCandidates({
+        selectedMentions: mentionMapRef.current,
+        selectedDisplayNames: personaMentionMapRef.current.keys(),
+        memberCandidates: mentionCandidates,
+      }).map((candidate) => candidate.displayName);
+      if (!containsMentionAllToken(text, competingLabels)) {
+        return { status: "none" };
+      }
+      const isAllLabel = (label: string | null | undefined) =>
+        label?.trim().toLowerCase() === MENTION_GROUP_ALL;
+      // A person explicitly picked under the label "all" owns that literal.
+      if (
+        [
+          ...mentionMapRef.current.keys(),
+          ...personaMentionMapRef.current.keys(),
+        ].some(isAllLabel)
+      ) {
+        return { status: "none" };
+      }
+      // A typed `@all` that also names a member is ambiguous, like any other
+      // typed name with two meanings: fail visibly instead of guessing.
+      if (
+        mentionCandidates.some(
+          (candidate) =>
+            candidate.isMember && isAllLabel(candidate.displayName),
+        )
+      ) {
+        return { status: "blocked", message: MENTION_ALL_AMBIGUOUS_ERROR };
+      }
+      let freshMembers: readonly ChannelMember[] | undefined = externalMembers;
+      if (!freshMembers) {
+        try {
+          const result = await refetchMembers();
+          freshMembers = result.status === "success" ? result.data : undefined;
+        } catch {
+          freshMembers = undefined;
+        }
+      }
+      if (!freshMembers || !currentPubkey) {
+        return mentionAllSendResolution({ status: "loading" });
+      }
+      // Recompute agent identity and mention eligibility from fresh evidence:
+      // the roster and the agent directories can both have changed.
+      const agentPubkeys = new Set([
+        ...agentIdentityPubkeys,
+        ...getAgentIdentityPubkeys({
+          managedAgentPubkeys,
+          relayAgents: relayAgentsQuery.data ?? [],
+          members: freshMembers,
+          profileIsAgent: (pubkey) => profiles?.[pubkey]?.isAgent === true,
+        }),
+      ]);
+      let eligiblePubkeys: Set<string>;
+      try {
+        const eligible = await revalidateMentionPubkeys(
+          freshMembers.map((member) => member.pubkey),
+          mentionChannelId,
+          {
+            phase: "publish",
+            intendedAgentPubkeys: [...agentPubkeys],
+            skipIneligibleAgents: true,
+          },
+        );
+        eligiblePubkeys = new Set(eligible.map(normalizePubkey));
+      } catch {
+        return {
+          status: "blocked",
+          message: MENTION_ALL_AGENT_DIRECTORY_ERROR,
+        };
+      }
+      return mentionAllSendResolution(
+        resolveMentionAllAudience({
+          admittedAgentPubkeys: new Set(
+            [...agentPubkeys].filter((pubkey) => eligiblePubkeys.has(pubkey)),
+          ),
+          agentPubkeys,
+          currentPubkey,
+          members: freshMembers,
+        }),
+      );
+    },
+    [
+      agentIdentityPubkeys,
+      currentPubkey,
+      externalMembers,
+      managedAgentPubkeys,
+      mentionAllEnabled,
+      mentionCandidates,
+      mentionChannelId,
+      profiles,
+      refetchMembers,
+      relayAgentsQuery.data,
+      revalidateMentionPubkeys,
+    ],
+  );
   const cancelMentionAutocomplete = React.useCallback(() => {
     autocompleteGenerationRef.current += 1;
     if (debounceTimerRef.current !== null) {
@@ -876,9 +1047,20 @@ export function useMentions(
             profiles,
             requireExact: exactMentionSpace,
           });
-          if (exactMentionSpace && flushed?.type !== "match")
+          if (
+            exactMentionSpace &&
+            (flushed?.type !== "match" ||
+              isMentionSuggestionDisabled(flushed.suggestion))
+          )
             return { handled: false };
           event.preventDefault();
+          if (
+            flushed?.type === "match" &&
+            isMentionSuggestionDisabled(flushed.suggestion)
+          ) {
+            // Keep the picker open so the disabled reason stays visible.
+            return { handled: true };
+          }
           if (flushed?.type === "match") {
             flushedMentionStartIndexRef.current = flushed.startIndex;
             mentionPickerOriginRef.current = "inline";
@@ -891,7 +1073,10 @@ export function useMentions(
           }
         }
         event.preventDefault();
-        return { handled: true, suggestion: suggestions[mentionSelectedIndex] };
+        const selected = suggestions[mentionSelectedIndex];
+        return isMentionSuggestionDisabled(selected)
+          ? { handled: true }
+          : { handled: true, suggestion: selected };
       }
       if (event.key === "Escape") {
         event.preventDefault();
@@ -941,6 +1126,7 @@ export function useMentions(
     mentionStartIndex,
     openMentionPicker,
     registerMentionPubkey,
+    resolveMentionAllForSend,
     restoreDraftMentionRefs,
     settlePendingMentionBindings: pasteBinding.settlePendingMentionBindings,
     suggestions,

@@ -1,5 +1,6 @@
-import type { ManagedAgentBackend } from "@/shared/api/types";
+import type { ManagedAgent } from "@/shared/api/types";
 
+import { HostRunOnSection } from "../hosts/HostRunOnSection";
 import { summarizeRunOn } from "./runOnSummary";
 
 /**
@@ -15,13 +16,24 @@ import { summarizeRunOn } from "./runOnSummary";
  *
  * Named "Run on" (matching the create flow) rather than "Provider" because
  * this dialog already uses "Provider" for the ACP harness selector.
+ *
+ * Exception: an agent on an approved machine can move to another machine
+ * (`HostRunOnSection`), because the machine acknowledges undeploy.
  */
 export function RunOnSummarySection({
-  backend,
+  agent,
 }: {
-  backend: ManagedAgentBackend;
+  agent: Pick<ManagedAgent, "pubkey" | "backend">;
 }) {
-  const summary = summarizeRunOn(backend);
+  const summary = summarizeRunOn(agent.backend);
+  if (summary.location === "host") {
+    return (
+      <HostRunOnSection
+        agentPubkey={agent.pubkey}
+        hostPubkey={summary.hostPubkey}
+      />
+    );
+  }
 
   return (
     <div className="space-y-1.5" data-testid="edit-agent-run-on">

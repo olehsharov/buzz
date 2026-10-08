@@ -1,0 +1,4 @@
+# Prebuilt agent-host artifacts the relay image bundles under /host/
+# (e.g. buzz-aarch64-apple-darwin.tar.gz). Built outside Docker; see Dockerfile.
+*
+!.gitignore

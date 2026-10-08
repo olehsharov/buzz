@@ -1,6 +1,6 @@
 use tauri::State;
 
-use crate::{app_state::AppState, models::ChannelPageCursor, relay::query_relay};
+use crate::{app_state::AppState, models::ChannelPageCursor, relay::query_relay_at};
 
 const TIMELINE_KINDS: [u32; 11] = [
     9,
@@ -41,6 +41,7 @@ pub async fn get_channel_window(
     channel_id: String,
     limit_rows: Option<u32>,
     cursor: Option<ChannelPageCursor>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let filter = build_channel_window_filter(
@@ -48,7 +49,7 @@ pub async fn get_channel_window(
         limit_rows.unwrap_or(50).min(200),
         cursor.as_ref(),
     );
-    Ok(query_relay(&state, &[filter])
+    Ok(query_relay_at(&state, &relay.api_base(), &[filter])
         .await?
         .iter()
         .filter_map(|event| serde_json::to_value(event).ok())

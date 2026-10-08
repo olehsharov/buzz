@@ -1111,6 +1111,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "buzz-core",
+ "buzz-host",
  "buzz-persona",
  "buzz-sdk",
  "buzz-ws-client",
@@ -1131,6 +1132,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "unicode-segmentation",
  "url",
  "uuid",
 ]
@@ -1266,6 +1268,27 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+]
+
+[[package]]
+name = "buzz-host"
+version = "0.1.0"
+dependencies = [
+ "buzz-core",
+ "buzz-sdk",
+ "buzz-ws-client",
+ "clap",
+ "hex",
+ "nostr 0.44.7",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
@@ -9769,7 +9792,9 @@ version = "0.1.0"
 dependencies = [
  "buzz-acp",
  "buzz-agent",
+ "buzz-cli",
  "buzz-dev-mcp",
+ "tokio",
 ]
 
 [[package]]

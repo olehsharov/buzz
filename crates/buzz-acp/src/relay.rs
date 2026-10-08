@@ -731,6 +731,17 @@ impl RelayEventPublisher {
             .map_err(|_| RelayError::ConnectionClosed)
     }
 
+    /// Non-blocking publish for ephemeral frames (stream drafts), like
+    /// [`HarnessRelay::try_publish_event`]: a full command channel drops the
+    /// event instead of stalling the caller.
+    pub fn try_publish_event(&self, event: Event) -> Result<(), RelayError> {
+        self.cmd_tx
+            .try_send(RelayCommand::PublishEvent {
+                event: Box::new(event),
+            })
+            .map_err(|_| RelayError::ConnectionClosed)
+    }
+
     /// Test-only publisher pair: published events are forwarded to the
     /// returned receiver instead of a live relay socket.
     #[cfg(test)]
@@ -1688,8 +1699,9 @@ async fn execute_connected_command(
             // budget the relay already rejected us on.
             //
             // INVARIANT: apart from observer frames (parked above), the WS publish
-            // path carries only ephemeral kinds (typing indicators). The silent
-            // drop-while-gated relies on that invariant. If a future caller
+            // path carries only ephemeral kinds (typing indicators, NIP-SD stream
+            // drafts). The silent drop-while-gated relies on that invariant
+            // (a dropped cumulative draft is healed by the next snapshot). If a future caller
             // publishes durable events through this path, it must extend the
             // kind guard above to avoid silently discarding user data.
             if state.check_rate_gate().is_some() {

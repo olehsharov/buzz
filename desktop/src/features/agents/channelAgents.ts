@@ -202,7 +202,9 @@ export async function attachManagedAgentToChannel(
     // community's (agent, relay) pair, and `startManagedAgent` spawns that same
     // pair — so this ensures the pair the caller is attaching to, never
     // another community's.
-    const isRemote = input.agent.backend.type === "provider";
+    const isRemote =
+      input.agent.backend.type === "provider" ||
+      input.agent.backend.type === "host";
     const needsStart = isRemote
       ? input.agent.status !== "deployed"
       : input.agent.status !== "running" && input.agent.status !== "deployed";

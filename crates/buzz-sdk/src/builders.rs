@@ -12,7 +12,7 @@ use buzz_core::{
         KIND_GIT_STATUS_OPEN, KIND_IA_ARCHIVE_REQUEST, KIND_IA_UNARCHIVE_REQUEST,
         KIND_MODERATION_BAN, KIND_MODERATION_RESOLVE_REPORT, KIND_MODERATION_TIMEOUT,
         KIND_MODERATION_UNBAN, KIND_MODERATION_UNTIMEOUT, KIND_PRESENCE_UPDATE, KIND_PROJECT,
-        KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
+        KIND_STREAM_DRAFT, KIND_USER_STATUS, KIND_WORKFLOW_DEF, KIND_WORKFLOW_TRIGGER,
     },
     observer::{
         content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
@@ -1906,6 +1906,131 @@ pub fn build_presence_update(status: &str) -> Result<EventBuilder, SdkError> {
     }
     let tags = vec![tag(&["status", status])?];
     Ok(EventBuilder::new(Kind::Custom(KIND_PRESENCE_UPDATE as u16), status).tags(tags))
+}
+
+/// Tag name linking NIP-SD draft frames and the final kind:9 reply to one stream.
+pub const STREAM_TAG: &str = "stream";
+/// Maximum byte length of a NIP-SD draft snapshot (matches the kind:9 cap).
+pub const MAX_STREAM_DRAFT_CONTENT_BYTES: usize = 64 * 1024;
+/// Maximum character length of a NIP-SD `label` tag.
+pub const MAX_STREAM_DRAFT_LABEL_CHARS: usize = 80;
+/// Marker appended to a snapshot cut at [`MAX_STREAM_DRAFT_CONTENT_BYTES`].
+const STREAM_TRUNCATION_MARKER: char = '…';
+
+/// Lifecycle status carried by a NIP-SD draft frame's `status` tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StreamDraftStatus {
+    /// The agent is reasoning; reasoning text is never published.
+    Thinking,
+    /// The agent started a tool call (may carry a `label`).
+    Tool,
+    /// The agent is writing reply text; content is the snapshot so far.
+    Writing,
+    /// The stream completed; the durable reply (if any) is a kind:9.
+    Final,
+    /// The stream was discarded (cancelled, errored, or truncated turn).
+    Abandoned,
+}
+
+impl StreamDraftStatus {
+    /// Wire value of the `status` tag.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Thinking => "thinking",
+            Self::Tool => "tool",
+            Self::Writing => "writing",
+            Self::Final => "final",
+            Self::Abandoned => "abandoned",
+        }
+    }
+
+    /// Whether this status ends the stream (`final` or `abandoned`).
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Final | Self::Abandoned)
+    }
+}
+
+/// One NIP-SD draft frame (kind 20003), as passed to [`build_stream_draft`].
+pub struct StreamDraft<'a> {
+    /// Channel the reply is being written into (`h` tag).
+    pub channel_id: Uuid,
+    /// Per-reply stream id (`stream` tag), shared with the final kind:9.
+    pub stream_id: Uuid,
+    /// Frame sequence number (`seq` tag), monotonic per stream, starting at 1.
+    pub seq: u64,
+    /// Frame status (`status` tag).
+    pub status: StreamDraftStatus,
+    /// Thread the reply targets, if any. Emits the same NIP-10 `e` tags a
+    /// kind:9 reply to that thread carries.
+    pub thread_ref: Option<&'a ThreadRef>,
+    /// Short tool title (`label` tag); only valid with [`StreamDraftStatus::Tool`].
+    /// Trimmed and cut to [`MAX_STREAM_DRAFT_LABEL_CHARS`] characters.
+    pub label: Option<&'a str>,
+    /// Cumulative markdown snapshot of the reply so far. Must be empty for
+    /// terminal statuses and at most [`MAX_STREAM_DRAFT_CONTENT_BYTES`]; use
+    /// [`truncate_stream_content`] first.
+    pub content: &'a str,
+}
+
+/// Cut `content` to fit [`MAX_STREAM_DRAFT_CONTENT_BYTES`], appending `…` when
+/// anything was dropped. Never splits a UTF-8 character.
+pub fn truncate_stream_content(content: &str) -> std::borrow::Cow<'_, str> {
+    if content.len() <= MAX_STREAM_DRAFT_CONTENT_BYTES {
+        return std::borrow::Cow::Borrowed(content);
+    }
+    let mut end = MAX_STREAM_DRAFT_CONTENT_BYTES - STREAM_TRUNCATION_MARKER.len_utf8();
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = String::with_capacity(end + STREAM_TRUNCATION_MARKER.len_utf8());
+    out.push_str(&content[..end]);
+    out.push(STREAM_TRUNCATION_MARKER);
+    std::borrow::Cow::Owned(out)
+}
+
+/// The `["stream", <uuid>]` tag tying a final kind:9 reply to its draft stream.
+pub fn stream_tag(stream_id: Uuid) -> Result<Tag, SdkError> {
+    tag(&[STREAM_TAG, &stream_id.to_string()])
+}
+
+/// Build a NIP-SD live reply draft frame (kind 20003, ephemeral).
+///
+/// Tags: `h`, `stream`, `seq`, optional NIP-10 thread `e` tags, `status`, and
+/// an optional `label` for tool frames. Content is the cumulative snapshot.
+pub fn build_stream_draft(draft: &StreamDraft<'_>) -> Result<EventBuilder, SdkError> {
+    if draft.seq == 0 {
+        return Err(SdkError::InvalidInput(
+            "stream draft seq starts at 1".into(),
+        ));
+    }
+    check_content(draft.content, MAX_STREAM_DRAFT_CONTENT_BYTES)?;
+    if draft.status.is_terminal() && !draft.content.is_empty() {
+        return Err(SdkError::InvalidInput(format!(
+            "stream draft status {} must carry empty content",
+            draft.status.as_str()
+        )));
+    }
+    let label = draft.label.map(str::trim).filter(|l| !l.is_empty());
+    if label.is_some() && draft.status != StreamDraftStatus::Tool {
+        return Err(SdkError::InvalidInput(
+            "stream draft label is only valid with status tool".into(),
+        ));
+    }
+
+    let mut tags = vec![
+        tag(&["h", &draft.channel_id.to_string()])?,
+        stream_tag(draft.stream_id)?,
+        tag(&["seq", &draft.seq.to_string()])?,
+    ];
+    if let Some(thread_ref) = draft.thread_ref {
+        thread_tags(thread_ref, &mut tags)?;
+    }
+    tags.push(tag(&["status", draft.status.as_str()])?);
+    if let Some(label) = label {
+        let label: String = label.chars().take(MAX_STREAM_DRAFT_LABEL_CHARS).collect();
+        tags.push(tag(&["label", &label])?);
+    }
+    Ok(EventBuilder::new(Kind::Custom(KIND_STREAM_DRAFT as u16), draft.content).tags(tags))
 }
 
 /// Build a NIP-38 user status event (kind 30315) on the `d:general` coordinate.
@@ -4594,6 +4719,204 @@ mod tests {
     fn dm_add_member_rejects_bad_pubkey() {
         let err = build_dm_add_member(uuid(), "short").unwrap_err();
         assert!(matches!(err, SdkError::InvalidInput(_)));
+    }
+
+    fn draft<'a>(
+        channel_id: Uuid,
+        stream_id: Uuid,
+        seq: u64,
+        status: StreamDraftStatus,
+        label: Option<&'a str>,
+        content: &'a str,
+    ) -> StreamDraft<'a> {
+        StreamDraft {
+            channel_id,
+            stream_id,
+            seq,
+            status,
+            thread_ref: None,
+            label,
+            content,
+        }
+    }
+
+    fn e_tags(event: &nostr::Event) -> Vec<Vec<String>> {
+        event
+            .tags
+            .iter()
+            .map(|t| t.as_slice().to_vec())
+            .filter(|t| t.first().map(String::as_str) == Some("e"))
+            .collect()
+    }
+
+    #[test]
+    fn stream_draft_shape_top_level() {
+        let (cid, sid) = (uuid(), uuid());
+        let ev = sign(
+            build_stream_draft(&draft(
+                cid,
+                sid,
+                3,
+                StreamDraftStatus::Writing,
+                None,
+                "Hello **wor",
+            ))
+            .unwrap(),
+        );
+        assert_eq!(ev.kind.as_u16() as u32, KIND_STREAM_DRAFT);
+        assert_eq!(ev.content, "Hello **wor");
+        assert_eq!(tag_values(&ev, "h"), vec![cid.to_string()]);
+        assert_eq!(tag_values(&ev, "stream"), vec![sid.to_string()]);
+        assert_eq!(tag_values(&ev, "seq"), vec!["3".to_string()]);
+        assert_eq!(tag_values(&ev, "status"), vec!["writing".to_string()]);
+        assert!(e_tags(&ev).is_empty());
+        assert!(tag_values(&ev, "label").is_empty());
+    }
+
+    #[test]
+    fn stream_draft_thread_tags_match_reply_shape() {
+        let (root, parent) = (event_id(), event_id());
+        let nested = ThreadRef {
+            root_event_id: root,
+            parent_event_id: parent,
+        };
+        let mut frame = draft(uuid(), uuid(), 1, StreamDraftStatus::Thinking, None, "");
+        frame.thread_ref = Some(&nested);
+        let ev = sign(build_stream_draft(&frame).unwrap());
+        let s = |v: &str| v.to_string();
+        assert_eq!(
+            e_tags(&ev),
+            vec![
+                vec![s("e"), root.to_hex(), s(""), s("root")],
+                vec![s("e"), parent.to_hex(), s(""), s("reply")],
+            ]
+        );
+
+        let direct = ThreadRef {
+            root_event_id: root,
+            parent_event_id: root,
+        };
+        frame.thread_ref = Some(&direct);
+        let ev = sign(build_stream_draft(&frame).unwrap());
+        assert_eq!(
+            e_tags(&ev),
+            vec![vec![s("e"), root.to_hex(), s(""), s("reply")]],
+            "a direct reply carries only the reply marker, like a kind:9 reply"
+        );
+    }
+
+    #[test]
+    fn stream_draft_tool_label_is_trimmed_and_capped() {
+        let long = format!("  {}  ", "é".repeat(200));
+        let ev = sign(
+            build_stream_draft(&draft(
+                uuid(),
+                uuid(),
+                2,
+                StreamDraftStatus::Tool,
+                Some(&long),
+                "",
+            ))
+            .unwrap(),
+        );
+        let labels = tag_values(&ev, "label");
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].chars().count(), MAX_STREAM_DRAFT_LABEL_CHARS);
+        assert!(labels[0].chars().all(|c| c == 'é'));
+        assert_eq!(tag_values(&ev, "status"), vec!["tool".to_string()]);
+
+        // A blank label is omitted rather than emitted empty.
+        let ev = sign(
+            build_stream_draft(&draft(
+                uuid(),
+                uuid(),
+                2,
+                StreamDraftStatus::Tool,
+                Some("   "),
+                "",
+            ))
+            .unwrap(),
+        );
+        assert!(tag_values(&ev, "label").is_empty());
+    }
+
+    #[test]
+    fn stream_draft_rejects_invalid_frames() {
+        let (cid, sid) = (uuid(), uuid());
+        assert!(matches!(
+            build_stream_draft(&draft(cid, sid, 0, StreamDraftStatus::Writing, None, "x")),
+            Err(SdkError::InvalidInput(_))
+        ));
+        for terminal in [StreamDraftStatus::Final, StreamDraftStatus::Abandoned] {
+            assert!(matches!(
+                build_stream_draft(&draft(cid, sid, 9, terminal, None, "leftover")),
+                Err(SdkError::InvalidInput(_))
+            ));
+            let ev = sign(build_stream_draft(&draft(cid, sid, 9, terminal, None, "")).unwrap());
+            assert_eq!(
+                tag_values(&ev, "status"),
+                vec![terminal.as_str().to_string()]
+            );
+        }
+        assert!(matches!(
+            build_stream_draft(&draft(
+                cid,
+                sid,
+                1,
+                StreamDraftStatus::Writing,
+                Some("shell"),
+                "x"
+            )),
+            Err(SdkError::InvalidInput(_))
+        ));
+        let oversized = "a".repeat(MAX_STREAM_DRAFT_CONTENT_BYTES + 1);
+        assert!(matches!(
+            build_stream_draft(&draft(
+                cid,
+                sid,
+                1,
+                StreamDraftStatus::Writing,
+                None,
+                &oversized
+            )),
+            Err(SdkError::ContentTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn truncate_stream_content_caps_bytes_on_char_boundary() {
+        assert!(matches!(
+            truncate_stream_content("short"),
+            std::borrow::Cow::Borrowed("short")
+        ));
+        let exact = "a".repeat(MAX_STREAM_DRAFT_CONTENT_BYTES);
+        assert_eq!(truncate_stream_content(&exact), exact.as_str());
+
+        // Multi-byte characters straddling the cut must not be split.
+        let long = "€".repeat(MAX_STREAM_DRAFT_CONTENT_BYTES);
+        let cut = truncate_stream_content(&long);
+        assert!(cut.len() <= MAX_STREAM_DRAFT_CONTENT_BYTES);
+        assert!(cut.ends_with('…'));
+        assert!(cut.trim_end_matches('…').chars().all(|c| c == '€'));
+        // The truncated snapshot is always accepted by the builder and by
+        // the kind:9 builder used for the final post.
+        assert!(build_stream_draft(&draft(
+            uuid(),
+            uuid(),
+            1,
+            StreamDraftStatus::Writing,
+            None,
+            &cut
+        ))
+        .is_ok());
+        assert!(build_message(uuid(), &cut, None, &[], false, &[], &[]).is_ok());
+    }
+
+    #[test]
+    fn stream_tag_shape() {
+        let sid = uuid();
+        let t = stream_tag(sid).unwrap();
+        assert_eq!(t.as_slice(), &["stream".to_string(), sid.to_string()]);
     }
 
     #[test]

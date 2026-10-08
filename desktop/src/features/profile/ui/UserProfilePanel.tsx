@@ -27,9 +27,11 @@ import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
 import { AddAgentToChannelDialog } from "@/features/agents/ui/AddAgentToChannelDialog";
 import {
   availableRuntimesForStart,
+  type BackendIntent,
   buildInstanceInputForDefinition,
   resolveStartRuntimeForDefinition,
 } from "@/features/agents/lib/instanceInputForDefinition";
+import type { AgentDefinitionSubmitOptions } from "@/features/agents/ui/AgentDefinitionDialog";
 import { describeLogFile } from "@/features/agents/ui/agentUi";
 import { useAgentLifecycleActions } from "@/features/profile/ui/useAgentLifecycleActions";
 import {
@@ -419,7 +421,10 @@ export function UserProfilePanel({
     });
 
   const createManagedAgentForPersona = React.useCallback(
-    async (personaToStart: AgentPersona) => {
+    async (
+      personaToStart: AgentPersona,
+      backendIntent?: BackendIntent | null,
+    ) => {
       const runtimes = await availableRuntimesForStart(availableRuntimesQuery);
       const { runtime, warnings } = resolveStartRuntimeForDefinition(
         personaToStart,
@@ -434,6 +439,8 @@ export function UserProfilePanel({
       const input = await buildInstanceInputForDefinition(
         personaToStart,
         runtime,
+        undefined,
+        backendIntent ?? undefined,
       );
 
       const created = await createAgentMutation.mutateAsync(input);
@@ -521,8 +528,12 @@ export function UserProfilePanel({
   }, [deleteManagedAgentRecord, managedAgent, onClose]);
 
   const handleSubmitPersona = React.useCallback(
-    async (input: CreatePersonaInput | UpdatePersonaInput) => {
+    async (
+      input: CreatePersonaInput | UpdatePersonaInput,
+      options?: AgentDefinitionSubmitOptions,
+    ) => {
       await submitProfilePersonaDialog({
+        backendIntent: options?.backendIntent,
         createManagedAgentForPersona,
         createPersona: createPersonaMutation.mutateAsync,
         input,

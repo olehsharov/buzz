@@ -209,9 +209,10 @@ pub use sharing::set_team_shared;
 pub(crate) fn refresh_team_catalog_heads_for_persona<R: tauri::Runtime>(
     app: &AppHandle<R>,
     state: &AppState,
+    community_relay: &str,
     persona_id: &str,
 ) {
-    pending::refresh_shared_team_catalog_heads_for_persona(app, state, persona_id);
+    pending::refresh_shared_team_catalog_heads_for_persona(app, state, community_relay, persona_id);
 }
 
 /// Refresh (or retract) one team's shared 30178 catalog head after an inbound
@@ -224,10 +225,17 @@ pub(crate) fn refresh_team_catalog_heads_for_persona<R: tauri::Runtime>(
 pub(crate) fn refresh_team_catalog_head<R: tauri::Runtime>(
     app: &AppHandle<R>,
     state: &AppState,
+    community_relay: &str,
     team: &TeamRecord,
     personas: &[AgentDefinition],
 ) {
-    pending::refresh_shared_team_catalog_head_resolving(app, state, team, personas);
+    pending::refresh_shared_team_catalog_head_resolving(
+        app,
+        state,
+        community_relay,
+        team,
+        personas,
+    );
 }
 
 /// Purge and tombstone a team's 30178 catalog coordinate after an inbound
@@ -239,9 +247,10 @@ pub(crate) fn refresh_team_catalog_head<R: tauri::Runtime>(
 pub(crate) fn tombstone_team_catalog_head<R: tauri::Runtime>(
     app: &AppHandle<R>,
     state: &AppState,
+    community_relay: &str,
     d_tag: &str,
 ) {
-    pending::tombstone_team_catalog_pending(app, state, d_tag);
+    pending::tombstone_team_catalog_pending(app, state, community_relay, d_tag);
 }
 
 /// Retain a freshly authored team event in the local store, flagged for relay
@@ -256,9 +265,15 @@ pub(crate) fn tombstone_team_catalog_head<R: tauri::Runtime>(
 /// Unlike `retain_managed_agent_pending`, no projection-equality short-circuit:
 /// teams have no start/stop runtime churn, so a republish only happens on an
 /// actual user edit.
-pub(super) fn retain_team_pending(app: &AppHandle, state: &AppState, team: &TeamRecord) {
+pub(super) fn retain_team_pending(
+    app: &AppHandle,
+    state: &AppState,
+    community_relay: &str,
+    team: &TeamRecord,
+) {
     let result = (|| -> Result<(), String> {
-        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+        let scope =
+            crate::managed_agents::retention::retention_scope_for(app, state, community_relay)?;
         retain_team_pending_at(&scope, team)
     })();
     if let Err(e) = result {
@@ -321,9 +336,10 @@ pub(super) fn retain_team_pending_at(
 /// the head's `created_at` read before the purge — so a future-dated head cannot
 /// survive its own tombstone. Without a head, fall back to
 /// `monotonic_created_at(None)`.
-fn tombstone_team_pending(app: &AppHandle, state: &AppState, d_tag: &str) {
+fn tombstone_team_pending(app: &AppHandle, state: &AppState, community_relay: &str, d_tag: &str) {
     let result = (|| -> Result<(), String> {
-        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+        let scope =
+            crate::managed_agents::retention::retention_scope_for(app, state, community_relay)?;
         tombstone_team_at(&scope.db_path, &scope.owner_keys, d_tag)
     })();
     if let Err(e) = result {
@@ -401,7 +417,10 @@ pub(crate) fn tombstone_team_at(
 }
 
 #[tauri::command]
-pub async fn list_teams(app: AppHandle) -> Result<Vec<TeamRecord>, String> {
+pub async fn list_teams(
+    app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
+) -> Result<Vec<TeamRecord>, String> {
     use tauri::Manager;
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -410,7 +429,7 @@ pub async fn list_teams(app: AppHandle) -> Result<Vec<TeamRecord>, String> {
             .lock()
             .map_err(|error| error.to_string())?;
         let mut teams = load_teams(&app)?;
-        pending::project_active_team_sharing(&app, &state, &mut teams);
+        pending::project_active_team_sharing(&app, &state, relay.ws_url(), &mut teams);
         Ok(teams)
     })
     .await
@@ -418,7 +437,11 @@ pub async fn list_teams(app: AppHandle) -> Result<Vec<TeamRecord>, String> {
 }
 
 #[tauri::command]
-pub async fn create_team(input: CreateTeamRequest, app: AppHandle) -> Result<TeamRecord, String> {
+pub async fn create_team(
+    input: CreateTeamRequest,
+    app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
+) -> Result<TeamRecord, String> {
     use tauri::Manager;
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -460,7 +483,7 @@ pub async fn create_team(input: CreateTeamRequest, app: AppHandle) -> Result<Tea
             |records| save_managed_agents(&app, records),
         )?;
         // Created teams are always non-builtin; publish to the relay.
-        retain_team_pending(&app, &state, &team);
+        retain_team_pending(&app, &state, relay.ws_url(), &team);
         Ok(team)
     })
     .await
@@ -468,7 +491,11 @@ pub async fn create_team(input: CreateTeamRequest, app: AppHandle) -> Result<Tea
 }
 
 #[tauri::command]
-pub async fn update_team(input: UpdateTeamRequest, app: AppHandle) -> Result<TeamRecord, String> {
+pub async fn update_team(
+    input: UpdateTeamRequest,
+    app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
+) -> Result<TeamRecord, String> {
     use tauri::Manager;
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -483,7 +510,7 @@ pub async fn update_team(input: UpdateTeamRequest, app: AppHandle) -> Result<Tea
         let personas = load_personas(&app)?;
         ensure_persona_ids_are_active(&personas, &input.persona_ids)?;
         let mut teams = load_teams(&app)?;
-        pending::project_active_team_sharing(&app, &state, &mut teams);
+        pending::project_active_team_sharing(&app, &state, relay.ws_url(), &mut teams);
         let updated = commit_team_update(
             &mut teams,
             &input.id,
@@ -498,13 +525,19 @@ pub async fn update_team(input: UpdateTeamRequest, app: AppHandle) -> Result<Tea
         )?;
         // Built-in teams are not owner-authored — never publish them.
         if !updated.is_builtin {
-            retain_team_pending(&app, &state, &updated);
+            retain_team_pending(&app, &state, relay.ws_url(), &updated);
             // Reproject the shared 30178 head immediately so the catalog
             // reflects the edit. Resolution failure (a member was deleted
             // mid-edit) is treated as a projection failure — the shared head
             // is tombstoned and the owner is notified via a typed notice.
             // Best-effort: a retention hiccup never blocks the team edit.
-            pending::refresh_shared_team_catalog_head_resolving(&app, &state, &updated, &personas);
+            pending::refresh_shared_team_catalog_head_resolving(
+                &app,
+                &state,
+                relay.ws_url(),
+                &updated,
+                &personas,
+            );
         }
         Ok(updated)
     })
@@ -513,7 +546,11 @@ pub async fn update_team(input: UpdateTeamRequest, app: AppHandle) -> Result<Tea
 }
 
 #[tauri::command]
-pub async fn delete_team(id: String, app: AppHandle) -> Result<(), String> {
+pub async fn delete_team(
+    id: String,
+    app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
+) -> Result<(), String> {
     use tauri::Manager;
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -525,16 +562,16 @@ pub async fn delete_team(id: String, app: AppHandle) -> Result<(), String> {
         // delete_team_with_cascade rejects built-in teams via validate_team_deletion,
         // so reaching here means this team was owner-published — tombstone it. The
         // d_tag is the team id, captured before the record left the store.
-        tombstone_team_pending(&app, &state, &id);
+        tombstone_team_pending(&app, &state, relay.ws_url(), &id);
         // The catalog projection is a separate coordinate with its own
         // retained head, so the 30176 tombstone above does not retract it.
         // Without this, deleting a shared team would leave a live catalog
         // entry the owner can no longer see or unshare.
-        pending::tombstone_team_catalog_pending(&app, &state, &id);
+        pending::tombstone_team_catalog_pending(&app, &state, relay.ws_url(), &id);
         // Tombstone the cascaded personas too, so their orphaned kind:30175 heads
         // don't linger on the relay (F4). Each d-tag was captured pre-removal.
         for persona_d_tag in &cascaded_persona_d_tags {
-            super::personas::tombstone_persona_pending(&app, &state, persona_d_tag);
+            super::personas::tombstone_persona_pending(&app, &state, relay.ws_url(), persona_d_tag);
         }
         try_regenerate_nest(&app);
         Ok(())

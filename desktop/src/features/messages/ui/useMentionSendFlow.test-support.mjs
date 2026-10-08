@@ -247,6 +247,8 @@ export async function setup({ lifecycle = false } = {}) {
       memberPubkeys: new Set(),
       hasResolvedMembers: true,
       settlePendingMentionBindings: async () => {},
+      resolveMentionAllForSend: async () =>
+        control.mentionAll ?? { status: "none" },
       extractMentionPersonas: () => [],
       extractMentionPubkeys: () => [KEY],
       isAgentPubkey: (key) => key === KEY,

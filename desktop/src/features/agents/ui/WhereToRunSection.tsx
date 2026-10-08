@@ -2,17 +2,26 @@ import { AlertTriangle } from "lucide-react";
 import * as React from "react";
 
 import { useBackendProvidersQuery } from "@/features/agents/hooks";
+import { AddMachineDialog } from "@/features/agents/hosts/AddMachineDialog";
+import { buildHostRunOnOptions } from "@/features/agents/hosts/hostRunOptions";
+import { useAgentHostsWithPresence } from "@/features/agents/hosts/useAgentHosts";
 import { probeBackendProvider } from "@/shared/api/tauri";
+import { normalizePubkey } from "@/shared/lib/pubkey";
 
 import { ProviderConfigFields } from "./ProviderConfigFields";
 import { PersonaDropdownField } from "./PersonaDropdownField";
 import {
   applyProbeResult,
   emptyWhereToRunDraft,
+  hostPubkeyFromRunOn,
   type WhereToRunDraft,
 } from "./whereToRunIntent";
 
-/** Optional remote-backend selector. Buzz shared compute is an LLM provider, not a run destination. */
+/**
+ * "Where to run": this computer, the user's approved machines (with
+ * presence; offline ones listed but disabled), then provider scripts.
+ * Buzz shared compute is an LLM provider, not a run destination.
+ */
 export function WhereToRunSection({
   draft,
   isPending,
@@ -23,18 +32,28 @@ export function WhereToRunSection({
   onDraftChange: (next: WhereToRunDraft) => void;
 }) {
   const backendProviders = useBackendProvidersQuery().data ?? [];
+  const { hosts, presence, presenceLoaded } = useAgentHostsWithPresence();
+  const [addMachineOpen, setAddMachineOpen] = React.useState(false);
   const [probeError, setProbeError] = React.useState<string | null>(null);
   const runOnOptions = React.useMemo(
     () => [
       { label: "This computer", value: "local" },
+      ...buildHostRunOnOptions(hosts, presence, presenceLoaded, Date.now()),
       ...backendProviders.map((provider) => ({
         label: provider.id,
         value: provider.id,
       })),
     ],
-    [backendProviders],
+    [backendProviders, hosts, presence, presenceLoaded],
   );
-  const isProviderMode = draft.runOn !== "local";
+  const selectedHostPubkey = hostPubkeyFromRunOn(draft.runOn);
+  const selectedHost = selectedHostPubkey
+    ? (hosts.find(
+        (host) =>
+          normalizePubkey(host.pubkey) === normalizePubkey(selectedHostPubkey),
+      ) ?? null)
+    : null;
+  const isProviderMode = draft.runOn !== "local" && !selectedHostPubkey;
   const selectedBackendProvider = React.useMemo(
     () =>
       backendProviders.find((provider) => provider.id === draft.runOn) ?? null,
@@ -83,8 +102,6 @@ export function WhereToRunSection({
     };
   }, [selectedBinaryPath, draft.probedProvider]);
 
-  if (backendProviders.length === 0) return null;
-
   return (
     <div className="space-y-4">
       <div className="space-y-1.5">
@@ -100,11 +117,34 @@ export function WhereToRunSection({
               runOn,
             })
           }
+          footerAction={{
+            label: "Add machine…",
+            onSelect: () => setAddMachineOpen(true),
+            testId: "where-to-run-add-machine",
+          }}
           options={runOnOptions}
           placeholder="Choose where to run"
           value={draft.runOn}
         />
       </div>
+      <AddMachineDialog
+        onOpenChange={setAddMachineOpen}
+        open={addMachineOpen}
+      />
+
+      {selectedHost ? (
+        <p
+          className="rounded-2xl border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground"
+          data-testid="where-to-run-host-note"
+        >
+          Runs on{" "}
+          <span className="font-medium text-foreground">
+            {selectedHost.name}
+          </span>
+          . Buzz sends this agent&apos;s key to that machine, encrypted, when it
+          deploys, and waits for the machine to confirm.
+        </p>
+      ) : null}
 
       {isProviderMode && selectedBackendProvider ? (
         <div className="space-y-4">

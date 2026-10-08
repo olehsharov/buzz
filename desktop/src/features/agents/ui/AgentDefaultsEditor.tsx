@@ -1,8 +1,8 @@
 /**
- * Settings card for global agent configuration defaults.
+ * Settings card for a community's agent configuration defaults.
  *
- * Lets the user set env vars, provider, and model that apply to ALL local
- * agents as the lowest-precedence user layer. Per-agent and persona configs
+ * Lets the user set env vars, provider, and model that apply to the agents of
+ * this window's community as the lowest-precedence user layer. Per-agent and persona configs
  * always win on collision.
  *
  * Precedence: baked floor < GLOBAL (this card) < persona < per-agent.

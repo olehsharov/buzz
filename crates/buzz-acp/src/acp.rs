@@ -120,14 +120,54 @@ pub enum AcpError {
 /// Build an [`AcpError::AgentError`] from a JSON-RPC error object,
 /// preserving the numeric code. When the `message` field is missing or
 /// non-string, fall back to the full JSON object so provider-specific
-/// detail (e.g. a `data` field) is not lost.
+/// detail (e.g. a `data` field) is not lost. When both are present, the
+/// `data` detail is appended to the message: ACP SDK adapters report every
+/// uncaught exception as a bare `-32603 "Internal error"` and carry the real
+/// cause only in `data.details` (e.g. `Session <id> not found in project
+/// directory for <cwd>`).
 fn agent_error_from_json(error: &serde_json::Value) -> AcpError {
     let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-32000);
     let message = match error.get("message").and_then(|m| m.as_str()) {
-        Some(m) => m.to_string(),
+        Some(m) => match error.get("data").and_then(agent_error_data_detail) {
+            Some(detail) if !m.contains(&detail) => format!("{m}: {detail}"),
+            _ => m.to_string(),
+        },
         None => error.to_string(),
     };
     AcpError::AgentError { code, message }
+}
+
+/// Upper bound on the `data` detail appended to an agent error message; the
+/// message is logged, persisted and posted to the channel.
+const AGENT_ERROR_DETAIL_MAX_CHARS: usize = 1000;
+
+/// Human-readable detail from a JSON-RPC error `data` value: its `details`
+/// (ACP SDK) or `message` string when present, else the compact JSON. Empty
+/// values yield `None`; long values are truncated.
+fn agent_error_data_detail(data: &serde_json::Value) -> Option<String> {
+    let detail = match data {
+        serde_json::Value::Null => return None,
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Object(map) if map.is_empty() => return None,
+        serde_json::Value::Object(map) => match ["details", "message"]
+            .iter()
+            .find_map(|key| map.get(*key).and_then(|v| v.as_str()))
+        {
+            Some(s) => s.to_string(),
+            None => data.to_string(),
+        },
+        other => other.to_string(),
+    };
+    let detail = detail.trim();
+    if detail.is_empty() {
+        return None;
+    }
+    let mut chars = detail.chars();
+    let mut bounded: String = chars.by_ref().take(AGENT_ERROR_DETAIL_MAX_CHARS).collect();
+    if chars.next().is_some() {
+        bounded.push('…');
+    }
+    Some(bounded)
 }
 
 fn build_initialize_params() -> serde_json::Value {
@@ -207,6 +247,12 @@ pub struct AcpClient {
     /// a JSON-RPC *success*, not `-32601` — which the main loop would read as
     /// a delivered steer and drop the user's message from the queue.
     steering_supported: bool,
+    /// True when the agent advertised both `sessionCapabilities.fork` and
+    /// `sessionCapabilities.resume` in its `initialize` response. Gates
+    /// [`session_fork`](Self::session_fork) for `BUZZ_ACP_RESUME_SESSION`.
+    fork_resume_supported: bool,
+    /// Whether `initialize` advertised `sessionCapabilities.resume`.
+    resume_supported: bool,
     /// Per-turn channel for receiving goose-native non-cancelling steer
     /// requests from the main loop. Installed by
     /// [`install_steer_rx`](Self::install_steer_rx) at dispatch and
@@ -215,6 +261,9 @@ pub struct AcpClient {
     /// outside of a goose-native turn — the read loop's steer arm is
     /// disabled in that case.
     steer_rx: Option<tokio::sync::mpsc::Receiver<crate::pool::SteerRequest>>,
+    /// Live reply draft sink for the current turn (NIP-SD). Fed synchronously
+    /// from `session/update` notifications; `None` when streaming is off.
+    stream_sink: Option<std::sync::Arc<crate::stream_draft::StreamSink>>,
     /// Usage tracker for goose/buzz-agent's cumulative notification format.
     goose_usage: UsageTracker,
     /// Per-turn prompt-response usage and Claude's optional cumulative cost.
@@ -629,7 +678,10 @@ impl AcpClient {
             observer_context: ObserverContext::default(),
             active_run_id: None,
             steering_supported: false,
+            fork_resume_supported: false,
+            resume_supported: false,
             steer_rx: None,
+            stream_sink: None,
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
             standard_adapter,
@@ -688,6 +740,14 @@ impl AcpClient {
             .pointer("/_meta/steering/supported")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        self.resume_supported = result
+            .pointer("/agentCapabilities/sessionCapabilities/resume")
+            .is_some_and(|v| !v.is_null());
+        self.fork_resume_supported = ["fork", "resume"].iter().all(|cap| {
+            result
+                .pointer(&format!("/agentCapabilities/sessionCapabilities/{cap}"))
+                .is_some_and(|v| !v.is_null())
+        });
         tracing::debug!(target: "acp::init", "initialize response: {result}");
         Ok(result)
     }
@@ -729,6 +789,77 @@ impl AcpClient {
         system_prompt: Option<SystemPromptTransport<'_>>,
         session_title: Option<&str>,
     ) -> Result<SessionNewResponse, AcpError> {
+        let params = self.session_setup_params(cwd, mcp_servers, system_prompt, session_title);
+        let result = self.send_request("session/new", params).await?;
+        let session_id = result["sessionId"]
+            .as_str()
+            .ok_or_else(|| AcpError::Protocol("session/new response missing sessionId".into()))?
+            .to_owned();
+        tracing::info!(target: "acp::session", "session created: {session_id}");
+        Ok(SessionNewResponse {
+            session_id,
+            raw: result,
+        })
+    }
+
+    /// Send `session/fork` for an existing provider session and return the new
+    /// session's ID. The adapter copies the source history into a new session;
+    /// the source is left untouched. The fork is not live until resumed with
+    /// [`session_resume_full`](Self::session_resume_full).
+    pub async fn session_fork(
+        &mut self,
+        source_session_id: &str,
+        cwd: &str,
+    ) -> Result<String, AcpError> {
+        let params = serde_json::json!({
+            "sessionId": source_session_id,
+            "cwd": cwd,
+            "mcpServers": [],
+        });
+        let result = self.send_request("session/fork", params).await?;
+        let session_id = result["sessionId"]
+            .as_str()
+            .ok_or_else(|| AcpError::Protocol("session/fork response missing sessionId".into()))?
+            .to_owned();
+        tracing::info!(target: "acp::session", "session forked: {source_session_id} -> {session_id}");
+        Ok(session_id)
+    }
+
+    /// Send `session/resume` for `session_id` with the same setup parameters
+    /// as [`session_new_full`](Self::session_new_full), so the resumed session
+    /// gets the harness system prompt, MCP servers, and title.
+    pub async fn session_resume_full(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        mcp_servers: Vec<McpServer>,
+        system_prompt: Option<SystemPromptTransport<'_>>,
+        session_title: Option<&str>,
+    ) -> Result<SessionNewResponse, AcpError> {
+        let mut params = self.session_setup_params(cwd, mcp_servers, system_prompt, session_title);
+        params["sessionId"] = serde_json::Value::String(session_id.to_owned());
+        let result = self.send_request("session/resume", params).await?;
+        // The resume response may omit `sessionId`; the requested ID is the
+        // session that is now live.
+        let session_id = result["sessionId"]
+            .as_str()
+            .unwrap_or(session_id)
+            .to_owned();
+        tracing::info!(target: "acp::session", "session resumed: {session_id}");
+        Ok(SessionNewResponse {
+            session_id,
+            raw: result,
+        })
+    }
+
+    /// Build the shared `session/new` / `session/resume` parameter object.
+    fn session_setup_params(
+        &self,
+        cwd: &str,
+        mcp_servers: Vec<McpServer>,
+        system_prompt: Option<SystemPromptTransport<'_>>,
+        session_title: Option<&str>,
+    ) -> serde_json::Value {
         let mut params = serde_json::json!({
             "cwd": cwd,
             "mcpServers": mcp_servers,
@@ -755,16 +886,7 @@ impl AcpClient {
             params["_meta"]["claudeCode"]["options"]["extraArgs"]["thinking-display"] =
                 serde_json::Value::String("summarized".to_owned());
         }
-        let result = self.send_request("session/new", params).await?;
-        let session_id = result["sessionId"]
-            .as_str()
-            .ok_or_else(|| AcpError::Protocol("session/new response missing sessionId".into()))?
-            .to_owned();
-        tracing::info!(target: "acp::session", "session created: {session_id}");
-        Ok(SessionNewResponse {
-            session_id,
-            raw: result,
-        })
+        params
     }
 
     /// Send `session/new` and return only the `sessionId` string.
@@ -963,6 +1085,18 @@ impl AcpClient {
         self.steering_supported
     }
 
+    /// Whether the agent advertised `sessionCapabilities.fork` and `.resume`
+    /// at `initialize` time.
+    pub fn fork_resume_supported(&self) -> bool {
+        self.fork_resume_supported
+    }
+
+    /// Whether the agent advertised `sessionCapabilities.resume` at
+    /// `initialize` time.
+    pub fn resume_supported(&self) -> bool {
+        self.resume_supported
+    }
+
     /// Consume per-turn usage for NIP-AM publishing. Goose/buzz-agent is an
     /// exclusive cumulative path; standard ACP prompt usage is used only when
     /// goose emitted nothing for this turn.
@@ -1013,6 +1147,25 @@ impl AcpClient {
     /// Idempotent — safe to call when `steer_rx` is already `None`.
     pub fn clear_steer_rx(&mut self) {
         self.steer_rx = None;
+    }
+
+    /// Route this turn's `session/update` text, thought, and tool events to a
+    /// reply draft sink. Replaces any previous sink.
+    pub fn install_stream_sink(&mut self, sink: std::sync::Arc<crate::stream_draft::StreamSink>) {
+        self.stream_sink = Some(sink);
+    }
+
+    /// Detach the turn's draft sink. Called with [`clear_steer_rx`](Self::clear_steer_rx)
+    /// on every `run_prompt_task` exit path so a later turn (or heartbeat)
+    /// never feeds an ended stream. Idempotent.
+    pub fn clear_stream_sink(&mut self) {
+        self.stream_sink = None;
+    }
+
+    /// Test-only: whether no draft sink is attached.
+    #[cfg(test)]
+    pub fn stream_sink_is_none(&self) -> bool {
+        self.stream_sink.is_none()
     }
 
     /// Returns `true` if no steer receiver is currently installed.
@@ -1836,28 +1989,39 @@ impl AcpClient {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
                     tracing::info!(target: "acp::stream", "{text}");
+                    if let Some(sink) = &self.stream_sink {
+                        sink.on_text(text);
+                    }
                 }
                 false
             }
             "tool_call" => {
-                let title = update
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
+                let title = update.get("title").and_then(|v| v.as_str());
                 let kind = update
                     .get("kind")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
-                tracing::info!(target: "acp::tool", "tool_call: {title} ({kind})");
+                tracing::info!(
+                    target: "acp::tool",
+                    "tool_call: {} ({kind})",
+                    title.unwrap_or("unknown")
+                );
+                if let Some(sink) = &self.stream_sink {
+                    sink.on_tool_call(update.get("toolCallId").and_then(|v| v.as_str()), title);
+                }
                 true
             }
             "tool_call_update" => {
-                let tool_id = update
-                    .get("toolCallId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?");
+                let tool_id = update.get("toolCallId").and_then(|v| v.as_str());
                 let status = update.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-                tracing::info!(target: "acp::tool", "tool_call_update: {tool_id} → {status}");
+                tracing::info!(
+                    target: "acp::tool",
+                    "tool_call_update: {} → {status}",
+                    tool_id.unwrap_or("?")
+                );
+                if let Some(sink) = &self.stream_sink {
+                    sink.on_tool_title(tool_id, update.get("title").and_then(|v| v.as_str()));
+                }
                 false
             }
             "plan" => {
@@ -1867,6 +2031,10 @@ impl AcpClient {
             "agent_thought_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
                     tracing::debug!(target: "acp::thought", "{text}");
+                }
+                // Status only: reasoning text never reaches a draft.
+                if let Some(sink) = &self.stream_sink {
+                    sink.on_thought();
                 }
                 false
             }
@@ -4981,6 +5149,81 @@ sleep 1"#,
             AcpError::AgentError { code, message } => {
                 assert_eq!(code, -32001);
                 assert_eq!(message, "auth denied");
+            }
+            other => panic!("expected AgentError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_error_from_json_appends_acp_sdk_internal_error_details() {
+        // ACP SDK adapters (claude-agent-acp) wrap an uncaught exception as a
+        // bare -32603 and carry the cause only in `data.details`.
+        let error = serde_json::json!({
+            "code": -32603,
+            "message": "Internal error",
+            "data": {"details": "Session abc not found in project directory for /home/u"}
+        });
+        match super::agent_error_from_json(&error) {
+            AcpError::AgentError { code, message } => {
+                assert_eq!(code, -32603);
+                assert_eq!(
+                    message,
+                    "Internal error: Session abc not found in project directory for /home/u"
+                );
+            }
+            other => panic!("expected AgentError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_error_from_json_appends_string_and_structured_data() {
+        let string_data =
+            serde_json::json!({"code": -32000, "message": "failed", "data": "quota exceeded"});
+        let structured = serde_json::json!({"code": -32602, "message": "Invalid params", "data": {"messageId": "m1"}});
+        let message = |e: &serde_json::Value| match super::agent_error_from_json(e) {
+            AcpError::AgentError { message, .. } => message,
+            other => panic!("expected AgentError, got {other:?}"),
+        };
+        assert_eq!(message(&string_data), "failed: quota exceeded");
+        assert_eq!(
+            message(&structured),
+            r#"Invalid params: {"messageId":"m1"}"#
+        );
+    }
+
+    #[test]
+    fn agent_error_from_json_ignores_empty_or_redundant_data() {
+        let message = |e: serde_json::Value| match super::agent_error_from_json(&e) {
+            AcpError::AgentError { message, .. } => message,
+            other => panic!("expected AgentError, got {other:?}"),
+        };
+        for data in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!("  "),
+            serde_json::json!({"details": "Internal error"}),
+        ] {
+            assert_eq!(
+                message(
+                    serde_json::json!({"code": -32603, "message": "Internal error", "data": data})
+                ),
+                "Internal error"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_error_from_json_bounds_appended_detail() {
+        let long = "x".repeat(super::AGENT_ERROR_DETAIL_MAX_CHARS + 50);
+        let error = serde_json::json!({"code": -32603, "message": "Internal error", "data": {"details": long}});
+        match super::agent_error_from_json(&error) {
+            AcpError::AgentError { message, .. } => {
+                let detail = message.strip_prefix("Internal error: ").expect("prefix");
+                assert_eq!(
+                    detail.chars().count(),
+                    super::AGENT_ERROR_DETAIL_MAX_CHARS + 1
+                );
+                assert!(detail.ends_with('…'));
             }
             other => panic!("expected AgentError, got {other:?}"),
         }

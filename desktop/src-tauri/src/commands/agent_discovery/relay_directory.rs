@@ -4,7 +4,7 @@ use tauri::State;
 
 use crate::{
     app_state::AppState, commands::identity_archive, managed_agents::RelayAgentInfo, nostr_convert,
-    relay::query_relay,
+    relay::query_relay_at,
 };
 
 const RELAY_DIRECTORY_PAGE_SIZE: usize = 500;
@@ -27,6 +27,7 @@ const RELAY_DIRECTORY_MAX_CONCURRENCY: usize = 8;
 /// every caller keys the events by pubkey downstream, so ordering is irrelevant.
 async fn query_filter_batches(
     state: &AppState,
+    api_base_url: &str,
     semaphore: &tokio::sync::Semaphore,
     filters: &[serde_json::Value],
     error_label: &str,
@@ -36,7 +37,7 @@ async fn query_filter_batches(
             let _permit = semaphore.acquire().await.map_err(|error| {
                 format!("{error_label}: directory concurrency semaphore closed: {error}")
             })?;
-            query_relay(state, batch)
+            query_relay_at(state, api_base_url, batch)
                 .await
                 .map_err(|error| format!("{error_label}: {error}"))
         },
@@ -95,12 +96,13 @@ pub(super) fn advance_relay_cursor(filter: &mut serde_json::Value, page: &[nostr
 
 async fn query_all_relay_pages(
     state: &AppState,
+    api_base_url: &str,
     mut filter: serde_json::Value,
 ) -> Result<Vec<nostr::Event>, String> {
     filter["limit"] = serde_json::json!(RELAY_DIRECTORY_PAGE_SIZE);
     let mut events = Vec::new();
     loop {
-        let page = query_relay(state, &[filter.clone()]).await?;
+        let page = query_relay_at(state, api_base_url, &[filter.clone()]).await?;
         let done = page.len() < RELAY_DIRECTORY_PAGE_SIZE;
         if !done {
             advance_relay_cursor(&mut filter, &page);
@@ -118,19 +120,23 @@ fn retain_agents_allowed_by_build(agents: &mut Vec<RelayAgentInfo>, require_veri
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn list_relay_agents_for_state(
     state: &AppState,
 ) -> Result<Vec<RelayAgentInfo>, String> {
-    list_relay_agents_for_selection(state, None, None).await
+    let target = identity_archive::capture_relay_target(state);
+    list_relay_agents_for_selection(state, &target, None, None).await
 }
 
 async fn list_relay_agents_for_selection(
     state: &AppState,
+    target: &identity_archive::RelayTarget,
     requested_pubkeys: Option<&std::collections::HashSet<String>>,
     channel_id: Option<&str>,
 ) -> Result<Vec<RelayAgentInfo>, String> {
     let viewer_pubkey = current_user_pubkey(state)?;
-    let relay_pubkey = identity_archive::fetch_relay_self(state)
+    let api_base_url = target.api_base_url.as_str();
+    let relay_pubkey = identity_archive::fetch_relay_self_at(state, &target.ws_url)
         .await?
         .ok_or_else(|| "relay agent membership authority is unavailable".to_string())?;
 
@@ -146,7 +152,7 @@ async fn list_relay_agents_for_selection(
         owned_filter["#d"] = serde_json::json!(requested_pubkeys);
     }
     let owned_query = async {
-        query_all_relay_pages(state, owned_filter)
+        query_all_relay_pages(state, api_base_url, owned_filter)
             .await
             .map_err(|error| format!("relay owned-agent query failed: {error}"))
     };
@@ -164,7 +170,7 @@ async fn list_relay_agents_for_selection(
         membership_filter["#d"] = serde_json::json!([channel_id]);
     }
     let membership_query = async {
-        query_all_relay_pages(state, membership_filter)
+        query_all_relay_pages(state, api_base_url, membership_filter)
             .await
             .map_err(|error| format!("relay agent channel-membership query failed: {error}"))
     };
@@ -194,12 +200,14 @@ async fn list_relay_agents_for_selection(
                 membership_query,
                 query_filter_batches(
                     state,
+                    api_base_url,
                     &semaphore,
                     &directory_filters,
                     "relay agent runtime-directory query failed",
                 ),
                 query_filter_batches(
                     state,
+                    api_base_url,
                     &semaphore,
                     &profile_filters,
                     "relay agent owner-profile query failed",
@@ -246,12 +254,14 @@ async fn list_relay_agents_for_selection(
             let (directory_events, profile_events) = tokio::try_join!(
                 query_filter_batches(
                     state,
+                    api_base_url,
                     &semaphore,
                     &directory_filters,
                     "relay agent runtime-directory query failed",
                 ),
                 query_filter_batches(
                     state,
+                    api_base_url,
                     &semaphore,
                     &profile_filters,
                     "relay agent owner-profile query failed",
@@ -273,6 +283,7 @@ async fn list_relay_agents_for_selection(
     let managed_filters = managed_policy_filters(&candidate_pubkeys, &verified_owners);
     let managed_agent_events = query_filter_batches(
         state,
+        api_base_url,
         &semaphore,
         &managed_filters,
         "relay agent managed-policy query failed",
@@ -305,9 +316,47 @@ async fn list_relay_agents_for_selection(
     Ok(agents)
 }
 
+/// Drop this device's managed agents that belong to another community.
+///
+/// An agent belongs to ONE community. One that ran here under a pre-scoping
+/// build can still have a profile, a 30177 record, and channel memberships on
+/// this relay; it must stay hidden from mentions, pickers, and directories
+/// here all the same. Agents operated by anyone else are untouched.
+fn retain_agents_of_community(
+    agents: &mut Vec<RelayAgentInfo>,
+    records: &[crate::managed_agents::ManagedAgentRecord],
+    workspace_relay: &str,
+) {
+    let hidden = crate::managed_agents::community_scope::other_community_agent_pubkeys(
+        records,
+        workspace_relay,
+    );
+    agents.retain(|agent| !hidden.contains(&agent.pubkey.to_ascii_lowercase()));
+}
+
+/// Apply [`retain_agents_of_community`] with this device's agent store and
+/// the relay the directory was read from.
+fn hide_other_community_agents<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    workspace_relay: &str,
+    mut agents: Vec<RelayAgentInfo>,
+) -> Result<Vec<RelayAgentInfo>, String> {
+    let records = crate::managed_agents::community_scope::load_agent_records_without_keys(app)?;
+    retain_agents_of_community(&mut agents, &records, workspace_relay);
+    Ok(agents)
+}
+
 #[tauri::command]
-pub async fn list_relay_agents(state: State<'_, AppState>) -> Result<Vec<RelayAgentInfo>, String> {
-    list_relay_agents_for_state(&state).await
+pub async fn list_relay_agents<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    relay: crate::window_relay::WindowRelay,
+    state: State<'_, AppState>,
+) -> Result<Vec<RelayAgentInfo>, String> {
+    // The invoking window's relay, resolved once: the queries and the
+    // community filter both use it.
+    let target = identity_archive::RelayTarget::for_window(&relay);
+    let agents = list_relay_agents_for_selection(&state, &target, None, None).await?;
+    hide_other_community_agents(&app, relay.ws_url(), agents)
 }
 
 /// Revalidate only the selected relay agents in the target channel.
@@ -315,9 +364,11 @@ pub async fn list_relay_agents(state: State<'_, AppState>) -> Result<Vec<RelayAg
 /// This preserves the full directory command for autocomplete while keeping
 /// send-time authorization bounded by the actual mention set and destination.
 #[tauri::command]
-pub async fn revalidate_relay_agents(
+pub async fn revalidate_relay_agents<R: tauri::Runtime>(
     pubkeys: Vec<String>,
     channel_id: Option<String>,
+    app: tauri::AppHandle<R>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<Vec<RelayAgentInfo>, String> {
     let requested_pubkeys = pubkeys
@@ -328,12 +379,68 @@ pub async fn revalidate_relay_agents(
     if requested_pubkeys.is_empty() {
         return Ok(Vec::new());
     }
-    list_relay_agents_for_selection(&state, Some(&requested_pubkeys), channel_id.as_deref()).await
+    let target = identity_archive::RelayTarget::for_window(&relay);
+    let agents = list_relay_agents_for_selection(
+        &state,
+        &target,
+        Some(&requested_pubkeys),
+        channel_id.as_deref(),
+    )
+    .await?;
+    // Send-time authorization: a hidden agent cannot be woken by a mention.
+    hide_other_community_agents(&app, relay.ws_url(), agents)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn relay_agent(pubkey: &str) -> RelayAgentInfo {
+        serde_json::from_value(serde_json::json!({
+            "pubkey": pubkey,
+            "name": "agent",
+            "agent_type": "acp",
+            "channels": [],
+            "capabilities": [],
+            "status": "online",
+        }))
+        .expect("relay agent fixture")
+    }
+
+    fn managed(pubkey: &str, relay_url: &str) -> crate::managed_agents::ManagedAgentRecord {
+        serde_json::from_value(serde_json::json!({
+            "pubkey": pubkey,
+            "name": "managed",
+            "relay_url": relay_url,
+            "acp_command": "buzz-acp",
+            "agent_command": "goose",
+            "agent_args": [],
+            "mcp_command": "",
+            "turn_timeout_seconds": 320,
+            "created_at": "",
+            "updated_at": ""
+        }))
+        .expect("record fixture")
+    }
+
+    #[test]
+    fn directory_hides_this_devices_agents_from_other_communities() {
+        let own = "a".repeat(64);
+        let foreign = "b".repeat(64);
+        let stranger = "c".repeat(64);
+        let mut agents = vec![
+            relay_agent(&own),
+            relay_agent(&foreign),
+            relay_agent(&stranger),
+        ];
+        let records = [
+            managed(&own, "wss://here.example"),
+            managed(&foreign, "wss://elsewhere.example"),
+        ];
+        retain_agents_of_community(&mut agents, &records, "wss://here.example");
+        let kept: Vec<_> = agents.iter().map(|agent| agent.pubkey.clone()).collect();
+        assert_eq!(kept, vec![own, stranger]);
+    }
 
     #[test]
     fn marked_build_requires_verified_owner_without_requiring_viewer_ownership() {
@@ -463,9 +570,14 @@ mod real_relay_tests {
     }
 
     async fn publish(builder: EventBuilder, signer: &Keys, state: &AppState) {
-        relay::submit_event_with_keys(builder, state, signer, None)
-            .await
-            .expect("publish real-relay fixture");
+        relay::submit_event_at_with_keys(
+            builder,
+            state,
+            &relay::relay_api_base_url_with_override(state),
+            signer,
+        )
+        .await
+        .expect("publish real-relay fixture");
     }
 
     #[tokio::test]
@@ -531,7 +643,7 @@ mod real_relay_tests {
         .expect("create-path immediate policy flush");
         assert_eq!(flushed, 1);
 
-        let queried = query_relay(
+        let queried = crate::relay::query_relay(
             &state,
             &[serde_json::json!({
                 "kinds": [KIND_MANAGED_AGENT],

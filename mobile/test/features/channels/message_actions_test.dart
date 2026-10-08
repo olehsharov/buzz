@@ -77,18 +77,12 @@ class _FakeReadStateNotifier extends ReadStateNotifier {
     isReady: state.isReady,
     pubkey: state.pubkey,
     contexts: state.contexts,
-    version: state.version + 1,
     forcedUnreadContexts: Map.unmodifiable(forced),
   );
 }
 
 ReadStateState _readState(Map<String, int> contexts, {bool isReady = true}) =>
-    ReadStateState(
-      isReady: isReady,
-      pubkey: 'self',
-      contexts: contexts,
-      version: 1,
-    );
+    ReadStateState(isReady: isReady, pubkey: 'self', contexts: contexts);
 
 Future<SharedPreferences> _mockPrefs() async {
   SharedPreferences.setMockInitialValues({});
@@ -1802,7 +1796,6 @@ void main() {
           isReady: true,
           pubkey: 'self',
           contexts: const {_channelId: 2000},
-          version: 1,
           // Channel forced unread from the channel tile, message forced
           // unread from this sheet.
           forcedUnreadContexts: const {

@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:buzz/shared/read_state/read_state_format.dart';
 import 'package:buzz/shared/read_state/read_state_provider.dart';
 import 'package:buzz/shared/community/community_provider.dart';
@@ -21,7 +23,10 @@ void main() {
 
   late ProviderContainer container;
 
-  Future<ReadStateNotifier> pumpNotifier() async {
+  Future<ReadStateNotifier> pumpNotifier({
+    _FakeRelaySession Function() session = _FakeRelaySession.new,
+    bool expectReady = true,
+  }) async {
     SharedPreferences.setMockInitialValues({});
     final prefs = await SharedPreferences.getInstance();
     final nsec = nostr.Keys.generate().nsec;
@@ -30,7 +35,7 @@ void main() {
       overrides: [
         savedPrefsProvider.overrideWithValue(prefs),
         relayConfigProvider.overrideWith(() => _FakeRelayConfig(nsec)),
-        relaySessionProvider.overrideWith(_FakeRelaySession.new),
+        relaySessionProvider.overrideWith(session),
         activeCommunityProvider.overrideWith((ref) async => null),
         appLifecycleProvider.overrideWith(_FakeAppLifecycle.new),
       ],
@@ -44,7 +49,7 @@ void main() {
     for (var i = 0; i < 10 && !container.read(readStateProvider).isReady; i++) {
       await Future<void>.delayed(Duration.zero);
     }
-    expect(container.read(readStateProvider).isReady, isTrue);
+    expect(container.read(readStateProvider).isReady, expectReady);
     return notifier;
   }
 
@@ -121,6 +126,180 @@ void main() {
     expect(state().isForcedUnread(msgKey), isTrue);
     expect(state().locallyForcedChannelIds, {channelId});
   });
+
+  test('manager emissions that change nothing do not notify', () async {
+    final notifier = await pumpNotifier();
+    var notifications = 0;
+    container.listen(readStateProvider, (_, _) => notifications++);
+
+    notifier.seedContextRead(channelId, 100);
+    expect(notifications, 1);
+
+    // An older explicit read only promotes the context to publishable: the
+    // manager emits onChanged, but every exposed field is unchanged.
+    notifier.markContextRead(channelId, 50);
+    expect(state().effectiveTimestamp(channelId), 100);
+    expect(notifications, 1);
+
+    notifier.markContextUnread(msgKey, channelId: channelId);
+    notifier.markContextUnread(msgKey, channelId: channelId);
+    expect(notifications, 2);
+  });
+
+  test('one manager survives disconnected → connecting → connected', () async {
+    final initializations = <String>[];
+    final reinitializations = <String>[];
+    final originalDebugPrint = debugPrint;
+    debugPrint = (String? message, {int? wrapWidth}) {
+      if (message == null) return;
+      if (message.startsWith('[ReadStateManager] initialize pubkey')) {
+        initializations.add(message);
+      } else if (message == '[ReadStateManager] reinitializeRemote') {
+        reinitializations.add(message);
+      }
+    };
+    addTearDown(() => debugPrint = originalDebugPrint);
+
+    final notifier = await pumpNotifier();
+    notifier.markContextUnread(msgKey, channelId: channelId);
+    final session =
+        container.read(relaySessionProvider.notifier) as _FakeRelaySession;
+
+    session.setStatus(SessionStatus.connecting);
+    await Future<void>.delayed(Duration.zero);
+    session.setStatus(SessionStatus.connected);
+    for (var i = 0; i < 10 && reinitializations.isEmpty; i++) {
+      await Future<void>.delayed(Duration.zero);
+    }
+    await Future<void>.delayed(Duration.zero);
+
+    expect(initializations, hasLength(1));
+    // The reconnect refreshes the existing manager instead of replacing it.
+    expect(reinitializations, hasLength(1));
+    expect(state().isReady, isTrue);
+    // Session-local forces live on the notifier; a rebuild would drop them.
+    expect(state().isForcedUnread(msgKey), isTrue);
+
+    // Dropping back out of connected keeps the same manager too.
+    session.setStatus(SessionStatus.reconnecting);
+    await Future<void>.delayed(Duration.zero);
+    container.read(readStateProvider);
+    await Future<void>.delayed(Duration.zero);
+    expect(initializations, hasLength(1));
+    expect(state().isReady, isTrue);
+  });
+
+  test('a reconnect refresh makes read state ready while the first fetch, '
+      'issued before the relay was reachable, is still pending', () async {
+    await pumpNotifier(
+      session: _OfflineUntilConnectedSession.new,
+      expectReady: false,
+    );
+    final session =
+        container.read(relaySessionProvider.notifier) as _FakeRelaySession;
+
+    session.setStatus(SessionStatus.connected);
+    for (var i = 0; i < 10 && !state().isReady; i++) {
+      await Future<void>.delayed(Duration.zero);
+    }
+    expect(state().isReady, isTrue);
+  });
+
+  test('ReadStateState equality covers every exposed field', () {
+    const base = ReadStateState(
+      isReady: true,
+      pubkey: 'abc',
+      contexts: {'a': 1, 'b': 2},
+      forcedUnreadContexts: {'msg:x': 'a'},
+    );
+    final cases = <(String, ReadStateState, bool)>[
+      (
+        'same values, different map instances and order',
+        ReadStateState(
+          isReady: true,
+          pubkey: 'abc',
+          contexts: {'b': 2, 'a': 1},
+          forcedUnreadContexts: {'msg:x': 'a'},
+        ),
+        true,
+      ),
+      (
+        'isReady differs',
+        const ReadStateState(
+          isReady: false,
+          pubkey: 'abc',
+          contexts: {'a': 1, 'b': 2},
+          forcedUnreadContexts: {'msg:x': 'a'},
+        ),
+        false,
+      ),
+      (
+        'pubkey differs',
+        const ReadStateState(
+          isReady: true,
+          pubkey: 'def',
+          contexts: {'a': 1, 'b': 2},
+          forcedUnreadContexts: {'msg:x': 'a'},
+        ),
+        false,
+      ),
+      (
+        'context timestamp differs',
+        const ReadStateState(
+          isReady: true,
+          pubkey: 'abc',
+          contexts: {'a': 1, 'b': 3},
+          forcedUnreadContexts: {'msg:x': 'a'},
+        ),
+        false,
+      ),
+      (
+        'context missing',
+        const ReadStateState(
+          isReady: true,
+          pubkey: 'abc',
+          contexts: {'a': 1},
+          forcedUnreadContexts: {'msg:x': 'a'},
+        ),
+        false,
+      ),
+      (
+        'forced context differs',
+        const ReadStateState(
+          isReady: true,
+          pubkey: 'abc',
+          contexts: {'a': 1, 'b': 2},
+          forcedUnreadContexts: {'msg:y': 'a'},
+        ),
+        false,
+      ),
+      (
+        'forced channel differs',
+        const ReadStateState(
+          isReady: true,
+          pubkey: 'abc',
+          contexts: {'a': 1, 'b': 2},
+          forcedUnreadContexts: {'msg:x': 'b'},
+        ),
+        false,
+      ),
+      (
+        'no forced contexts',
+        const ReadStateState(
+          isReady: true,
+          pubkey: 'abc',
+          contexts: {'a': 1, 'b': 2},
+        ),
+        false,
+      ),
+    ];
+    for (final (label, other, equal) in cases) {
+      expect(base == other, equal, reason: label);
+      expect(other == base, equal, reason: '$label (symmetric)');
+      if (equal) expect(other.hashCode, base.hashCode, reason: label);
+    }
+    expect(const ReadStateState.inert(), const ReadStateState.inert());
+  });
 }
 
 class _FakeRelayConfig extends RelayConfigNotifier {
@@ -139,6 +318,8 @@ class _FakeRelaySession extends RelaySessionNotifier {
   SessionState build() =>
       const SessionState(status: SessionStatus.disconnected);
 
+  void setStatus(SessionStatus status) => state = SessionState(status: status);
+
   @override
   Future<List<NostrEvent>> fetchHistory(
     NostrFilter filter, {
@@ -151,6 +332,21 @@ class _FakeRelaySession extends RelaySessionNotifier {
     void Function(NostrEvent) onEvent, {
     void Function(String message)? onClosed,
   }) async => () {};
+}
+
+/// History requests sent before the relay connects are never answered, the
+/// way a REQ written to an absent socket is dropped until its timeout.
+class _OfflineUntilConnectedSession extends _FakeRelaySession {
+  @override
+  Future<List<NostrEvent>> fetchHistory(
+    NostrFilter filter, {
+    Duration timeout = const Duration(seconds: 8),
+  }) {
+    if (state.status != SessionStatus.connected) {
+      return Completer<List<NostrEvent>>().future;
+    }
+    return Future.value(const []);
+  }
 }
 
 class _FakeAppLifecycle extends AppLifecycleNotifier {

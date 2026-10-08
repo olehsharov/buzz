@@ -59,7 +59,7 @@ export function useAgentLifecycleActions({
         startManagedAgent,
       });
       toast.success(
-        managedAgent.backend.type === "provider"
+        managedAgent.backend.type !== "local"
           ? `Deploying ${managedAgent.name}.`
           : `Started ${managedAgent.name}.`,
       );
@@ -93,7 +93,11 @@ export function useAgentLifecycleActions({
         stopManagedAgent,
         onStopped: () => clearActiveTurnsForAgentOnStop(managedAgent.pubkey),
       });
-      toast.success(`Restarted ${managedAgent.name}.`);
+      toast.success(
+        managedAgent.backend.type !== "local"
+          ? `Redeploying ${managedAgent.name}.`
+          : `Restarted ${managedAgent.name}.`,
+      );
     } catch (error) {
       if (isRelayRemovedError(error)) return;
       toast.error(

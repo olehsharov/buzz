@@ -4,12 +4,15 @@ import { hasActiveEscapeSurface } from "@/shared/hooks/escapeSurfaces";
 import { hasPrimaryShortcutModifier } from "@/shared/lib/platform";
 
 export function useMarkAsReadShortcuts({
+  allowMarkAll = true,
   activeChannelId,
   activeChannelLastMessageAt,
   markAllChannelsRead,
   markChannelRead,
   selectedView,
 }: {
+  /** False outside the main window: Shift+Escape (mark all read) is global. */
+  allowMarkAll?: boolean;
   activeChannelId: string | null;
   activeChannelLastMessageAt: string | null | undefined;
   markAllChannelsRead: () => void;
@@ -33,6 +36,7 @@ export function useMarkAsReadShortcuts({
       if (hasActiveEscapeSurface()) return;
 
       if (event.shiftKey) {
+        if (!allowMarkAll) return;
         event.preventDefault();
         markAllChannelsRead();
         return;
@@ -49,6 +53,7 @@ export function useMarkAsReadShortcuts({
       window.removeEventListener("keydown", handleKeyDown);
     };
   }, [
+    allowMarkAll,
     activeChannelId,
     activeChannelLastMessageAt,
     markAllChannelsRead,

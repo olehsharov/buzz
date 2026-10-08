@@ -6,6 +6,7 @@ List<MarkdownComponent> _useMessageInlineComponents({
   required Map<String, String> mentionNames,
   required Map<String, String> mentionLabels,
   required Map<String, Set<String>> bindings,
+  required bool mentionAll,
   required Set<String> agentPubkeys,
   required Map<String, String> channelNames,
   required List<CustomEmoji> customEmoji,
@@ -36,6 +37,7 @@ List<MarkdownComponent> _useMessageInlineComponents({
     mentionNames: mentionNames,
     mentionLabels: mentionLabels,
     bindings: bindings,
+    mentionAll: mentionAll,
     agentPubkeys: agentPubkeys,
     channelNames: channelNames,
     customEmoji: customEmoji,
@@ -59,6 +61,7 @@ List<MarkdownComponent> _useMessageInlineComponents({
             range.label: content.substring(range.start + 1, range.end),
         },
         agentMentionPubkeys: inputs.agentPubkeys,
+        mentionAll: inputs.mentionAll,
         onMentionTap: inputs.hasMentionHandler ? mentionTap : null,
       ),
       CustomEmojiMd(inputs.customEmoji, content: finalContent, size: emojiSize),
@@ -78,6 +81,7 @@ class _InlineComponentInputs {
   final Map<String, String> mentionNames;
   final Map<String, String> mentionLabels;
   final Map<String, Set<String>> bindings;
+  final bool mentionAll;
   final Set<String> agentPubkeys;
   final Map<String, String> channelNames;
   final List<CustomEmoji> customEmoji;
@@ -93,6 +97,7 @@ class _InlineComponentInputs {
     required Map<String, String> mentionNames,
     required Map<String, String> mentionLabels,
     required Map<String, Set<String>> bindings,
+    required this.mentionAll,
     required Set<String> agentPubkeys,
     required Map<String, String> channelNames,
     required List<CustomEmoji> customEmoji,
@@ -120,6 +125,7 @@ class _InlineComponentInputs {
       content == other.content &&
       finalContent == other.finalContent &&
       emojiSize == other.emojiSize &&
+      mentionAll == other.mentionAll &&
       hasMentionHandler == other.hasMentionHandler &&
       hasMediaReply == other.hasMediaReply &&
       hasMediaMore == other.hasMediaMore &&

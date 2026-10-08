@@ -5,8 +5,8 @@ use crate::{
     app_state::AppState,
     events, nostr_convert,
     relay::{
-        classify_request_error, parse_json_response, query_relay, relay_api_base_url_with_override,
-        relay_error_message, submit_event,
+        classify_request_error, parse_json_response, query_relay_at, relay_error_message,
+        submit_event_at,
     },
 };
 
@@ -19,12 +19,13 @@ struct RelayInformationDocument {
 #[tauri::command]
 pub async fn relay_requires_membership(
     relay_url: Option<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
     let base_url = relay_url
         .as_deref()
         .map(crate::relay::relay_http_base_url)
-        .unwrap_or_else(|| relay_api_base_url_with_override(&state));
+        .unwrap_or_else(|| relay.api_base());
     let url = format!("{}/info", base_url.trim_end_matches('/'));
     let response = state
         .http_client
@@ -43,10 +44,14 @@ pub async fn relay_requires_membership(
 }
 
 #[tauri::command]
-pub async fn list_relay_members(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+pub async fn list_relay_members(
+    relay: crate::window_relay::WindowRelay,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
     // kind:13534 is a single replaceable event on the relay carrying all members.
-    let events = query_relay(
+    let events = query_relay_at(
         &state,
+        &relay.api_base(),
         &[serde_json::json!({
             "kinds": [13534],
             "limit": 1
@@ -62,6 +67,7 @@ pub async fn list_relay_members(state: State<'_, AppState>) -> Result<serde_json
 
 #[tauri::command]
 pub async fn get_my_relay_membership(
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     let my_pubkey = {
@@ -69,8 +75,9 @@ pub async fn get_my_relay_membership(
         keys.public_key().to_hex()
     };
 
-    let events = query_relay(
+    let events = query_relay_at(
         &state,
+        &relay.api_base(),
         &[serde_json::json!({
             "kinds": [13534],
             "limit": 1
@@ -99,20 +106,22 @@ pub async fn get_my_relay_membership(
 pub async fn add_relay_member(
     target_pubkey: String,
     role: String,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     let builder = events::build_relay_admin_add(&target_pubkey, &role)?;
-    let result = submit_event(builder, &state).await?;
+    let result = submit_event_at(builder, &state, &relay.api_base()).await?;
     serde_json::to_value(result).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn remove_relay_member(
     target_pubkey: String,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     let builder = events::build_relay_admin_remove(&target_pubkey)?;
-    let result = submit_event(builder, &state).await?;
+    let result = submit_event_at(builder, &state, &relay.api_base()).await?;
     serde_json::to_value(result).map_err(|e| e.to_string())
 }
 
@@ -120,9 +129,10 @@ pub async fn remove_relay_member(
 pub async fn change_relay_member_role(
     target_pubkey: String,
     new_role: String,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     let builder = events::build_relay_admin_change_role(&target_pubkey, &new_role)?;
-    let result = submit_event(builder, &state).await?;
+    let result = submit_event_at(builder, &state, &relay.api_base()).await?;
     serde_json::to_value(result).map_err(|e| e.to_string())
 }

@@ -1,4 +1,8 @@
+use super::super::agents::access_transition::{
+    plan_access_runtime_transition, redeploy_for_access_policy, AccessRuntimeTransition,
+};
 use super::*;
+use tauri::Emitter;
 
 pub(crate) fn managed_agent_access_policy_changed(
     current_mode: crate::managed_agents::RespondTo,
@@ -17,22 +21,6 @@ pub(crate) fn managed_agent_access_policy_changed(
     prospective_mode != current_mode
         || (prospective_mode == crate::managed_agents::RespondTo::Allowlist
             && prospective_allowlist != current_allowlist)
-}
-
-fn ensure_access_policy_change_supported(
-    record: &ManagedAgentRecord,
-    access_policy_changed: bool,
-) -> Result<(), String> {
-    if access_policy_changed
-        && record.backend != crate::managed_agents::BackendKind::Local
-        && record.backend_agent_id.is_some()
-    {
-        return Err(
-            "Access cannot be changed while this provider-backed agent is deployed because the provider protocol has no explicit stop or revocation acknowledgement. Stop or recreate the provider agent first."
-                .to_string(),
-        );
-    }
-    Ok(())
 }
 
 /// Reject an effort mutation for a non-local record. Remote effort is
@@ -123,7 +111,7 @@ pub(crate) async fn flush_managed_agent_policy(
     state: &AppState,
     existing_error: Option<String>,
 ) -> Option<String> {
-    match crate::managed_agents::persona_events::flush_active_pending_events(app, state).await {
+    match crate::managed_agents::persona_events::flush_bound_pending_events(app, state).await {
         Ok(_) => existing_error,
         Err(error) => Some(match existing_error {
             Some(profile_error) => {
@@ -138,18 +126,115 @@ pub(crate) async fn flush_managed_agent_policy(
 ///
 /// Most runtime config changes take effect on the next agent spawn. Access
 /// policy changes stop active local pairs before saving and restart those exact
-/// pairs after the relay policy is flushed.
+/// pairs after the relay policy is flushed. A deployed provider or paired
+/// machine agent cannot be stopped from here: its new policy is saved with
+/// `provider_policy_pending` in the same write, published, and then delivered
+/// by a redeploy. A failed redeploy keeps the flag (and `last_error`) so
+/// workspace apply and Deploy retry it, and the command reports the failure.
 #[tauri::command]
 pub async fn update_managed_agent(
     input: UpdateManagedAgentRequest,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
+) -> Result<UpdateManagedAgentResponse, String> {
+    update_managed_agent_scoped(input, app, &state, relay.ws_url(), None).await
+}
+
+/// The access step of an agent edit (`update_managed_agent` Phase 1), run on
+/// the record inside the locked store write.
+///
+/// Merges `respond_to` / `respond_to_allowlist` onto the record's current
+/// policy and validates the merged state, so a single update can switch to
+/// Allowlist and supply its pubkeys together. When the effective policy
+/// changes it plans how the running agent receives it: active local pairs are
+/// stopped here, before the new policy is written, so nothing observes a saved
+/// narrow policy while the old broad process is alive (a stop failure aborts
+/// before mutation); a deployed remote agent is marked
+/// `provider_policy_pending` for a redeploy. Every backend accepts the edit.
+///
+/// Returns whether the effective policy changed and the runtime transition
+/// the caller completes after saving.
+pub(crate) fn apply_access_edit<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    record: &mut ManagedAgentRecord,
+    runtimes: &mut std::collections::HashMap<
+        crate::managed_agents::ManagedAgentRuntimeKey,
+        crate::managed_agents::ManagedAgentPairRuntime,
+    >,
+    respond_to: Option<crate::managed_agents::RespondTo>,
+    respond_to_allowlist: Option<&[String]>,
+    community_relay: &str,
+) -> Result<(bool, AccessRuntimeTransition), String> {
+    let prospective_mode = respond_to.unwrap_or(record.respond_to);
+    let prospective_allowlist = match respond_to_allowlist {
+        Some(list) => crate::managed_agents::validate_respond_to_allowlist(list)?,
+        None => record.respond_to_allowlist.clone(),
+    };
+    if prospective_mode == crate::managed_agents::RespondTo::Allowlist
+        && prospective_allowlist.is_empty()
+    {
+        return Err(
+            "respond-to mode 'allowlist' requires at least one pubkey in the allowlist".to_string(),
+        );
+    }
+    let access_policy_changed = managed_agent_access_policy_changed(
+        record.respond_to,
+        &record.respond_to_allowlist,
+        prospective_mode,
+        &prospective_allowlist,
+        crate::managed_agents::owner_only_access_build(),
+    );
+    let access_transition =
+        plan_access_runtime_transition(record, access_policy_changed, runtimes, community_relay);
+    if let AccessRuntimeTransition::RestartLocal { .. } = &access_transition {
+        crate::managed_agents::stop_managed_agent_process(app, record, runtimes)?;
+    }
+    record.respond_to = prospective_mode;
+    // Preserve the persisted allowlist across mode toggles — only replace
+    // when the caller explicitly supplied a new list.
+    if respond_to_allowlist.is_some() {
+        record.respond_to_allowlist = prospective_allowlist;
+    }
+    Ok((access_policy_changed, access_transition))
+}
+
+/// Error returned by [`update_managed_agent_scoped`] when its
+/// `access_precondition` no longer holds.
+pub(crate) const ACCESS_PRECONDITION_FAILED: &str =
+    "agent access changed since it was selected; not updated";
+
+/// Whether `record` stores exactly the access policy `mode` / `allowlist`
+/// (the allowlist only counts in allowlist mode, as the runtime gate reads it).
+pub(crate) fn record_has_access_policy(
+    record: &ManagedAgentRecord,
+    mode: crate::managed_agents::RespondTo,
+    allowlist: &[String],
+) -> bool {
+    record.respond_to == mode
+        && (mode != crate::managed_agents::RespondTo::Allowlist
+            || record.respond_to_allowlist == allowlist)
+}
+
+/// The body of [`update_managed_agent`], shared with template access
+/// propagation so both edits take the same stop/restart and redeploy path.
+///
+/// `community_relay` is the invoking window's community. `access_precondition`,
+/// when set, is checked inside the locked write: the update applies only while
+/// the record still stores that access policy, otherwise it fails with
+/// [`ACCESS_PRECONDITION_FAILED`] and changes nothing.
+pub(crate) async fn update_managed_agent_scoped(
+    input: UpdateManagedAgentRequest,
+    app: AppHandle,
+    state: &AppState,
+    community_relay: &str,
+    access_precondition: Option<(crate::managed_agents::RespondTo, Vec<String>)>,
 ) -> Result<UpdateManagedAgentResponse, String> {
     // Captured before Phase 1 stops the runtime for an access-policy change: a
     // community removed while this update runs refuses the restart.
-    let admission = crate::managed_agents::AdmissionSnapshot::capture(&state);
+    let admission = crate::managed_agents::AdmissionSnapshot::capture(state);
     // Phase 1: local save (synchronous, under lock)
-    let (mut summary, sync_params, rollback, access_policy_changed, access_restart_relays) = {
+    let (mut summary, sync_params, rollback, access_policy_changed, access_transition) = {
         let _store_guard = state
             .managed_agents_store_lock
             .lock()
@@ -166,6 +251,11 @@ pub async fn update_managed_agent(
         }
 
         let record = find_managed_agent_mut(&mut records, &input.pubkey)?;
+        if let Some((mode, allowlist)) = &access_precondition {
+            if !record_has_access_policy(record, *mode, allowlist) {
+                return Err(ACCESS_PRECONDITION_FAILED.to_string());
+            }
+        }
         let previous_record = record.clone();
 
         let mut name_changed = false;
@@ -188,12 +278,9 @@ pub async fn update_managed_agent(
         // turn_timeout_seconds is intentionally not applied here —
         // BUZZ_ACP_TURN_TIMEOUT is deprecated and ignored by the harness.
         // Use idle_timeout_seconds or max_turn_duration_seconds instead.
-        // Store the relay override exactly as supplied (trimmed). An explicit
-        // value pins the agent; empty falls back to the workspace relay at
-        // read-time. A name-only edit (relay_url == None) leaves the pin intact.
-        if let Some(relay_url) = input.relay_url {
-            record.relay_url = relay_url.trim().to_string();
-        }
+        // `relay_url` is the agent's community, fixed when it is created: an
+        // edit never moves an agent to another community, so a supplied
+        // value is ignored (accepted only for wire compatibility).
         if let Some(acp_command) = input.acp_command {
             record.acp_command = acp_command;
         }
@@ -250,60 +337,17 @@ pub async fn update_managed_agent(
             record.relay_mesh = Some(crate::managed_agents::RelayMeshConfig { model_ref });
         }
 
-        // Inbound author gate: merge patch onto current values, then validate
-        // the merged state. This lets a single update switch to Allowlist AND
-        // supply pubkeys atomically.
-        let prospective_mode = input.respond_to.unwrap_or(record.respond_to);
-        let prospective_allowlist = match input.respond_to_allowlist.as_ref() {
-            Some(list) => crate::managed_agents::validate_respond_to_allowlist(list)?,
-            None => record.respond_to_allowlist.clone(),
-        };
-        if prospective_mode == crate::managed_agents::RespondTo::Allowlist
-            && prospective_allowlist.is_empty()
-        {
-            return Err(
-                "respond-to mode 'allowlist' requires at least one pubkey in the allowlist"
-                    .to_string(),
-            );
-        }
-        let access_policy_changed = managed_agent_access_policy_changed(
-            record.respond_to,
-            &record.respond_to_allowlist,
-            prospective_mode,
-            &prospective_allowlist,
-            crate::managed_agents::owner_only_access_build(),
-        );
-        ensure_access_policy_change_supported(record, access_policy_changed)?;
-
-        // Revoke the currently running local gate before persisting or
-        // advertising the replacement policy. Keeping this inside the same
-        // store/process critical section prevents another command or a status
-        // refresh from observing a saved narrow policy while the old broad
-        // process is still alive. A stop failure aborts before mutation.
-        let mut access_restart_relays = Vec::new();
-        if access_policy_changed && record.backend == crate::managed_agents::BackendKind::Local {
-            access_restart_relays =
-                crate::managed_agents::managed_agent_runtime_keys(&runtimes, &record.pubkey)
-                    .into_iter()
-                    .map(|key| key.relay_url)
-                    .collect();
-            if access_restart_relays.is_empty() && record.runtime_pid.is_some() {
-                access_restart_relays.push(crate::relay::effective_agent_relay_url(
-                    &record.relay_url,
-                    &relay_ws_url_with_override(&state),
-                ));
-            }
-            if !access_restart_relays.is_empty() {
-                crate::managed_agents::stop_managed_agent_process(&app, record, &mut runtimes)?;
-            }
-        }
-
-        record.respond_to = prospective_mode;
-        // Preserve the persisted allowlist across mode toggles — only replace
-        // when the caller explicitly supplied a new list.
-        if input.respond_to_allowlist.is_some() {
-            record.respond_to_allowlist = prospective_allowlist;
-        }
+        // Inbound author gate: validate, plan, and write the new policy (a
+        // running local pair is stopped first, a deployed remote agent is
+        // marked pending in this same write).
+        let (access_policy_changed, access_transition) = apply_access_edit(
+            &app,
+            record,
+            &mut runtimes,
+            input.respond_to,
+            input.respond_to_allowlist.as_deref(),
+            community_relay,
+        )?;
 
         // Effort + env_vars: applied together inside `apply_record_field_updates` to
         // enforce the ordering invariant (env_vars before effort column write) and
@@ -333,7 +377,7 @@ pub async fn update_managed_agent(
         // Publish the edit to the relay. After-save, inside the lock, before
         // any .await. The retention upsert hashes the opt-IN projection, so an
         // update that touched only runtime/local fields is a no-op publish.
-        super::super::agents::retain_managed_agent_pending(&app, &state, record);
+        super::super::agents::retain_managed_agent_pending(&app, state, record);
 
         let sync_params = if name_changed {
             let agent_keys = Keys::parse(&record.private_key_nsec)
@@ -342,7 +386,7 @@ pub async fn update_managed_agent(
             // an explicit per-agent relay wins; empty falls back to workspace.
             let relay_url = crate::relay::effective_agent_relay_url(
                 &record.relay_url,
-                &relay_ws_url_with_override(&state),
+                &relay_ws_url_with_override(state),
             );
             let display_name = record.name.clone();
             // Avatar fallback derives from the EFFECTIVE harness (persona-wins),
@@ -376,7 +420,7 @@ pub async fn update_managed_agent(
             sync_params,
             rollback,
             access_policy_changed,
-            access_restart_relays,
+            access_transition,
         )
     }; // lock dropped here
 
@@ -388,14 +432,14 @@ pub async fn update_managed_agent(
     // 30-second retention sweep. The flush remains durable/best-effort; rows a
     // relay does not accept stay pending for the background retry.
     let mut profile_sync_error =
-        crate::managed_agents::persona_events::flush_active_pending_events(&app, &state)
+        crate::managed_agents::persona_events::flush_bound_pending_events(&app, state)
             .await
             .err()
             .map(|error| format!("managed policy sync failed: {error}"));
     if profile_sync_error.is_none()
         && crate::managed_agents::persona_events::active_pending_event(
             &app,
-            &state,
+            state,
             buzz_core_pkg::kind::KIND_MANAGED_AGENT,
             &summary.pubkey,
         )?
@@ -411,7 +455,7 @@ pub async fn update_managed_agent(
     // authoritative name.
     if let Some((agent_keys, relay_url, display_name, avatar_url, about, auth_tag)) = sync_params {
         if let Err(sync_error) = sync_managed_agent_profile(
-            &state,
+            state,
             &relay_url,
             &agent_keys,
             &display_name,
@@ -424,24 +468,18 @@ pub async fn update_managed_agent(
             let rollback = rollback.ok_or_else(|| {
                 "missing local rollback state after relay profile sync failure".to_string()
             })?;
-            rollback_failed_agent_update(&app, &state, &summary.pubkey, rollback)?;
-            let restart_suffix = if access_restart_relays.is_empty() {
-                String::new()
-            } else {
-                match super::super::agents::start_local_agent_pairs_with_preflight(
-                    &app,
-                    &state,
-                    &summary.pubkey,
-                    &access_restart_relays,
-                    &admission,
-                )
-                .await
-                {
-                    Ok(_) => String::new(),
-                    Err(error) => format!(
-                        " The runtime also failed to restart with the kept access policy: {error}"
-                    ),
-                }
+            rollback_failed_agent_update(&app, state, &summary.pubkey, rollback)?;
+            let restart_suffix = match apply_access_transition(
+                &app,
+                state,
+                &summary.pubkey,
+                &access_transition,
+                &admission,
+            )
+            .await
+            {
+                Ok(_) => String::new(),
+                Err(error) => format!(" {}", error.kept_policy_message()),
             };
             let rollback_message = if access_policy_changed {
                 "The access policy change was kept, but other edits were rolled back"
@@ -454,26 +492,80 @@ pub async fn update_managed_agent(
         }
     }
 
-    if !access_restart_relays.is_empty() {
-        summary = super::super::agents::start_local_agent_pairs_with_preflight(
-            &app,
-            &state,
-            &summary.pubkey,
-            &access_restart_relays,
-            &admission,
-        )
-        .await
-        .map_err(|error| {
-            format!(
-                "Agent access was saved and published, but its runtime failed to restart with the new policy: {error}"
-            )
-        })?;
+    if let Some(refreshed) =
+        apply_access_transition(&app, state, &summary.pubkey, &access_transition, &admission)
+            .await
+            .map_err(AccessApplyError::saved_policy_message)?
+    {
+        summary = refreshed;
     }
 
     Ok(UpdateManagedAgentResponse {
         agent: summary,
         profile_sync_error: profile_sync_error.take(),
     })
+}
+
+/// Why a saved access policy did not reach the running agent.
+enum AccessApplyError {
+    LocalRestart(String),
+    RemoteRedeploy(String),
+}
+
+impl AccessApplyError {
+    fn saved_policy_message(self) -> String {
+        match self {
+            Self::LocalRestart(error) => format!(
+                "Agent access was saved and published, but its runtime failed to restart with the new policy: {error}"
+            ),
+            Self::RemoteRedeploy(error) => format!(
+                "Agent access was saved and published, but redeploying the agent with it failed: {error}. Until a redeploy succeeds the deployed agent keeps its previous access. Buzz retries the redeploy the next time this community loads, or press Retry on the agent."
+            ),
+        }
+    }
+
+    fn kept_policy_message(self) -> String {
+        match self {
+            Self::LocalRestart(error) => {
+                format!("The runtime also failed to restart with the kept access policy: {error}")
+            }
+            Self::RemoteRedeploy(error) => format!(
+                "Redeploying the agent with the kept access policy also failed: {error}; it will be retried."
+            ),
+        }
+    }
+}
+
+/// Deliver a saved access policy to the running agent: start the local pairs
+/// stopped in Phase 1, or redeploy the remote agent. Returns the refreshed
+/// summary when a runtime was touched.
+async fn apply_access_transition(
+    app: &AppHandle,
+    state: &AppState,
+    pubkey: &str,
+    transition: &AccessRuntimeTransition,
+    admission: &crate::managed_agents::AdmissionSnapshot,
+) -> Result<Option<crate::managed_agents::ManagedAgentSummary>, AccessApplyError> {
+    match transition {
+        AccessRuntimeTransition::None => Ok(None),
+        AccessRuntimeTransition::RestartLocal { relay_urls } => {
+            super::super::agents::start_local_agent_pairs_with_preflight(
+                app, state, pubkey, relay_urls, admission,
+            )
+            .await
+            .map(Some)
+            .map_err(AccessApplyError::LocalRestart)
+        }
+        AccessRuntimeTransition::Redeploy(target) => {
+            let result = redeploy_for_access_policy(app, state, pubkey, target).await;
+            // The row's pending badge and error change either way.
+            let _ = app.emit("agents-data-changed", ());
+            result.map_err(AccessApplyError::RemoteRedeploy)?;
+            super::super::hosts::summary_for(app, state, pubkey)
+                .map(Some)
+                .map_err(AccessApplyError::RemoteRedeploy)
+        }
+    }
 }
 
 #[cfg(test)]

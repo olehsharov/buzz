@@ -570,7 +570,6 @@ Widget _systemEventAvatar(
 class _ThreadSummaryRow extends ConsumerWidget {
   final ThreadSummary summary;
   final TimelineMessage message;
-  final List<TimelineMessage> allMessages;
   final String channelId;
   final String? currentPubkey;
   final bool isMember;
@@ -579,7 +578,6 @@ class _ThreadSummaryRow extends ConsumerWidget {
   const _ThreadSummaryRow({
     required this.summary,
     required this.message,
-    required this.allMessages,
     required this.channelId,
     required this.currentPubkey,
     required this.isMember,
@@ -596,7 +594,11 @@ class _ThreadSummaryRow extends ConsumerWidget {
           MaterialPageRoute<void>(
             builder: (_) => ThreadDetailPage(
               threadHead: message,
-              allMessages: allMessages,
+              // Read at tap time so a newer timeline does not invalidate
+              // this row.
+              allMessages: ref
+                  .read(channelTimelineProvider(channelId))
+                  .messages,
               channelId: channelId,
               currentPubkey: currentPubkey,
               isMember: isMember,

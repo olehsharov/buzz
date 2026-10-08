@@ -10,6 +10,7 @@ import {
 } from "@/features/agents/hooks";
 import { managedAgentRuntimesQueryKey } from "@/features/agents/managedAgentRuntimeHooks";
 import { teamAutoRetractedNotice } from "@/features/agents/ui/teamLibraryCopy";
+import { isMainWindow } from "@/shared/lib/windowKind";
 
 export const LOCAL_AGENT_DATA_QUERY_KEYS = [
   personasQueryKey,
@@ -54,9 +55,12 @@ export function useAgentsDataRefresh(): void {
       teamName: string;
       reason: string;
     }>("team-catalog-auto-retracted", (event) => {
-      toast.warning(
-        teamAutoRetractedNotice(event.payload.teamName, event.payload.reason),
-      );
+      // Toast once, from the main window; every window still refreshes.
+      if (isMainWindow()) {
+        toast.warning(
+          teamAutoRetractedNotice(event.payload.teamName, event.payload.reason),
+        );
+      }
       // Invalidate team queries so the share toggle reflects the retraction.
       void queryClient.invalidateQueries({ queryKey: teamsQueryKey });
     });

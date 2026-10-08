@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window and trusted huddle companions",
-  "windows": ["main", "huddle-*"],
+  "description": "Capability for the main window and its trusted huddle, pop-out, and community companions, which load the same bundled app",
+  "windows": ["main", "huddle-*", "popout-*", "community-*"],
   "permissions": [
     "core:default",
     "core:webview:allow-set-webview-zoom",
@@ -10,6 +10,7 @@
     "core:window:allow-set-badge-label",
     "core:window:allow-request-user-attention",
     "core:window:allow-set-focus",
+    "core:window:allow-set-title",
     "core:window:allow-start-dragging",
     "core:window:allow-toggle-maximize",
     "core:window:allow-unminimize",

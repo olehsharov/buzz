@@ -197,7 +197,13 @@ pub(crate) fn build_deploy_payload<R: tauri::Runtime>(
         return Err(err);
     }
 
-    let global = crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
+    // The agent's OWN community: its deploy target and the only community
+    // whose defaults it may receive (never the active one's).
+    let agent_relay = crate::relay::effective_agent_relay_url(
+        &record.relay_url,
+        &relay_ws_url_with_override(state),
+    );
+    let global = crate::managed_agents::load_agent_defaults_for_relay(app, &agent_relay)?;
     let personas = load_personas(app).unwrap_or_default();
     let teams = crate::managed_agents::load_teams(app).unwrap_or_default();
     let persona_env =
@@ -231,10 +237,7 @@ pub(crate) fn build_deploy_payload<R: tauri::Runtime>(
 
     Ok(deploy_payload_json(
         record,
-        crate::relay::effective_agent_relay_url(
-            &record.relay_url,
-            &relay_ws_url_with_override(state),
-        ),
+        agent_relay,
         DeployProjections {
             effective_model: effective.model.value,
             effective_provider: effective.provider.value,

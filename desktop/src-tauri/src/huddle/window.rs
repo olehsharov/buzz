@@ -31,8 +31,12 @@ pub fn close_huddle_companion(
         .clone()
         .ok_or("no active huddle")?;
     close_huddle_window(&app, &ephemeral_channel_id);
-    app.emit("huddle-companion-returned", ())
-        .map_err(|error| error.to_string())?;
+    app.emit_to(
+        crate::popout::MAIN_WINDOW_LABEL,
+        "huddle-companion-returned",
+        (),
+    )
+    .map_err(|error| error.to_string())?;
     Ok(())
 }
 

@@ -9,6 +9,7 @@ mod config;
 mod edit_routing;
 mod engram_fetch;
 mod filter;
+mod gate_drop_log;
 mod isolated_execution;
 mod observer;
 mod pool;
@@ -18,11 +19,15 @@ mod prompt_project;
 mod queue;
 mod recovery_wake;
 mod relay;
+mod resume_store;
 mod run_task;
 mod runtime;
 use runtime::{AgentRuntime, PoolStartup, SessionMode};
 mod scope;
+mod scope_sessions;
 mod setup_mode;
+mod stream_draft;
+mod turn_journal;
 mod usage;
 
 pub use usage::TurnUsage;
@@ -428,6 +433,7 @@ mod inbound_author_gate {
         relay_self: Option<String>,
         // None means no authoritative NIP-11 result yet, including at startup.
         refreshed_generation: Option<u64>,
+        drop_log: super::gate_drop_log::DropLogLimiter,
     }
 
     pub(crate) fn refresh_needed(refreshed_generation: Option<u64>, event_generation: u64) -> bool {
@@ -446,6 +452,7 @@ mod inbound_author_gate {
                 agent_pubkey_hex: agent_pubkey_hex.to_string(),
                 relay_self,
                 refreshed_generation: completed.then_some(0),
+                drop_log: super::gate_drop_log::DropLogLimiter::default(),
             }
         }
 
@@ -550,14 +557,32 @@ mod inbound_author_gate {
                 )
                 .await;
             if !decision.allowed {
-                tracing::debug!(
-                    channel_id = %buzz_event.channel_id,
-                    raw_author = %buzz_event.event.pubkey.to_hex(),
-                    effective_author = %decision.effective_author,
-                    mode = %respond_to,
-                    is_dm = decision.is_dm,
-                    "inbound author gate — dropping event"
-                );
+                // Info, so an agent that silently ignores someone is visible
+                // at the default log level; rate-limited per (author,
+                // channel) because any channel member can trigger it.
+                match self.drop_log.record(
+                    &decision.effective_author,
+                    buzz_event.channel_id,
+                    std::time::Instant::now(),
+                ) {
+                    Some(suppressed) => tracing::info!(
+                        channel_id = %buzz_event.channel_id,
+                        raw_author = %buzz_event.event.pubkey.to_hex(),
+                        effective_author = %decision.effective_author,
+                        mode = %respond_to,
+                        is_dm = decision.is_dm,
+                        suppressed_since_last = suppressed,
+                        "inbound author gate — dropping event"
+                    ),
+                    None => tracing::debug!(
+                        channel_id = %buzz_event.channel_id,
+                        raw_author = %buzz_event.event.pubkey.to_hex(),
+                        effective_author = %decision.effective_author,
+                        mode = %respond_to,
+                        is_dm = decision.is_dm,
+                        "inbound author gate — dropping event"
+                    ),
+                }
                 return None;
             }
             Some(AuthorizedListenerEvent {
@@ -635,6 +660,9 @@ struct QueuedNormalListenerEvent {
     /// The admitted event as a native steer would render it, including an
     /// edit's resolved original-message routing.
     steer_event: queue::BatchEvent,
+    /// Whether the event's channel is a DM (decides how a steered message
+    /// from another thread is told to reply).
+    is_dm: bool,
 }
 
 impl QueuedNormalListenerEvent {
@@ -653,6 +681,7 @@ impl QueuedNormalListenerEvent {
         self,
         handling: MultipleEventHandling,
         owner: Option<&str>,
+        autopost: bool,
         pool: &mut AgentPool,
         queue: &mut EventQueue,
         steer_ack_tx: &mpsc::UnboundedSender<SteerAckEvent>,
@@ -663,19 +692,25 @@ impl QueuedNormalListenerEvent {
         let Some(signal) = mode_gate_signal(handling, &self.effective_author, owner) else {
             return;
         };
-        // A native steer keeps the running turn's `<context>`, so it may only
-        // carry a message that replies in the same thread. Under the channel
-        // policy one session spans threads; a message for another thread takes
-        // the cancel+merge path, whose re-prompt carries its own `<context>`.
+        // Steer natively whenever the adapter can: cancelling the running turn
+        // instead also kills every background subagent it started
+        // (claude-agent-acp's `session/cancel` finishes them all). A native
+        // steer keeps the running turn's `<context>`, so a message for another
+        // thread carries its own reply routing in the steer body (#6132 sent it
+        // to cancel+merge instead). Only when the harness autoposts the turn's
+        // response text must the message share the turn's thread: the reply
+        // would be posted where the running turn's draft goes.
         let same_reply_thread = queue.in_flight_reply_thread(&self.scope)
             == Some(self.steer_event.reply_thread().as_str());
+        let own_routing = (!same_reply_thread).then_some(SteerReplyRouting { is_dm: self.is_dm });
         let native_attempted = matches!(signal, ControlSignal::Steer)
-            && same_reply_thread
+            && (same_reply_thread || !autopost)
             && try_native_steer(
                 pool,
                 queue,
                 self.scope.clone(),
                 self.steer_event,
+                own_routing,
                 steer_ack_tx,
             );
         if !native_attempted {
@@ -714,6 +749,7 @@ impl NormalListenerIngress {
         self,
         queue: &mut EventQueue,
         session_scope: scope::SessionScope,
+        is_dm: bool,
     ) -> QueuedNormalListenerEvent {
         let Self {
             buzz_event,
@@ -744,6 +780,7 @@ impl NormalListenerIngress {
             effective_author,
             reaction_target_id,
             steer_event,
+            is_dm,
         }
     }
 }
@@ -2841,11 +2878,60 @@ async fn run_harness(
         );
     }
 
-    let ctx = Arc::new(runtime.prompt_context(
+    let mut prompt_context = runtime.prompt_context(
         relay.rest_client(),
         channel_info_map,
         SessionMode::Conversation,
-    )?);
+    )?;
+    prompt_context.stream = stream_draft::StreamRuntime::new(
+        config.stream_mode,
+        relay.event_publisher(),
+        config.keys.clone(),
+    );
+    match resume_store::state_root_from_env(|key| std::env::var_os(key)) {
+        Some(root) => {
+            let store = turn_journal::TurnJournalStore::new(&root, &pubkey_hex);
+            tracing::info!(
+                "turn journal directory {} (interrupted turns resume after a restart)",
+                store.dir().display()
+            );
+            prompt_context.turn_journal =
+                turn_journal::TurnJournal::new(store, shutdown_tx.subscribe());
+        }
+        None => tracing::warn!(
+            "no state directory (set an absolute XDG_STATE_HOME or HOME): turns interrupted \
+             by a restart will not resume"
+        ),
+    }
+    match resume_store::state_root_from_env(|key| std::env::var_os(key)) {
+        Some(root) => {
+            let store =
+                scope_sessions::ScopeSessionStore::new(&root, &pubkey_hex, &prompt_context.cwd);
+            match scope_sessions::ScopeSessions::load(store.clone(), &prompt_context.cwd) {
+                Ok(map) => {
+                    tracing::info!(
+                        "scope-session map {} (conversations resume across worker restarts)",
+                        store.path().display()
+                    );
+                    prompt_context.scope_sessions = map;
+                }
+                Err(error) => {
+                    // Starting with an empty map would silently start every
+                    // conversation over. Keep the evidence and refuse to start.
+                    anyhow::bail!(
+                        "{error} — move it aside to start with no remembered conversations"
+                    );
+                }
+            }
+        }
+        None => tracing::warn!(
+            "no state directory: conversations will not resume after a worker restart"
+        ),
+    }
+    let ctx = Arc::new(prompt_context);
+    // Turns a previous run could not finish re-run once, in their own
+    // sessions. Their events are skipped if the relay replays them.
+    let restored_event_ids = restore_interrupted_turns(&ctx, &mut queue);
 
     if !config.memory_enabled {
         tracing::info!(
@@ -3008,6 +3094,20 @@ async fn run_harness(
         Wake(u32, Result<AgentPool, String>),
         HoldDeadline,
         Recovery(recovery_wake::RecoveryWake),
+    }
+
+    // Restored turns wait for no relay event: dispatch them now (a lazy pool
+    // wakes for them at the top of the loop).
+    if pool_ready && queue.has_flushable_work() {
+        for (scope, thread_tags) in dispatch_pending(
+            &mut pool,
+            &mut queue,
+            &ctx,
+            &mut last_activity,
+            observer.as_ref(),
+        ) {
+            typing_channels.insert(scope, thread_tags);
+        }
     }
 
     loop {
@@ -3304,6 +3404,7 @@ async fn run_harness(
                                     // complete normally (the relay may reject actions if
                                     // the agent lost access).
                                     let drained_ids = queue.drain_channel(ch);
+                                    ctx.scope_sessions.forget_channel(ch);
                                     let invalidated = if pool_ready {
                                         pool.invalidate_channel_sessions(ch)
                                     } else {
@@ -3455,6 +3556,19 @@ async fn run_harness(
                                             .await,
                                         &buzz_event.event,
                                     );
+                                    // A deliberate rotate wants a fresh
+                                    // session: a resume binding on this scope
+                                    // must not re-apply the fork.
+                                    ctx.resume_session.release(&scope);
+                                    ctx.scope_sessions.forget(&scope);
+                                    // `!rotate` is the one way out of a dead
+                                    // session: the next message starts fresh.
+                                    if ctx.dead_sessions.clear(&scope) {
+                                        tracing::info!(
+                                            scope = %scope.telemetry_label(),
+                                            "!rotate cleared a dead session — next message starts a fresh session"
+                                        );
+                                    }
                                     let fired = signal_in_flight_task_for_scope(
                                         &mut pool,
                                         &scope,
@@ -3492,6 +3606,13 @@ async fn run_harness(
                             // launched by the same human). Allowlist adds the
                             // explicit pubkey list on top, for external people;
                             // it never revokes same-owner team bots.
+                            if is_restored_replay(&restored_event_ids, &buzz_event.event) {
+                                tracing::info!(
+                                    event_id = %buzz_event.event.id,
+                                    "relay replayed an event the restored turn already carries — skipping"
+                                );
+                                continue;
+                            }
                             let Some(authorized_event) = authorize_normal_listener_event(
                                 &mut author_gate_ctx,
                                 buzz_event,
@@ -3521,14 +3642,11 @@ async fn run_harness(
                             // channel-keyed routing. Telemetry only for now —
                             // queue/pool partitioning by scope lands in a
                             // follow-up (see ticket outline steps 2–4).
-                            let session_scope = ingress.session_scope(
-                                config.session_policy,
-                                is_dm_channel(
-                                    ingress.buzz_event.channel_id,
-                                    &ctx.channel_info,
-                                )
-                                .await,
-                            );
+                            let is_dm =
+                                is_dm_channel(ingress.buzz_event.channel_id, &ctx.channel_info)
+                                    .await;
+                            let session_scope =
+                                ingress.session_scope(config.session_policy, is_dm);
                             tracing::debug!(
                                 channel_id = %session_scope.channel_id(),
                                 scope = %session_scope.telemetry_label(),
@@ -3537,7 +3655,7 @@ async fn run_harness(
                                 policy = %config.session_policy,
                                 "admitted event — resolved session scope"
                             );
-                            let queued = ingress.push(&mut queue, session_scope);
+                            let queued = ingress.push(&mut queue, session_scope, is_dm);
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
                             // Fire-and-forget: on rare fast-failure paths the
@@ -3551,6 +3669,7 @@ async fn run_harness(
                             queued.steer_or_interrupt(
                                 config.multiple_event_handling,
                                 owner_cache.get(),
+                                config.stream_mode == stream_draft::StreamMode::DraftAutopost,
                                 &mut pool,
                                 &mut queue,
                                 &steer_ack_tx,
@@ -4334,6 +4453,7 @@ fn try_native_steer(
     queue: &mut EventQueue,
     scope: scope::SessionScope,
     be: queue::BatchEvent,
+    own_routing: Option<SteerReplyRouting>,
     steer_ack_tx: &mpsc::UnboundedSender<SteerAckEvent>,
 ) -> bool {
     let channel_id = scope.channel_id();
@@ -4350,11 +4470,15 @@ fn try_native_steer(
     // channel context and the actor's profile in the original prompt,
     // duplicating it here would defeat the point of non-cancelling
     // steering (which is to inject only what's new).
-    // The caller steers natively only a message in the running turn's reply
-    // thread, so the turn's own `<context>` still routes the reply. An edit's
+    // A message in the running turn's reply thread is routed by the turn's own
+    // `<context>`; one from another thread carries `own_routing`. An edit's
     // block names its original (`Edit of:`) and the original's thread root.
     let event_id_hex = be.event.id.to_hex();
-    let body = native_steer_body(channel_id, &be);
+    let mut body = native_steer_body(channel_id, &be);
+    if let Some(routing) = own_routing {
+        body.push_str("\n\n");
+        body.push_str(&steer_reply_routing_note(&be, routing));
+    }
 
     let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<pool::SteerAck>();
     let request = pool::SteerRequest {
@@ -4418,6 +4542,39 @@ fn try_native_steer(
             );
             false
         }
+    }
+}
+
+/// How to route the reply to a steered message that is not in the running
+/// turn's reply thread.
+#[derive(Debug, Clone, Copy)]
+struct SteerReplyRouting {
+    is_dm: bool,
+}
+
+/// The reply instruction for a steered message from another thread: the
+/// running turn's `<context>` names its own thread, so this message must say
+/// where its reply goes — the same destination its own turn's `<context>`
+/// would name.
+fn steer_reply_routing_note(be: &queue::BatchEvent, routing: SteerReplyRouting) -> String {
+    let event_id = be.routing_event_id();
+    if be.routing_thread_tags().root_event_id.is_some() {
+        format!(
+            "IMPORTANT: This message is in a different thread from the work you are doing. \
+             Reply to it with `--reply-to {event_id}` on `buzz messages send`, not into the \
+             thread of your current work."
+        )
+    } else if routing.is_dm {
+        "IMPORTANT: This is a new top-level message in the DM, not part of the thread you are \
+         working in. Reply to it top-level (`buzz messages send` without `--reply-to`), not into \
+         the thread of your current work."
+            .to_string()
+    } else {
+        format!(
+            "IMPORTANT: This is a new top-level message, not part of the thread you are working \
+             in. Reply to it with `--reply-to {event_id}` on `buzz messages send` — it is the \
+             root of its own thread. Do NOT reply into the thread of your current work."
+        )
     }
 }
 
@@ -4608,6 +4765,7 @@ mod try_native_steer_fallback_log_tests {
                     received_at: std::time::Instant::now(),
                     edit: None,
                 },
+                None,
                 &steer_ack_tx,
             )
         });
@@ -4868,6 +5026,10 @@ fn dispatch_pending(
         // Assign ownership before moving the worker into the task. If this is
         // a bounded-hold fork, the new generation immediately invalidates the
         // prior busy worker's copy when that worker eventually returns.
+        // Before ownership moves: may the scope's previous worker still hold
+        // its session live? Only then must this worker not resume it.
+        ctx.scope_sessions
+            .set_held_elsewhere(&scope, pool.scope_held_by_other_worker(&scope, agent.index));
         let owner_generation = pool.record_scope_owner(scope.clone(), agent.index);
         agent
             .state
@@ -5004,6 +5166,61 @@ fn spawn_failure_notice(
     });
 }
 
+/// Whether `event` is a relay replay of an event a restored turn already
+/// carries. The restored turn runs it once; queuing the replay as well would
+/// run it twice.
+fn is_restored_replay(restored: &HashSet<String>, event: &nostr::Event) -> bool {
+    restored.contains(&event.id.to_hex())
+}
+
+/// Requeue the turns the previous run journaled but could not finish, each
+/// once and in its own provider session, and post a notice for the ones that
+/// will not resume (too old, already resumed once, other cwd, unreadable fork
+/// record). Returns the ids of the events now queued again, so a relay replay
+/// of them is not queued a second time.
+fn restore_interrupted_turns(ctx: &PromptContext, queue: &mut EventQueue) -> HashSet<String> {
+    let Some(store) = ctx.turn_journal.store() else {
+        return HashSet::new();
+    };
+    let mut restored = HashSet::new();
+    for action in turn_journal::plan_restore(store, &ctx.cwd, turn_journal::now_unix()) {
+        match action {
+            turn_journal::RestoreAction::Notice { batch, message } => {
+                spawn_failure_notice(Some(&ctx.rest_client), &batch, message);
+            }
+            turn_journal::RestoreAction::Resume { batch, session_id } => {
+                // A turn that ran in the bound fork must take the binding, so
+                // no other scope continues that fork first.
+                if let Err(error) =
+                    ctx.resume_session
+                        .reserve_for_restored(&batch.scope, &session_id, &ctx.cwd)
+                {
+                    tracing::error!(
+                        scope = %batch.scope.telemetry_label(),
+                        "cannot tell whether the restored turn ran in the resumed fork, \
+                         not resuming it: {error}"
+                    );
+                    ctx.turn_journal.discard(&batch.scope);
+                    spawn_failure_notice(
+                        Some(&ctx.rest_client),
+                        &batch,
+                        format!(
+                            "⚠️ My work on this was interrupted by a restart and I couldn't \
+                             resume it ({error}). Please re-send if it's still needed."
+                        ),
+                    );
+                    continue;
+                }
+                restored.extend(batch.events.iter().map(|e| e.event.id.to_hex()));
+                ctx.turn_journal
+                    .register_restart(batch.scope.clone(), session_id);
+                queue.requeue_as_cancelled(batch, CancelReason::Restart);
+            }
+        }
+    }
+    restored
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_prompt_result(
     pool: &mut AgentPool,
@@ -5064,7 +5281,24 @@ fn handle_prompt_result(
         // Don't requeue batches for channels the agent was removed from —
         // those events are stale and should be silently dropped.
         if !removed_channels.contains(&batch.channel_id) {
-            if matches!(
+            if let PromptOutcome::SessionDead(reason) | PromptOutcome::Refused(reason) =
+                &result.outcome
+            {
+                // Fail fast: retrying cannot revive a dead session or fix the
+                // durable record that refused the turn, and must not burn the
+                // retry budget. Post the full reason in the thread; a dead
+                // scope stays dead until `!rotate`.
+                tracing::error!(
+                    channel_id = %batch.channel_id,
+                    events = batch.events.len(),
+                    "dead-lettering batch immediately: {reason}"
+                );
+                spawn_failure_notice(
+                    rest_client,
+                    &batch,
+                    format!("⚠️ I couldn't process the last request: {reason}"),
+                );
+            } else if matches!(
                 result.outcome,
                 PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
             ) {
@@ -5202,6 +5436,8 @@ fn handle_prompt_result(
         PromptOutcome::AgentExited => "exited",
         PromptOutcome::Cancelled => "cancelled",
         PromptOutcome::CancelDrainTimeout(_) => "cancel_drain_timeout",
+        PromptOutcome::SessionDead(_) => "session_dead",
+        PromptOutcome::Refused(_) => "refused",
     };
     let agent_index = result.agent.index;
     // Capture the spawn-time configured model and our PID before the agent is
@@ -5353,6 +5589,18 @@ fn handle_prompt_result(
                 pid = harness_pid,
                 "agent_returned (cancelled)"
             );
+            pool.return_agent(result.agent);
+        }
+        // The scope's provider session is gone. The agent process is fine;
+        // the batch was dead-lettered with a notice above.
+        PromptOutcome::SessionDead(reason) | PromptOutcome::Refused(reason) => {
+            tracing::error!(
+                agent = agent_index,
+                outcome = outcome_label,
+                reason,
+                "agent_returned (turn failed fast — batch dead-lettered)"
+            );
+            emit_turn_error(&reason, None);
             pool.return_agent(result.agent);
         }
         PromptOutcome::ProjectContextIndeterminate(reason) => {
@@ -8233,6 +8481,112 @@ mod author_gate_tests {
         );
     }
 
+    /// Counts INFO "dropping event" lines emitted by the gate.
+    struct DropLineCapture {
+        lines: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for DropLineCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Message(Option<String>);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = Some(format!("{value:?}"));
+                    }
+                }
+            }
+            if *event.metadata().level() != tracing::Level::INFO {
+                return;
+            }
+            let mut message = Message(None);
+            event.record(&mut message);
+            if let Some(message) = message.0 {
+                if message.contains("inbound author gate — dropping event") {
+                    self.lines.lock().unwrap().push(message);
+                }
+            }
+        }
+    }
+
+    /// A dropped event is logged at INFO through the production listener
+    /// boundary (`authorize_listener_event`), at most once per (author,
+    /// channel) window, so a sender cannot amplify the log.
+    #[tokio::test]
+    async fn test_dropped_event_logs_at_info_once_per_author_and_channel() {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let relay_hex = nostr::Keys::generate().public_key().to_hex();
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        let (rest_client, server) = nip11_server(serde_json::json!({ "self": relay_hex })).await;
+        let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "test").await;
+        let stranger = nostr::Keys::generate();
+        let cache = cache_with_sibling();
+        cache.cache_sibling(stranger.public_key().to_hex(), false);
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+        let channel_info = pool::ChannelInfoResolver::new(
+            HashMap::from([first, second].map(|channel_id| {
+                (
+                    channel_id,
+                    relay::ChannelInfo {
+                        name: "general".into(),
+                        channel_type: "stream".into(),
+                        description: None,
+                    },
+                )
+            })),
+            rest_client.clone(),
+        );
+        let message = |channel_id| relay::BuzzEvent {
+            connection_generation: 0,
+            channel_id,
+            event: nostr::EventBuilder::new(
+                nostr::Kind::Custom(KIND_STREAM_MESSAGE as u16),
+                "do this",
+            )
+            .sign_with_keys(&stranger)
+            .expect("signed message"),
+        };
+
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(DropLineCapture {
+            lines: lines.clone(),
+        });
+        async {
+            for channel_id in [first, first, first, second] {
+                let admitted = gate
+                    .authorize_listener_event(
+                        message(channel_id),
+                        &RespondTo::OwnerOnly,
+                        &HashSet::new(),
+                        &cache,
+                        &channel_info,
+                        &rest_client,
+                    )
+                    .await;
+                assert!(admitted.is_none(), "a stranger is dropped under owner-only");
+            }
+        }
+        .with_subscriber(subscriber)
+        .await;
+
+        assert_eq!(
+            lines.lock().unwrap().len(),
+            2,
+            "one INFO line per (author, channel), not one per dropped event"
+        );
+        server.abort();
+    }
+
     #[tokio::test]
     async fn test_dm_rejects_stranger_under_anyone() {
         let cache = cache_with_sibling();
@@ -9518,10 +9872,12 @@ mod build_mcp_servers_tests {
             max_turns_per_session: 0,
             presence_enabled: true,
             typing_enabled: true,
+            stream_mode: crate::stream_draft::StreamMode::Off,
             memory_enabled: false,
             model: None,
             effort_level: None,
             session_title: None,
+            resume_session: None,
             permission_mode: config::PermissionMode::BypassPermissions,
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: std::collections::HashSet::new(),
@@ -10016,18 +10372,37 @@ mod edit_native_steer_tests {
         };
         let scope = ingress.session_scope(scope::SessionPolicy::Channel, false);
         let mut queue = EventQueue::new(config::DedupMode::Queue);
-        let queued = ingress.push(&mut queue, scope);
+        let queued = ingress.push(&mut queue, scope, false);
         assert_eq!(queued.steer_event.edit, Some(resolved));
         assert_eq!(queued.reaction_target_id, original.id.to_hex());
     }
 
     /// Drive a routed edit of `original` through the listener's steer decision
-    /// while a turn for `running_event` is in flight under the channel policy.
-    /// Returns the native steer request, if any, and the control signal sent
-    /// to the running turn, if any.
+    /// while a turn for `running_event` is in flight under the channel policy
+    /// (draft mode: the agent replies with the CLI). Returns the native steer
+    /// request, if any, and the control signal sent to the running turn, if
+    /// any.
     fn steer_edit_into_running_turn(
         running_event: nostr::Event,
         original: &nostr::Event,
+    ) -> (Option<pool::SteerRequest>, Option<ControlSignal>) {
+        let edit = edit_event(&original.id.to_hex(), &[]);
+        let resolved = queue::ResolvedEdit {
+            target_event_id: original.id.to_hex(),
+            target_thread_tags: queue::parse_thread_tags(original),
+        };
+        steer_into_running_turn(running_event, edit, Some(resolved), false, false)
+    }
+
+    /// Drive `new_event` (with its resolved edit route, if any) through the
+    /// listener's steer decision while a turn for `running_event` is in flight
+    /// in the same session scope.
+    fn steer_into_running_turn(
+        running_event: nostr::Event,
+        new_event: nostr::Event,
+        new_edit: Option<queue::ResolvedEdit>,
+        is_dm: bool,
+        autopost: bool,
     ) -> (Option<pool::SteerRequest>, Option<ControlSignal>) {
         let channel_id = Uuid::new_v4();
         let ingress =
@@ -10044,8 +10419,8 @@ mod edit_native_steer_tests {
 
         let mut queue = EventQueue::new(config::DedupMode::Queue);
         let running = ingress(running_event, None);
-        let scope = running.session_scope(scope::SessionPolicy::Channel, false);
-        running.push(&mut queue, scope.clone());
+        let scope = running.session_scope(scope::SessionPolicy::Channel, is_dm);
+        running.push(&mut queue, scope.clone(), is_dm);
         queue.flush_next().expect("running turn");
         assert!(queue.is_scope_in_flight(&scope));
 
@@ -10067,23 +10442,19 @@ mod edit_native_steer_tests {
             },
         );
 
-        let edit = edit_event(&original.id.to_hex(), &[]);
-        let resolved = queue::ResolvedEdit {
-            target_event_id: original.id.to_hex(),
-            target_thread_tags: queue::parse_thread_tags(original),
-        };
-        let edit_ingress = ingress(edit, Some(resolved));
+        let new_ingress = ingress(new_event, new_edit);
         assert_eq!(
-            edit_ingress.session_scope(scope::SessionPolicy::Channel, false),
+            new_ingress.session_scope(scope::SessionPolicy::Channel, is_dm),
             scope,
             "channel policy: one session spans every thread"
         );
         let (ack_tx, _ack_rx) = mpsc::unbounded_channel();
-        edit_ingress
-            .push(&mut queue, scope.clone())
+        new_ingress
+            .push(&mut queue, scope.clone(), is_dm)
             .steer_or_interrupt(
                 MultipleEventHandling::Steer,
                 None,
+                autopost,
                 &mut pool,
                 &mut queue,
                 &ack_tx,
@@ -10128,27 +10499,82 @@ mod edit_native_steer_tests {
     }
 
     /// Under the channel policy a turn started from thread A can be running
-    /// when an edit whose original is in thread B arrives. A native steer
-    /// would leave the turn's `<context>` replying to A, so the edit takes the
-    /// cancel+merge path instead; its re-prompt routes replies to B.
+    /// when an edit whose original is in thread B arrives. It is steered
+    /// natively (cancelling would kill the turn's background subagents), and
+    /// the steer carries its own reply routing to B, because the running
+    /// turn's `<context>` still points at A.
     #[tokio::test]
-    async fn routed_edit_for_another_thread_cancels_and_merges() {
+    async fn routed_edit_for_another_thread_steers_with_its_own_routing() {
         let thread_b = "ab".repeat(32);
         let original = message(Some(&thread_b));
         let (steer, control) = steer_edit_into_running_turn(message(None), &original);
 
-        assert!(steer.is_none(), "no native steer into thread A's turn");
-        assert_eq!(control, Some(ControlSignal::Steer));
+        let body = steer.expect("native steer").prompt_blocks.join("\n");
+        assert_eq!(control, None, "the running turn is not cancelled");
+        assert!(
+            body.contains(&format!("`--reply-to {}`", original.id.to_hex()))
+                && body.contains("different thread"),
+            "{body}"
+        );
     }
 
-    /// The same rule covers a top-level original: replies to it open a thread
-    /// rooted at the original, not at the running turn's top-level trigger.
+    /// A top-level original from another thread is steered too: its reply
+    /// opens a thread rooted at the original.
     #[tokio::test]
-    async fn routed_edit_for_another_top_level_message_cancels_and_merges() {
+    async fn routed_edit_for_another_top_level_message_steers_with_its_own_routing() {
         let original = message(None);
         let (steer, control) = steer_edit_into_running_turn(message(None), &original);
 
-        assert!(steer.is_none(), "no native steer across top-level threads");
+        let body = steer.expect("native steer").prompt_blocks.join("\n");
+        assert_eq!(control, None, "the running turn is not cancelled");
+        assert!(
+            body.contains(&format!("`--reply-to {}`", original.id.to_hex()))
+                && body.contains("root of its own thread"),
+            "{body}"
+        );
+    }
+
+    /// The reported bug: in a DM every new top-level message is its own reply
+    /// thread. It must be steered into the running turn — never cancel it, so
+    /// the turn's background subagents keep running — and told to reply
+    /// top-level.
+    #[tokio::test]
+    async fn dm_top_level_message_mid_turn_steers_without_cancelling() {
+        let (steer, control) =
+            steer_into_running_turn(message(None), message(None), None, true, false);
+
+        let body = steer.expect("native steer").prompt_blocks.join("\n");
+        assert_eq!(control, None, "a new DM message must not cancel the turn");
+        assert!(
+            body.contains("new top-level message in the DM")
+                && body.contains("without `--reply-to`"),
+            "{body}"
+        );
+    }
+
+    /// A message in the running turn's own thread needs no extra routing.
+    #[tokio::test]
+    async fn same_thread_steer_carries_no_extra_routing() {
+        let running = message(None);
+        let root = running.id.to_hex();
+        let (steer, control) =
+            steer_into_running_turn(running, message(Some(&root)), None, false, false);
+        let body = steer.expect("native steer").prompt_blocks.join("\n");
+        assert_eq!(control, None);
+        assert!(!body.contains("IMPORTANT"), "{body}");
+    }
+
+    /// When the harness autoposts the turn's response text, a message for
+    /// another thread still cancels and merges: an autoposted reply would land
+    /// in the running turn's thread.
+    #[tokio::test]
+    async fn autopost_mode_keeps_the_same_thread_gate() {
+        let (steer, control) =
+            steer_into_running_turn(message(None), message(None), None, true, true);
+        assert!(
+            steer.is_none(),
+            "no native steer across threads when autoposting"
+        );
         assert_eq!(control, Some(ControlSignal::Steer));
     }
 }
@@ -10210,10 +10636,12 @@ mod error_outcome_emission_tests {
             max_turns_per_session: 0,
             presence_enabled: true,
             typing_enabled: true,
+            stream_mode: crate::stream_draft::StreamMode::Off,
             memory_enabled: false,
             model: None,
             effort_level: None,
             session_title: None,
+            resume_session: None,
             permission_mode: config::PermissionMode::BypassPermissions,
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
@@ -11839,6 +12267,206 @@ mod error_outcome_emission_tests {
             0,
             "auth error must dead-letter immediately — no events should be pending"
         );
+    }
+
+    /// A dead provider session dead-letters its batch at once (no requeue, no
+    /// retry budget spent), posts the full reason in the thread, and emits
+    /// exactly one `turn_error` with it.
+    #[tokio::test]
+    async fn session_dead_dead_letters_with_the_reason_and_one_turn_error() {
+        let reason = "my session s-1 for this conversation is gone (code -32603): Internal error: Session not found";
+        fail_fast_outcome_dead_letters(
+            PromptOutcome::SessionDead(reason.into()),
+            reason,
+            "session_dead",
+        )
+        .await;
+    }
+
+    /// A turn refused for an unwritable durable record is dead-lettered the
+    /// same way, with the io error in the thread.
+    #[tokio::test]
+    async fn refused_turn_dead_letters_with_the_reason_and_one_turn_error() {
+        let reason = "couldn't save restart record: failed to create turn-journal record /x: Not a directory";
+        fail_fast_outcome_dead_letters(PromptOutcome::Refused(reason.into()), reason, "refused")
+            .await;
+    }
+
+    async fn fail_fast_outcome_dead_letters(
+        outcome: PromptOutcome,
+        reason: &str,
+        outcome_label: &str,
+    ) {
+        let relay = crate::stream_draft::test_relay::FakeRelay::spawn().await;
+        let rest = relay.rest(&Keys::generate());
+        let channel_id = uuid::Uuid::new_v4();
+        let scope = scope::SessionScope::Conversation { channel_id };
+        let event = nostr::EventBuilder::new(nostr::Kind::Custom(9), "test")
+            .sign_with_keys(&nostr::Keys::generate())
+            .unwrap();
+        let batch = FlushBatch {
+            channel_id,
+            scope: scope.clone(),
+            events: vec![BatchEvent {
+                edit: None,
+                event,
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                scope: None,
+                turn_id: "test-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = std::collections::HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let observer = ObserverHandle::in_process();
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(scope),
+            turn_id: "test-turn-id".to_string(),
+            outcome,
+            batch: Some(batch),
+        };
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            Some(observer.clone()),
+            Some(&rest),
+        );
+        assert_eq!(queue.queued_event_count(channel_id), 0, "never requeued");
+        assert_eq!(queue.pending_channels(), 0);
+        assert!(pool.any_idle(), "the healthy agent returns to the pool");
+        let turn_errors: Vec<_> = observer
+            .snapshot()
+            .into_iter()
+            .filter(|e| e.kind == "turn_error")
+            .collect();
+        assert_eq!(turn_errors.len(), 1);
+        assert_eq!(turn_errors[0].payload["error"], reason);
+        assert_eq!(turn_errors[0].payload["outcome"], outcome_label);
+        let posted = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let posted = relay.posted_messages();
+                if !posted.is_empty() {
+                    return posted;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("notice posted");
+        assert_eq!(posted.len(), 1);
+        let content = posted[0]["content"].as_str().unwrap_or_default();
+        assert!(content.contains(reason), "{content}");
+    }
+
+    /// Startup re-queues each resumable journaled turn once, marks its scope
+    /// to resume the recorded session, posts a notice for a record it will
+    /// not resume, and reports the restored event ids so relay replays of
+    /// them are skipped.
+    #[tokio::test]
+    async fn restore_interrupted_turns_requeues_once_and_skips_replays() {
+        let relay = crate::stream_draft::test_relay::FakeRelay::spawn().await;
+        let state = tempfile::tempdir().expect("state dir");
+        let store = turn_journal::TurnJournalStore::new(state.path(), "agent-hex");
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let mut ctx = pool::tests::make_prompt_context_no_owner();
+        ctx.rest_client = relay.rest(&Keys::generate());
+        ctx.turn_journal = turn_journal::TurnJournal::new(store.clone(), shutdown_rx);
+        let batch_for = |content: &str| {
+            let channel_id = uuid::Uuid::new_v4();
+            FlushBatch {
+                channel_id,
+                scope: scope::SessionScope::Conversation { channel_id },
+                events: vec![BatchEvent {
+                    edit: None,
+                    event: nostr::EventBuilder::new(nostr::Kind::Custom(9), content)
+                        .sign_with_keys(&nostr::Keys::generate())
+                        .unwrap(),
+                    prompt_tag: "test".into(),
+                    received_at: std::time::Instant::now(),
+                }],
+                cancelled_events: vec![],
+                cancel_reason: None,
+            }
+        };
+        let resumable = batch_for("resume me");
+        let stale = batch_for("too old");
+        let now = turn_journal::now_unix();
+        store
+            .save(&turn_journal::TurnRecord::for_turn(
+                &resumable, "s-1", &ctx.cwd, now,
+            ))
+            .unwrap();
+        store
+            .save(&turn_journal::TurnRecord::for_turn(
+                &stale, "s-2", &ctx.cwd, 0,
+            ))
+            .unwrap();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+
+        let restored = restore_interrupted_turns(&ctx, &mut queue);
+        let resumed_event = &resumable.events[0].event;
+        assert!(is_restored_replay(&restored, resumed_event));
+        assert!(!is_restored_replay(&restored, &stale.events[0].event));
+        assert_eq!(
+            ctx.turn_journal
+                .restart_session(&resumable.scope)
+                .as_deref(),
+            Some("s-1")
+        );
+        assert_eq!(ctx.turn_journal.restart_session(&stale.scope), None);
+        let flushed = queue.flush_next().expect("the restored turn is queued");
+        assert_eq!(flushed.scope, resumable.scope);
+        assert_eq!(flushed.cancel_reason, Some(CancelReason::Restart));
+        assert_eq!(flushed.events[0].event.id, resumed_event.id);
+        assert!(queue.flush_next().is_none(), "the stale turn is not queued");
+        let posted = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let posted = relay.posted_messages();
+                if !posted.is_empty() {
+                    return posted;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("notice posted for the stale record");
+        assert!(posted[0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("24 hours"));
     }
 
     /// Run a model-not-found turn failure for `event` through

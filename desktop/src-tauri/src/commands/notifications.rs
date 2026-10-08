@@ -101,7 +101,11 @@ mod linux {
 
                 // The frontend focuses the window on activation (the same path
                 // every other platform uses), so we only forward the target.
-                let _ = app.emit(NATIVE_NOTIFICATION_ACTIVATED_EVENT, target);
+                let _ = app.emit_to(
+                    crate::popout::MAIN_WINDOW_LABEL,
+                    NATIVE_NOTIFICATION_ACTIVATED_EVENT,
+                    target,
+                );
             });
         });
     }

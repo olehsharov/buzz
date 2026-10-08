@@ -109,6 +109,7 @@ Configuration (flags override env vars):
   BUZZ_AUTH_TAG      NIP-OA auth tag JSON  [optional]
 
 The 'pack' subcommand runs locally and does not require a relay connection.
+The 'host' subcommand uses its own host key and the relay from pairing.
 
 Exit codes: 0=ok  1=bad input  2=relay/network error  3=auth error  4=other  5=write conflict
 Errors are JSON on stderr: {\"error\": \"<category>\", \"message\": \"<detail>\"}"
@@ -276,6 +277,9 @@ enum Cmd {
     /// Persona pack operations (local, no relay connection needed)
     #[command(subcommand)]
     Pack(PackCmd),
+    /// Run this machine as an agent host for your Buzz desktop (pair, run, status)
+    #[command(subcommand)]
+    Host(buzz_host::HostCmd),
     /// Community moderation — reports queue, bans, timeouts, audit trail
     #[command(subcommand)]
     Moderation(ModerationCmd),
@@ -309,9 +313,35 @@ pub enum AgentsCmd {
         /// Proposed agent name
         #[arg(long)]
         display_name: String,
-        /// Proposed instructions; use '-' to read from stdin
-        #[arg(long)]
+        /// Proposed instructions; use '-' to read from stdin. Omit to let the owner write them
+        #[arg(long, default_value = "")]
         system_prompt: String,
+        /// Agent runtime id, e.g. claude
+        #[arg(long)]
+        runtime: Option<String>,
+        /// Model id for the runtime
+        #[arg(long)]
+        model: Option<String>,
+        /// Who the agent responds to
+        #[arg(long, value_parser = ["owner-only", "allowlist", "anyone", "nobody"])]
+        respond_to: Option<String>,
+        /// Environment variable KEY=VALUE (repeatable); only ANTHROPIC_AUTH_TOKEN,
+        /// ANTHROPIC_BASE_URL and BUZZ_ACP_RESUME_SESSION are allowed. Never pass secrets.
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// Avatar emoji (one emoji); requires --avatar-color
+        #[arg(long)]
+        avatar_emoji: Option<String>,
+        /// Avatar background color as #RRGGBB; requires --avatar-emoji
+        #[arg(long)]
+        avatar_color: Option<String>,
+        /// Compute provider id to run the agent on, e.g. my-ssh-host
+        #[arg(long)]
+        run_on: Option<String>,
+        /// Provider setting key=value (repeatable, max 20), e.g. host=... or workdir=...;
+        /// requires --run-on
+        #[arg(long, value_name = "KEY=VALUE")]
+        provider_config: Vec<String>,
     },
     /// Open a prefilled edit-agent form in the owner's Buzz Desktop
     DraftUpdate {
@@ -410,7 +440,7 @@ buzz agents archived"
 pub enum MessagesCmd {
     /// Send a message to a channel
     #[command(
-        after_help = "Examples:\n  buzz messages send --channel <UUID> --content \"hello\"\n  buzz messages send --channel <UUID> --content \"@alice check this\"\n  echo \"hello from stdin\" | buzz messages send --channel <UUID> --content -"
+        after_help = "Examples:\n  buzz messages send --channel <UUID> --content \"hello\"\n  buzz messages send --channel <UUID> --content \"@alice check this\"\n  buzz messages send --channel <UUID> --content \"@all standup in 5\"\n  echo \"hello from stdin\" | buzz messages send --channel <UUID> --content -\n\n@all is reserved: it always means every channel member except you, agents included (never a member named \"all\" — use --mention <pubkey> for them), and is ignored inside code blocks or inline code. --mention-all does the same and prepends \"@all \" when the content lacks the token."
     )]
     Send {
         /// Channel UUID (from 'buzz channels list')
@@ -434,6 +464,9 @@ pub enum MessagesCmd {
         /// Pubkey to mention (hex or npub; repeatable). Supplying any explicit identity permits unresolved or ambiguous @Name text as presentation-only; uniquely resolved member names still notify.
         #[arg(long = "mention")]
         mentions: Vec<String>,
+        /// Mention every channel member, like an `@all` token in --content: one p-tag per member except you (people and agents alike) plus a `buzz:mention-group` marker. Prepends "@all " to --content unless it already has an @all token outside code. Fails if more than 50 members qualify or the channel is a DM.
+        #[arg(long = "mention-all", default_value_t = false)]
+        mention_all: bool,
     },
     /// Send a code diff / patch to a channel
     SendDiff {
@@ -2154,6 +2187,16 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         };
     }
 
+    // Host commands carry their own identity (the host key) and relay.
+    if let Cmd::Host(sub) = cli.command {
+        return buzz_host::run(sub).await.map_err(|e| match e {
+            buzz_host::HostError::Invalid(_) | buzz_host::HostError::NotPaired => {
+                CliError::Usage(e.to_string())
+            }
+            other => CliError::Other(other.to_string()),
+        });
+    }
+
     // Auth: private key is required for all relay operations.
     // The keypair IS the identity — no tokens, no other auth.
     let private_key_str = cli.private_key.ok_or_else(|| {
@@ -2214,7 +2257,7 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         Cmd::Upload(sub) => commands::upload::dispatch(sub, &client).await,
         Cmd::Mem(sub) => commands::mem::dispatch(sub, &client).await,
         Cmd::Moderation(sub) => commands::moderation::dispatch(sub, &client, &cli.format).await,
-        Cmd::Pack(_) => unreachable!("handled above"),
+        Cmd::Pack(_) | Cmd::Host(_) => unreachable!("handled above"),
     }
 }
 
@@ -2372,6 +2415,7 @@ mod tests {
             "emoji",
             "feed",
             "gifs",
+            "host",
             "issues",
             "media",
             "mem",

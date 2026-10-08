@@ -47,6 +47,7 @@ import 'agent_activity/working_bots_provider.dart';
 import 'channel_management_provider.dart';
 import 'channel_sections/channel_sections_provider.dart';
 import 'channel_messages_provider.dart';
+import 'channel_timeline_provider.dart';
 import 'channel_typing_provider.dart';
 import 'channel_typing_indicator.dart';
 import 'channels_provider.dart';
@@ -271,23 +272,42 @@ class ChannelDetailPage extends HookConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final composerDockHeight = useState(0.0);
+    // Composer and IME height changes only move the timeline's bottom inset,
+    // so they flow through a listenable instead of rebuilding this page.
+    final composerDockHeight = useValueNotifier(0.0);
     final composerFocusNode = useFocusNode();
     final restoreComposerFocus = useRef<VoidCallback?>(null);
+    final restoreComposerFocusCallback = useCallback(
+      () => restoreComposerFocus.value?.call(),
+      const [],
+    );
     final sendMessage = ref.read(sendMessageProvider);
     final detailsAsync = ref.watch(channelDetailsProvider(channel.id));
     final channelsAsync = ref.watch(channelsProvider);
     final messagesState = ref.watch(channelMessagesProvider(channel.id));
     final huddleLifecycle =
         ref.watch(huddleLifecycleProvider(channel.id)).value ?? const [];
-    final sessionStatus = ref.watch(relaySessionProvider).status;
-    final readState = ref.watch(readStateProvider);
+    final sessionStatus = ref.watch(
+      relaySessionProvider.select((session) => session.status),
+    );
+    // Only what this page displays: other contexts' read markers must not
+    // rebuild the conversation.
+    final readStateView = ref.watch(
+      readStateProvider.select(
+        (state) => (
+          isReady: state.isReady,
+          isChannelForcedUnread: state.isForcedUnread(channel.id),
+        ),
+      ),
+    );
     final channelsNotifier = ref.read(channelsProvider.notifier);
     final initialOrdinaryUnreadMessageIdsRef = useRef<Set<String>>(const {});
     final initialOldestOrdinaryUnreadMessageIdRef = useRef<String?>(null);
     final initialForcedUnreadMessageIdsRef = useRef<Set<String>>(const {});
     final didCaptureInitialReadAt = useRef(false);
-    if (readState.isReady && !didCaptureInitialReadAt.value) {
+    if (readStateView.isReady && !didCaptureInitialReadAt.value) {
+      // One-time snapshot of the unread boundary at open.
+      final readState = ref.read(readStateProvider);
       final channelReadAt = readState.effectiveTimestamp(channel.id);
       final ordinaryUnreadEvents = [
         for (final event
@@ -560,7 +580,7 @@ class ChannelDetailPage extends HookConsumerWidget {
     );
 
     useEffect(() {
-      if (!readState.isReady || readTimestamp == null) {
+      if (!readStateView.isReady || readTimestamp == null) {
         return null;
       }
       return deferReadStateUpdate(context, () {
@@ -571,7 +591,7 @@ class ChannelDetailPage extends HookConsumerWidget {
             .read(channelsProvider.notifier)
             .clearObservedUnreadCoveredByRead(channel.id, readTimestamp);
       });
-    }, [channel.id, readState.isReady, readTimestamp]);
+    }, [channel.id, readStateView.isReady, readTimestamp]);
 
     return FrostedScaffold(
       resizeToAvoidBottomInset:
@@ -730,23 +750,13 @@ class ChannelDetailPage extends HookConsumerWidget {
                               ),
                             ),
                           ),
-                          data: (events) {
-                            final messages = formatTimeline(
-                              events,
-                              currentPubkey: currentPubkey,
-                            );
-                            final summaries = ref
-                                .read(
-                                  channelMessagesProvider(channel.id).notifier,
-                                )
-                                .threadSummaries;
-                            final entries = buildMainTimelineEntries(
-                              messages,
-                              relaySummaries: summaries,
+                          data: (_) {
+                            final timeline = ref.watch(
+                              channelTimelineProvider(channel.id),
                             );
                             return _MessageList(
-                              entries: entries,
-                              allMessages: messages,
+                              entries: timeline.entries,
+                              allMessages: timeline.messages,
                               initialMessageId: initialMessageId,
                               initialThreadRootId: initialThreadRootId,
                               initialThreadRouteBehavior:
@@ -758,8 +768,8 @@ class ChannelDetailPage extends HookConsumerWidget {
                               initialForcedUnreadMessageIds:
                                   initialForcedUnreadMessageIds,
                               hasInitialUnread:
-                                  readState.isReady &&
-                                  (readState.isForcedUnread(channel.id) ||
+                                  readStateView.isReady &&
+                                  (readStateView.isChannelForcedUnread ||
                                       initialForcedUnreadMessageIds
                                           .isNotEmpty ||
                                       initialOldestOrdinaryUnreadMessageId !=
@@ -771,13 +781,13 @@ class ChannelDetailPage extends HookConsumerWidget {
                               appBarTitleContentHeight:
                                   appBarTitleContentHeight,
                               composerBottomInset: showsComposer
-                                  ? composerDockHeight.value
-                                  : 0,
+                                  ? composerDockHeight
+                                  : const AlwaysStoppedAnimation(0.0),
                               composerFocusNode: showsComposer
                                   ? composerFocusNode
                                   : null,
                               restoreComposerFocus: showsComposer
-                                  ? () => restoreComposerFocus.value?.call()
+                                  ? restoreComposerFocusCallback
                                   : null,
                             );
                           },

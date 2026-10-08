@@ -3,6 +3,7 @@ import { orderMentionPubkeysByText } from "@/features/messages/lib/orderMentionP
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { isAgentAddressMentionTag } from "./agentAddressMention.mjs";
+import { isMentionAllMarkerTag } from "@/shared/lib/mentionGroup";
 import { resolveMentionProps } from "@/shared/lib/resolveMentionNames";
 
 const PUBKEY_PATTERN = /^[0-9a-f]{64}$/;
@@ -90,6 +91,14 @@ export function getSendToChannelSemantics(
         mentionPubkeys.push(pubkey);
       }
       if (tag[0] === "p") continue;
+    }
+
+    // The `@all` marker travels only with the original notification audience
+    // (its p-tags); an edit snapshot forwards named references only, so the
+    // forwarded body must not claim a group it no longer notifies.
+    if (isMentionAllMarkerTag(tag)) {
+      if (!hasMentionSnapshot) semanticTags.push([...tag]);
+      continue;
     }
 
     if (SHAREABLE_TAG_KINDS.has(tag[0] ?? "")) {

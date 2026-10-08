@@ -6,9 +6,8 @@ use crate::{
     models::{ChannelDetailInfo, ChannelInfo, ChannelMembersResponse, GetChannelsPayload},
     nostr_convert,
     relay::{
-        assert_expected_relay_scope, assert_expected_signer, query_relay,
-        relay_api_base_url_with_override, submit_event, submit_event_at_with_keys,
-        submit_event_with_keys,
+        assert_expected_relay_scope, assert_expected_signer, query_relay_at, submit_event_at,
+        submit_event_at_with_keys,
     },
 };
 
@@ -57,9 +56,10 @@ const STARTER_CHANNELS: &[StarterChannelSpec] = &[
 #[tauri::command]
 pub async fn get_channels(
     known_hash: Option<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<GetChannelsPayload, String> {
-    let channels = fetch_channels(&state, DirectoryScope::MemberOnly).await?;
+    let channels = fetch_channels(&state, &relay.api_base(), DirectoryScope::MemberOnly).await?;
 
     let last_messages: std::collections::HashMap<String, String> = channels
         .iter()
@@ -98,18 +98,26 @@ pub async fn get_channels(
 /// when a user is actually looking for channels to join.
 #[tauri::command]
 pub async fn get_open_channel_directory(
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<Vec<ChannelInfo>, String> {
-    fetch_channels(&state, DirectoryScope::IncludeOpenDirectory).await
+    fetch_channels(
+        &state,
+        &relay.api_base(),
+        DirectoryScope::IncludeOpenDirectory,
+    )
+    .await
 }
 
 #[tauri::command]
 pub async fn get_channel_details(
     channel_id: String,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<ChannelDetailInfo, String> {
-    let events = query_relay(
+    let events = query_relay_at(
         &state,
+        &relay.api_base(),
         &[serde_json::json!({
             "kinds": [39000],
             "#d": [channel_id],
@@ -144,13 +152,16 @@ fn profile_join_pubkeys(members: &[crate::models::ChannelMemberInfo], limit: usi
 }
 
 #[tauri::command]
-pub async fn get_channel_members(
+pub async fn get_channel_members<R: tauri::Runtime>(
     channel_id: String,
     read_your_writes: Option<bool>,
+    app: tauri::AppHandle<R>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<ChannelMembersResponse, String> {
-    let events = query_relay(
+    let events = query_relay_at(
         &state,
+        &relay.api_base(),
         &[channel_members_filter(
             &channel_id,
             read_your_writes.unwrap_or(false),
@@ -163,13 +174,24 @@ pub async fn get_channel_members(
         .map(nostr_convert::channel_members_from_event)
         .transpose()?
         .ok_or_else(|| "channel members not found".to_string())?;
+    // An agent belongs to ONE community: this device's agents from another
+    // community stay hidden from this community's rosters even where an
+    // older build left them channel members here.
+    let hidden = crate::managed_agents::community_scope::load_other_community_agent_pubkeys(
+        &app,
+        relay.ws_url(),
+    )?;
+    response
+        .members
+        .retain(|member| !hidden.contains(&member.pubkey.to_ascii_lowercase()));
 
     // Batch-fetch kind:0 profiles to populate display names, capped so the
     // query cost is bounded on large rosters (see MEMBER_PROFILE_JOIN_LIMIT).
     let pubkeys = profile_join_pubkeys(&response.members, MEMBER_PROFILE_JOIN_LIMIT);
     if !pubkeys.is_empty() {
-        let profile_events = query_relay(
+        let profile_events = query_relay_at(
             &state,
+            &relay.api_base(),
             &[serde_json::json!({
                 "kinds": [0],
                 "authors": pubkeys,
@@ -247,6 +269,7 @@ fn has_all_starter_channels(channels: &[ChannelInfo]) -> bool {
 
 async fn ensure_starter_channel_memberships(
     state: &AppState,
+    api_base_url: &str,
     keys: &nostr::Keys,
     channels: &mut [ChannelInfo],
     changed_channel_ids: &mut Vec<String>,
@@ -265,7 +288,7 @@ async fn ensure_starter_channel_memberships(
 
         let channel_uuid = parse_channel_uuid(&channel.id)?;
         let builder = events::build_join(channel_uuid)?;
-        submit_event_with_keys(builder, state, keys, None).await?;
+        submit_event_at_with_keys(builder, state, api_base_url, keys).await?;
         channel.is_member = true;
         changed_channel_ids.push(channel.id.clone());
     }
@@ -304,13 +327,15 @@ pub(crate) fn channel_metadata_filter(channel_ids: &[impl serde::Serialize]) -> 
 
 async fn fetch_starter_channel_metadata(
     state: &AppState,
+    api_base_url: &str,
     channel_ids: &[String],
 ) -> Result<Vec<ChannelInfo>, String> {
     if channel_ids.is_empty() {
         return Ok(Vec::new());
     }
 
-    let events = query_relay(state, &[channel_metadata_filter(channel_ids)]).await?;
+    let events =
+        query_relay_at(state, api_base_url, &[channel_metadata_filter(channel_ids)]).await?;
 
     events
         .iter()
@@ -325,6 +350,7 @@ pub async fn create_channel(
     visibility: String,
     description: Option<String>,
     ttl_seconds: Option<i32>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<ChannelInfo, String> {
     let channel_uuid = uuid::Uuid::new_v4();
@@ -354,7 +380,7 @@ pub async fn create_channel(
     // able to retarget the mark onto the new identity.
     let creator_keys = state.signing_keys()?;
     let creator_pubkey = creator_keys.public_key().to_hex();
-    submit_event_with_keys(builder, &state, &creator_keys, None).await?;
+    submit_event_at_with_keys(builder, &state, &relay.api_base(), &creator_keys).await?;
 
     // Mark this channel pending-owner: we just created it, so we know we're
     // the owner, but the relay's kind:39002 membership entry (#1761) is
@@ -366,7 +392,12 @@ pub async fn create_channel(
     state.mark_pending_owned_channel(&creator_pubkey, &channel_uuid_string);
 
     // Re-fetch the canonical metadata event to return ChannelInfo.
-    let events = query_relay(&state, &[channel_metadata_filter(&[&channel_uuid_string])]).await?;
+    let events = query_relay_at(
+        &state,
+        &relay.api_base(),
+        &[channel_metadata_filter(&[&channel_uuid_string])],
+    )
+    .await?;
 
     events
         .first()
@@ -388,11 +419,14 @@ pub struct StarterChannelsResult {
 
 #[tauri::command]
 pub async fn ensure_starter_channels(
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<StarterChannelsResult, String> {
     let mut changed_channel_ids = Vec::new();
     let (channels, error) =
-        match ensure_starter_channels_inner(&state, &mut changed_channel_ids).await {
+        match ensure_starter_channels_inner(&state, &relay.api_base(), &mut changed_channel_ids)
+            .await
+        {
             Ok(channels) => (channels, None),
             Err(error) => (Vec::new(), Some(error)),
         };
@@ -405,10 +439,12 @@ pub async fn ensure_starter_channels(
 
 async fn ensure_starter_channels_inner(
     state: &AppState,
+    api_base_url: &str,
     changed_channel_ids: &mut Vec<String>,
 ) -> Result<Vec<ChannelInfo>, String> {
-    let mut existing_channels = fetch_channels(state, DirectoryScope::IncludeOpenDirectory).await?;
-    let relay_scope = relay_api_base_url_with_override(state);
+    let mut existing_channels =
+        fetch_channels(state, api_base_url, DirectoryScope::IncludeOpenDirectory).await?;
+    let relay_scope = api_base_url.to_string();
     let creator_keys = state.signing_keys()?;
     let creator_pubkey = creator_keys.public_key().to_hex();
     let mut starter_ids = Vec::with_capacity(STARTER_CHANNELS.len());
@@ -434,7 +470,7 @@ async fn ensure_starter_channels_inner(
             None,
         )?;
 
-        match submit_event_with_keys(builder, state, &creator_keys, None).await {
+        match submit_event_at_with_keys(builder, state, api_base_url, &creator_keys).await {
             Ok(_) => {
                 state.mark_pending_owned_channel(&creator_pubkey, &channel_uuid_string);
                 created_ids.insert(channel_uuid_string.clone());
@@ -448,7 +484,7 @@ async fn ensure_starter_channels_inner(
     }
 
     for _ in 0..3 {
-        let metadata = fetch_starter_channel_metadata(state, &starter_ids).await?;
+        let metadata = fetch_starter_channel_metadata(state, api_base_url, &starter_ids).await?;
         for mut channel in metadata {
             if created_ids.contains(&channel.id) {
                 channel.is_member = true;
@@ -467,7 +503,8 @@ async fn ensure_starter_channels_inner(
     }
 
     if !has_all_starter_channels(&existing_channels) {
-        existing_channels = fetch_channels(state, DirectoryScope::IncludeOpenDirectory).await?;
+        existing_channels =
+            fetch_channels(state, api_base_url, DirectoryScope::IncludeOpenDirectory).await?;
     }
 
     if !has_all_starter_channels(&existing_channels) {
@@ -476,6 +513,7 @@ async fn ensure_starter_channels_inner(
 
     ensure_starter_channel_memberships(
         state,
+        api_base_url,
         &creator_keys,
         &mut existing_channels,
         changed_channel_ids,
@@ -502,6 +540,7 @@ pub struct UpdateChannelInput {
 #[tauri::command]
 pub async fn update_channel(
     input: UpdateChannelInput,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<ChannelDetailInfo, String> {
     let uuid = parse_channel_uuid(&input.channel_id)?;
@@ -512,9 +551,14 @@ pub async fn update_channel(
         input.visibility.as_deref(),
         input.ttl_seconds,
     )?;
-    submit_event(builder, &state).await?;
+    submit_event_at(builder, &state, &relay.api_base()).await?;
 
-    let events = query_relay(&state, &[channel_metadata_filter(&[&input.channel_id])]).await?;
+    let events = query_relay_at(
+        &state,
+        &relay.api_base(),
+        &[channel_metadata_filter(&[&input.channel_id])],
+    )
+    .await?;
 
     events
         .first()
@@ -527,11 +571,12 @@ pub async fn update_channel(
 pub async fn set_channel_topic(
     channel_id: String,
     topic: String,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let uuid = parse_channel_uuid(&channel_id)?;
     let builder = events::build_set_topic(uuid, &topic)?;
-    submit_event(builder, &state).await?;
+    submit_event_at(builder, &state, &relay.api_base()).await?;
     Ok(())
 }
 
@@ -539,38 +584,48 @@ pub async fn set_channel_topic(
 pub async fn set_channel_purpose(
     channel_id: String,
     purpose: String,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let uuid = parse_channel_uuid(&channel_id)?;
     let builder = events::build_set_purpose(uuid, &purpose)?;
-    submit_event(builder, &state).await?;
+    submit_event_at(builder, &state, &relay.api_base()).await?;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn archive_channel(channel_id: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn archive_channel(
+    channel_id: String,
+    relay: crate::window_relay::WindowRelay,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let uuid = parse_channel_uuid(&channel_id)?;
     let builder = events::build_archive(uuid)?;
-    submit_event(builder, &state).await?;
+    submit_event_at(builder, &state, &relay.api_base()).await?;
     Ok(())
 }
 
 #[tauri::command]
 pub async fn unarchive_channel(
     channel_id: String,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let uuid = parse_channel_uuid(&channel_id)?;
     let builder = events::build_unarchive(uuid)?;
-    submit_event(builder, &state).await?;
+    submit_event_at(builder, &state, &relay.api_base()).await?;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn delete_channel(channel_id: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn delete_channel(
+    channel_id: String,
+    relay: crate::window_relay::WindowRelay,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let uuid = parse_channel_uuid(&channel_id)?;
     let builder = events::build_delete_channel(uuid)?;
-    submit_event(builder, &state).await?;
+    submit_event_at(builder, &state, &relay.api_base()).await?;
     Ok(())
 }
 
@@ -581,10 +636,11 @@ pub async fn add_channel_members(
     role: Option<String>,
     expected_relay_url: Option<String>,
     expected_signer_pubkey: Option<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     let uuid = parse_channel_uuid(&channel_id)?;
-    let relay_base = relay_api_base_url_with_override(&state);
+    let relay_base = relay.api_base();
     assert_expected_relay_scope(expected_relay_url.as_deref(), &relay_base)?;
     let signing_keys = state.signing_keys()?;
     assert_expected_signer(
@@ -623,11 +679,12 @@ pub async fn add_channel_members(
 pub async fn remove_channel_member(
     channel_id: String,
     pubkey: String,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let uuid = parse_channel_uuid(&channel_id)?;
     let builder = events::build_remove_member(uuid, &pubkey)?;
-    submit_event(builder, &state).await?;
+    submit_event_at(builder, &state, &relay.api_base()).await?;
     Ok(())
 }
 
@@ -636,6 +693,7 @@ pub async fn change_channel_member_role(
     channel_id: String,
     pubkey: String,
     role: String,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let uuid = parse_channel_uuid(&channel_id)?;
@@ -647,23 +705,31 @@ pub async fn change_channel_member_role(
         other => return Err(format!("invalid role: {other}")),
     };
     let builder = events::build_add_member(uuid, &pubkey, Some(role_str))?;
-    submit_event(builder, &state).await?;
+    submit_event_at(builder, &state, &relay.api_base()).await?;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn join_channel(channel_id: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn join_channel(
+    channel_id: String,
+    relay: crate::window_relay::WindowRelay,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let uuid = parse_channel_uuid(&channel_id)?;
     let builder = events::build_join(uuid)?;
-    submit_event(builder, &state).await?;
+    submit_event_at(builder, &state, &relay.api_base()).await?;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn leave_channel(channel_id: String, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn leave_channel(
+    channel_id: String,
+    relay: crate::window_relay::WindowRelay,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let uuid = parse_channel_uuid(&channel_id)?;
     let builder = events::build_leave(uuid)?;
-    submit_event(builder, &state).await?;
+    submit_event_at(builder, &state, &relay.api_base()).await?;
     Ok(())
 }
 

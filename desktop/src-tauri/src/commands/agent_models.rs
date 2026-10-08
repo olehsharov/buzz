@@ -19,11 +19,11 @@ use crate::{
     app_state::AppState,
     managed_agents::{
         current_instance_id, discovery_env_with_baked_floor, find_managed_agent_mut,
-        known_acp_runtime, load_global_agent_config, load_managed_agents, load_personas,
-        managed_agent_avatar_url, missing_command_message, normalize_agent_args, resolve_command,
-        save_managed_agents, sync_managed_agent_processes, try_regenerate_nest, AgentModelInfo,
-        AgentModelsResponse, ManagedAgentRecord, UpdateManagedAgentRequest,
-        UpdateManagedAgentResponse, DEFAULT_ACP_COMMAND,
+        known_acp_runtime, load_managed_agents, load_personas, managed_agent_avatar_url,
+        missing_command_message, normalize_agent_args, resolve_command, save_managed_agents,
+        sync_managed_agent_processes, try_regenerate_nest, AgentModelInfo, AgentModelsResponse,
+        ManagedAgentRecord, UpdateManagedAgentRequest, UpdateManagedAgentResponse,
+        DEFAULT_ACP_COMMAND,
     },
     relay::{relay_ws_url_with_override, sync_managed_agent_profile},
 };
@@ -69,7 +69,7 @@ pub async fn get_agent_models(
         // so model discovery runs against the persona's current harness, not the
         // frozen record snapshot. An explicit per-agent override wins.
         let personas = load_personas(&app).unwrap_or_default();
-        let global = load_global_agent_config(&app).unwrap_or_default();
+        let global = crate::managed_agents::load_agent_defaults_for_agent(&app, record);
 
         // Single pure helper — descriptor + authoritative model/provider
         // resolver, packaged so the linked-agent regression test binds the
@@ -198,8 +198,12 @@ pub struct DiscoverAgentModelsInput {
 #[tauri::command]
 pub async fn discover_agent_models(
     input: DiscoverAgentModelsInput,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<AgentModelsResponse, String> {
+    // Only the mesh-llm build's shared-compute discovery reads the relay.
+    #[cfg(not(feature = "mesh-llm"))]
+    let _ = &relay;
     crate::managed_agents::validate_user_env_keys(&input.env_vars)?;
     // Also validate definition_env (caller-supplied, same trust level as env_vars).
     crate::managed_agents::validate_user_env_keys(&input.definition_env)?;
@@ -244,8 +248,10 @@ pub async fn discover_agent_models(
     if input.provider.as_deref().map(str::trim)
         == Some(crate::managed_agents::RELAY_MESH_PROVIDER_ID)
     {
-        let events = crate::relay::query_relay(
+        // Shared compute is per community: ask the invoking window's relay.
+        let events = crate::relay::query_relay_at(
             &state,
+            &relay.api_base(),
             &[
                 crate::mesh_llm::mesh_status_filter(),
                 crate::mesh_llm::relay_membership_filter(),
@@ -698,8 +704,13 @@ use databricks::{discover_databricks_models, DatabricksAuthIntent};
 
 #[path = "agent_models_update.rs"]
 mod update;
+#[cfg(test)]
+pub(crate) use update::apply_access_edit;
 pub use update::update_managed_agent;
 pub(super) use update::{flush_managed_agent_policy, managed_agent_access_policy_changed};
+pub(crate) use update::{
+    record_has_access_policy, update_managed_agent_scoped, ACCESS_PRECONDITION_FAILED,
+};
 
 // ── Model normalization ───────────────────────────────────────────────────────
 

@@ -18,6 +18,7 @@ import { useMyRelayMembershipLookupQuery } from "@/features/community-members/ho
 import type { SettingsSection } from "@/features/settings/ui/SettingsPanels";
 import type { PresenceStatus, Profile, UserStatus } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
+import { isCommunityWindow } from "@/shared/lib/windowKind";
 
 type SidebarProfileCardProps = {
   activeCommunity: Community | null;
@@ -168,24 +169,28 @@ export function SidebarProfileCard({
             userStatusText={selfUserStatus?.text}
             userStatusUpdatedAt={selfUserStatus?.updatedAt}
             communitySwitcherSlot={
-              <CommunitySwitcher
-                activeCommunity={activeCommunity}
-                canInvite={canInvite}
-                onAddCommunity={() => {
-                  setProfilePopoverOpen(false);
-                  onOpenAddCommunity();
-                }}
-                onInvite={() => {
-                  setProfilePopoverOpen(false);
-                  onOpenSettings("community-members");
-                }}
-                onLeaveCommunity={onLeaveCommunity}
-                onRemoveCommunityFromDevice={onRemoveCommunityFromDevice}
-                onSwitchCommunity={onSwitchCommunity}
-                onUpdateCommunity={onUpdateCommunity}
-                variant="profile-menu"
-                communities={communities}
-              />
+              // A community window is pinned to its community; switching
+              // and community management live in the main window.
+              isCommunityWindow() ? null : (
+                <CommunitySwitcher
+                  activeCommunity={activeCommunity}
+                  canInvite={canInvite}
+                  onAddCommunity={() => {
+                    setProfilePopoverOpen(false);
+                    onOpenAddCommunity();
+                  }}
+                  onInvite={() => {
+                    setProfilePopoverOpen(false);
+                    onOpenSettings("community-members");
+                  }}
+                  onLeaveCommunity={onLeaveCommunity}
+                  onRemoveCommunityFromDevice={onRemoveCommunityFromDevice}
+                  onSwitchCommunity={onSwitchCommunity}
+                  onUpdateCommunity={onUpdateCommunity}
+                  variant="profile-menu"
+                  communities={communities}
+                />
+              )
             }
           >
             <button

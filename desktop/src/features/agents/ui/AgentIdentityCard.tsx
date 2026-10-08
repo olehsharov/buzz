@@ -12,6 +12,8 @@ type AgentIdentityCardProps = {
   footerAccessory?: ReactNode;
   dataTestId: string;
   label: string;
+  /** Where the agent runs, under the subtitle (e.g. "Runs on devbox"). */
+  locationLabel?: ReactNode;
   /**
    * Second line under the agent name: the effective description when one
    * resolves (owner-authored — see `lib/agentDescription.ts`),
@@ -31,6 +33,7 @@ export function AgentIdentityCard({
   dataTestId,
   footerAccessory,
   label,
+  locationLabel,
   subtitle,
   onClick,
   statusBadge,
@@ -86,6 +89,7 @@ export function AgentIdentityCard({
               {subtitle}
             </span>
           ) : null}
+          {locationLabel}
           {/* pointer-events-auto: the overlay button above has pointer-events-none
               on this container, but the status badge itself (a sibling of the button
               in z-order) needs hover so the restart diff tooltip can fire. */}

@@ -185,11 +185,15 @@ export function useChannelTyping(
     let cleanup: (() => Promise<void>) | undefined;
 
     relayClient
-      .subscribeToTypingIndicators(channelId, (event) => {
-        if (!isDisposed) {
-          registerTyping(event);
-        }
-      })
+      .subscribeToChannelEphemeral(
+        KIND_TYPING_INDICATOR,
+        channelId,
+        (event) => {
+          if (!isDisposed) {
+            registerTyping(event);
+          }
+        },
+      )
       .then((dispose) => {
         if (isDisposed) {
           void dispose();

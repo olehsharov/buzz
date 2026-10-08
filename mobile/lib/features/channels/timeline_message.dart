@@ -4,6 +4,7 @@ import 'package:flutter/foundation.dart';
 
 import '../../shared/relay/relay.dart';
 import '../../shared/custom_emoji/custom_emoji.dart';
+import '../../shared/mentions/mention_group.dart';
 import 'channel_window.dart';
 
 enum SystemEventType {
@@ -494,7 +495,10 @@ List<TimelineMessage> formatTimeline(
         event.kind == EventKind.streamMessageV2 ||
         event.kind == EventKind.streamMessageDiff) {
       final edit = edits[event.id];
-      final effectiveTags = edit?.tags ?? event.tags;
+      final effectiveTags = _withOriginalMentionAllMarker(
+        edit?.tags ?? event.tags,
+        event.tags,
+      );
       // Include both notify (`p`) and reference-only (`mention`) tags —
       // mirrors desktop's resolveMentionNames, so names in messages sent
       // "without inviting" still render as mentions.
@@ -763,3 +767,16 @@ String? _readString(Map<dynamic, dynamic> json, String key) {
   final value = json[key];
   return value is String ? value : null;
 }
+
+/// Edits never notify, so they carry no `@all` audience; the original send's
+/// marker still decides how a surviving `@all` token renders (desktop's tag
+/// overlay keeps it the same way).
+List<List<String>> _withOriginalMentionAllMarker(
+  List<List<String>> effective,
+  List<List<String>> original,
+) =>
+    identical(effective, original) ||
+        hasMentionAllMarker(effective) ||
+        !hasMentionAllMarker(original)
+    ? effective
+    : [...effective, mentionAllMarkerTag()];

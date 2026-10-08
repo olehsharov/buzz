@@ -134,3 +134,75 @@ presentation marker. Readonly mention chips keep their own wrapping/accessibilit
 contract. Menu-based edit activation waits for Radix exit-focus cleanup before
 loading/focusing the editor; navigation tests must observe edit content and focus,
 not treat an already enabled reply input as an activated edit.
+
+## Group mention (`@all`)
+
+`@all` notifies, in the current stream or forum channel (project channels
+included: the project's channel roster), every person except the sender plus
+every agent the sender may mention there. Agent eligibility is the same rule
+the mention picker and send-time revalidation apply
+(`agentMentionRevalidation.ts`, `getMentionableAgentPubkeys`): agents the
+sender manages, and relay agents whose response policy would answer the sender
+in this channel. A member agent that fails the rule is skipped, never tagged,
+and never blocks the send, so a project channel of its owner plus the owner's
+agents addresses every agent at once. The picker's "Notify N members in this
+channel" counts only eligible recipients; with none it shows "No one else in
+this channel to notify".
+
+At send, the roster, agent identity and eligibility are recomputed from fresh
+evidence (roster refetch, managed and relay agent directories, publish-phase
+rule). Ineligible agents are dropped rather than failing the send; only when
+an agent would be dropped while an agent directory could not be loaded does
+the send block with a visible error that keeps the draft.
+
+The CLI (`buzz messages send`) tags every member except the sender, agents
+included, without this filter: it has no agent directory, and each agent
+harness's author gate ignores senders it would not answer, so the outcome is
+equivalent.
+
+It is offered only for new messages: DMs already notify every participant, and
+edits never notify. A typed prefix of its label (`@a`, `@al`, `@all`) ranks it
+first, ahead of the roster, so a large channel cannot push it past the
+suggestion cap; on a bare `@` it stays after the roster and is never the
+default selection.
+
+The group binds by its reserved literal token, not a key: the body carries the
+exact lowercase `@all` (picker selection inserts it with the usual separator),
+and a typed `@all` resolves the same way. Occurrence grammar, code masking and
+longest-literal ownership match member mentions. A member explicitly picked
+under the label "all" owns the literal; a typed `@all` that also names a member
+is rejected as ambiguous, like any other typed name with two meanings.
+
+On the wire: one `p` tag per recipient plus one `["buzz:mention-group", "all"]`
+marker (never a `mention` tag; other clients parse `mention` tag[1] as a key).
+The marker rides the validated reference-mention Tauri arg. Renderers show one
+group pill only when the marker is present and the body still owns an `@all`
+token; without the marker the text stays plain. Edits leave the original
+marker in place through the tag overlay and add no recipients; send-to-channel
+forwards the marker only with the original `p` audience, never from an edit
+snapshot.
+
+More than 50 recipients, eligible agents included (buzz-sdk `MENTION_CAP`),
+is never truncated: the picker
+shows `@all` disabled with its reason on every modality, and send re-resolves
+the roster freshly before any side effect, blocking with a visible error that
+keeps the draft. The same holds when `@all` plus other mentions exceeds 50.
+
+Mobile (`mobile/lib/shared/mentions/mention_group.dart`,
+`mobile/lib/features/channels/mentions/mention_all_audience.dart`) follows the
+same picker, wire, cap, send-time roster refresh, ambiguity and rendering
+rules in every `ComposeBar` (channel, thread, forum post and reply). Its
+recipients match the CLI rather than desktop: mobile has no per-member agent
+mention eligibility (every channel member, agents included, is already a
+first-class mention candidate there), so `@all` tags every member except the
+sender. Mobile edits use a plain edit sheet with no picker, so they never offer
+or resolve `@all`; the timeline keeps the original send's marker for an edited
+body.
+
+Coverage: `mentionAll.test.mjs` (audience and agent eligibility, grammar,
+candidate, rendering decision, wire routing, forwarding),
+`agentMentionRevalidation.test.mjs` (send-time skip mode),
+`useMentionSendFlow.mentionAll.test.mjs`
+and `ForumComposer.lifecycle.test.mjs` (send seam), and `mention-all.spec.ts`
+(picker, typed token, eligible and skipped agents, disabled modalities, DM,
+edit, rendered pill).

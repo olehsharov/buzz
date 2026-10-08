@@ -7,6 +7,10 @@
 #   buzz-agent     link to sprig (ACP-compliant agent)
 #   buzz-dev-mcp   link to sprig (developer MCP server; also dispatches
 #                    rg/tree/buzz)
+#   buzz           link to sprig (Buzz CLI, including `buzz host`)
+#   buzz-host      link to sprig (agent-host daemon, same as `buzz host`)
+#   git-credential-nostr, git-sign-nostr
+#                  links to sprig (Git helpers, via the buzz-acp personality)
 #
 # Usage:
 #   ./scripts/build-sprig.sh [version] [target]
@@ -19,7 +23,10 @@
 #                     profile. BUILD_PROFILE=dev/debug is rejected because Cargo
 #                     writes dev builds to target/debug, not target/dev.
 #   SKIP_BUILD=1      skip the cargo/cross build (use a prebuilt sprig already
-#                     present in target/[<target>/]<profile>)
+#                     present in target/[<target>/]<profile>, e.g. from
+#                     `cargo zigbuild` as the relay Dockerfile does)
+#   SPRIG_BIN_DIR     directory holding the prebuilt sprig (with SKIP_BUILD=1)
+#   GIT_SHA           source SHA recorded in sprig.json (default: git HEAD)
 #   ARCHIVE_BASENAME  override the archive basename (sans .tar.gz). Useful for
 #                     rolling releases where the asset filename should be stable
 #                     across builds (e.g. `sprig-<target>`). Defaults to
@@ -35,6 +42,10 @@
 #   buzz-acp
 #   buzz-agent
 #   buzz-dev-mcp
+#   buzz
+#   buzz-host
+#   git-credential-nostr
+#   git-sign-nostr
 #   README.md
 #   sprig.json        { version, git_sha, target, binaries: [{name, sha256, size}] }
 
@@ -52,14 +63,18 @@ case "$BUILD_PROFILE" in
         ;;
 esac
 
-if GIT_SHA="$(git rev-parse HEAD 2>/dev/null)"; then
+if [[ -n "${GIT_SHA:-}" ]]; then
+    :
+elif GIT_SHA="$(git rev-parse HEAD 2>/dev/null)"; then
     :
 else
     GIT_SHA="unknown"
 fi
 
 BUNDLE_BIN="sprig"
-COMMANDS=(buzz-acp buzz-agent buzz-dev-mcp)
+# Matches the links Dockerfile.sprig creates, plus buzz-host. `buzz` (with
+# `buzz host`) and the Git helpers are needed by `scripts/install-buzz-host.sh`.
+COMMANDS=(buzz-acp buzz-agent buzz-dev-mcp buzz buzz-host git-credential-nostr git-sign-nostr)
 
 echo "==> Building Sprig v${VERSION} for ${TARGET}"
 echo "    git_sha=${GIT_SHA}"
@@ -68,16 +83,18 @@ echo "    commands=${COMMANDS[*]}"
 echo "    cargo_profile=${BUILD_PROFILE}"
 
 if [[ "${USE_CROSS:-0}" == "1" ]] || [[ "$TARGET" != "$HOST_TARGET" ]]; then
-    if ! command -v cross >/dev/null 2>&1; then
+    if [[ "${SKIP_BUILD:-0}" != "1" ]] && ! command -v cross >/dev/null 2>&1; then
         echo "error: cross-compiling to $TARGET requires \`cross\` (install: cargo install cross --version 0.2.5)" >&2
         exit 1
     fi
     BUILDER=(cross build --profile "$BUILD_PROFILE" --target "$TARGET")
-    BIN_DIR="target/${TARGET}/${BUILD_PROFILE}"
+    BIN_DIR="${CARGO_TARGET_DIR:-target}/${TARGET}/${BUILD_PROFILE}"
 else
     BUILDER=(cargo build --profile "$BUILD_PROFILE")
-    BIN_DIR="target/${BUILD_PROFILE}"
+    BIN_DIR="${CARGO_TARGET_DIR:-target}/${BUILD_PROFILE}"
 fi
+
+BIN_DIR="${SPRIG_BIN_DIR:-$BIN_DIR}"
 
 if [[ "${SKIP_BUILD:-0}" == "1" ]]; then
     echo "    (SKIP_BUILD=1 set — expecting prebuilt ${BUNDLE_BIN} in ${BIN_DIR}/)"
@@ -146,6 +163,9 @@ Commands:
 - `buzz-agent` — ACP-compliant agent (spawns MCP servers, calls LLMs).
 - `buzz-dev-mcp` — Developer MCP server (shell, str_replace, todo) and
   multicall entrypoint for `rg`, `tree`, and `buzz`.
+- `buzz` — Buzz CLI, including `buzz host` (agent-host daemon).
+- `buzz-host` — the same as `buzz host`.
+- `git-credential-nostr`, `git-sign-nostr` — Git helpers.
 
 See `sprig.json` for SHA-256s, sizes, target, and source git SHA.
 

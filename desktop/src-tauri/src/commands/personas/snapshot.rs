@@ -12,7 +12,6 @@ use tauri::{AppHandle, State};
 use super::super::export_util::save_bytes_with_dialog;
 use crate::{
     app_state::AppState,
-    commands::engrams::get_agent_memory,
     managed_agents::{
         agent_snapshot::{
             build_snapshot, encode_snapshot_json, encode_snapshot_png, AgentSnapshotMemoryEntry,
@@ -274,7 +273,8 @@ pub(crate) async fn materialize_snapshot_bytes(
         // provider, and model configuration, not a pointer to the sender's
         // machine-wide defaults. This does not translate or substitute values
         // for a different recipient setup.
-        let global = crate::managed_agents::load_global_agent_config(&app).unwrap_or_default();
+        // The defaults of the exported record's own community.
+        let global = crate::managed_agents::load_agent_defaults_for_agent(&app, &def_record);
         materialize_portable_runtime_defaults(&mut def_record, &global);
 
         let memory_pubkey = if memory_level != MemoryLevel::None {
@@ -284,12 +284,14 @@ pub(crate) async fn materialize_snapshot_bytes(
             } else {
                 &def_record.pubkey
             };
-            Some(validate_memory_source(
-                mpk,
-                is_definition,
-                def_id,
-                &instances,
-            )?)
+            let pubkey = validate_memory_source(mpk, is_definition, def_id, &instances)?;
+            // Memory lives on the source agent's own community relay.
+            let memory_relay = instances
+                .iter()
+                .find(|instance| instance.pubkey == pubkey)
+                .map(|instance| instance.relay_url.clone())
+                .unwrap_or_default();
+            Some((pubkey, memory_relay))
         } else {
             None
         };
@@ -311,12 +313,22 @@ pub(crate) async fn materialize_snapshot_bytes(
         .and_then(crate::managed_agents::agent_snapshot::decode_avatar_data_url);
 
     // ── Fetch memory ─────────────────────────────────────────────────────────
-    let memory_entries: Vec<AgentSnapshotMemoryEntry> = if let Some(pubkey) = memory_pubkey {
-        let listing = get_agent_memory(pubkey, app.clone(), state).await?;
-        memory_entries_from_listing(listing, memory_level)
-    } else {
-        Vec::new()
-    };
+    let memory_entries: Vec<AgentSnapshotMemoryEntry> =
+        if let Some((pubkey, memory_relay)) = memory_pubkey {
+            let listing = crate::commands::engrams::load_agent_memory(
+                pubkey,
+                &app,
+                &state,
+                &crate::relay::relay_http_base_url(&crate::relay::effective_agent_relay_url(
+                    &memory_relay,
+                    &crate::relay::relay_ws_url_with_override(&state),
+                )),
+            )
+            .await?;
+            memory_entries_from_listing(listing, memory_level)
+        } else {
+            Vec::new()
+        };
 
     // ── Build manifest ───────────────────────────────────────────────────────
     let snapshot = build_snapshot(

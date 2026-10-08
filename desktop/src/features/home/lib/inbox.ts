@@ -52,6 +52,7 @@ export type InboxItem = {
   groupItems: FeedItem[];
   isActionRequired: boolean;
   latestActivityAt: number;
+  mentionAll?: boolean;
   mentionNames: string[];
   mentionPubkeysByName?: Record<string, string>;
   preview: string;
@@ -97,6 +98,7 @@ export type InboxReply = {
 export type InboxContextMessage = InboxReply & {
   depth: number;
   isSelected: boolean;
+  mentionAll?: boolean;
   mentionNames: string[];
   mentionPubkeysByName?: Record<string, string>;
 };
@@ -590,11 +592,8 @@ export function buildInboxItems({
       });
       const subject = feedHeadline(item, group.items);
       const preview = feedPreview(item);
-      const { mentionNames, mentionPubkeysByName } = resolveMentionProps(
-        item.tags,
-        profiles,
-        item.content,
-      );
+      const { mentionAll, mentionNames, mentionPubkeysByName } =
+        resolveMentionProps(item.tags, profiles, item.content);
       const channelLabel = groupChannel.name;
       const displayItem: FeedItem = {
         ...item,
@@ -615,6 +614,7 @@ export function buildInboxItems({
         groupItems: group.items,
         isActionRequired: categories.includes("needs_action"),
         latestActivityAt: group.latestActivityAt,
+        mentionAll,
         mentionNames: mentionNames ?? [],
         mentionPubkeysByName,
         preview,

@@ -400,3 +400,29 @@ fn retain_agent_record_is_noop_when_unchanged() {
         "no pending_sync churn for an unchanged record"
     );
 }
+
+#[test]
+fn event_sync_reconciles_only_the_scopes_own_community_agents() {
+    // Agents belong to ONE community: a scope's 30177 leg retains only the
+    // agents of the relay that scope publishes to.
+    let dir = TempDir::new().unwrap();
+    let keys = nostr::Keys::generate();
+    let mut own = sample_record(&"a".repeat(64), "own");
+    own.relay_url = "wss://one.example".into();
+    let mut foreign = sample_record(&"b".repeat(64), "foreign");
+    foreign.relay_url = "wss://two.example".into();
+    write_store(&dir, &[own, foreign]);
+
+    let db = dir.path().join("scope-one.db");
+    assert_eq!(
+        reconcile_agents_in_dir_at(dir.path(), &keys, &db, Some("WSS://one.example/")).unwrap(),
+        1
+    );
+    let conn = open_retention_db(&db).unwrap();
+    let pending: Vec<_> = get_pending_sync(&conn)
+        .unwrap()
+        .into_iter()
+        .map(|row| row.d_tag)
+        .collect();
+    assert_eq!(pending, vec!["a".repeat(64)]);
+}

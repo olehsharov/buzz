@@ -3,15 +3,19 @@ import { useQueryClient } from "@tanstack/react-query";
 
 import {
   createInputFromRequest,
+  createRequestNotices,
   requestTargetsEditablePersona,
+  runDraftFromRequest,
   type AgentManagementRequest,
   updateInputFromRequest,
 } from "./agentManagement";
+import type { WhereToRunDraft } from "./ui/whereToRunIntent";
 import { subscribeAgentManagementRequests } from "./observerRelayStore";
 import {
   managedAgentsQueryKey,
   personasQueryKey,
   useAcpRuntimesQuery,
+  useBackendProvidersQuery,
   useCreateManagedAgentMutation,
   useCreatePersonaMutation,
   useManagedAgentsQuery,
@@ -248,6 +252,57 @@ export function useAgentManagement() {
     [request],
   );
 
+  // The "Run on" draft seeds the dialog's state once, so it is resolved once
+  // per request — after provider discovery settles when the draft names a
+  // provider, so a slow discovery cannot misreport a real provider as
+  // missing, and a later providers refetch cannot rewrite the notice.
+  const [runPrefill, setRunPrefill] = React.useState<{
+    requestId: string;
+    draft: WhereToRunDraft;
+    notice: string | null;
+  } | null>(null);
+  // Discover providers only for a draft that names one; this hook is mounted
+  // app-wide and discovery is otherwise owned by the Run on section.
+  const backendProvidersQuery = useBackendProvidersQuery({
+    enabled:
+      request?.action === "create" && request.request.runOn !== undefined,
+  });
+  const providersSettled =
+    backendProvidersQuery.isSuccess || backendProvidersQuery.isError;
+  const discoveredProviders = backendProvidersQuery.data;
+  React.useEffect(() => {
+    if (
+      request?.action !== "create" ||
+      runPrefill?.requestId === request.requestId ||
+      (request.request.runOn !== undefined && !providersSettled)
+    ) {
+      return;
+    }
+    setRunPrefill({
+      requestId: request.requestId,
+      ...runDraftFromRequest(
+        request.request,
+        (discoveredProviders ?? []).map((provider) => provider.id),
+      ),
+    });
+  }, [discoveredProviders, providersSettled, request, runPrefill]);
+  const createRunPrefill =
+    request?.action === "create" && runPrefill?.requestId === request.requestId
+      ? runPrefill
+      : null;
+
+  const catalogRuntimeIds = React.useMemo(
+    () => runtimesQuery.data?.map((runtime) => runtime.id) ?? null,
+    [runtimesQuery.data],
+  );
+  const createNotices = React.useMemo(() => {
+    if (request?.action !== "create" || !createRunPrefill) return [];
+    return [
+      ...(createRunPrefill.notice ? [createRunPrefill.notice] : []),
+      ...createRequestNotices(request.request, catalogRuntimeIds),
+    ];
+  }, [catalogRuntimeIds, createRunPrefill, request]);
+
   const editInitialValues = React.useMemo(() => {
     if (request?.action !== "update" || !currentPersona) return null;
     return updateInputFromRequest(
@@ -272,6 +327,9 @@ export function useAgentManagement() {
   return {
     request,
     createInitialValues,
+    /** Null until the run draft is resolved; the dialog waits for it. */
+    createInitialRunDraft: createRunPrefill?.draft ?? null,
+    createNotices,
     editInitialValues,
     editError,
     error,

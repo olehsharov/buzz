@@ -778,6 +778,7 @@ fn summary_fixture(
         env_vars: Default::default(),
         backend: super::BackendKind::Local,
         backend_agent_id: None,
+        provider_policy_pending: false,
         status: "running".into(),
         pid: Some(4242),
         created_at: "2026-01-01T00:00:00Z".into(),
@@ -831,4 +832,62 @@ fn summary_with_drift_serializes_restart_diff_entries() {
             "change": { "kind": "value", "before": "gpt-5", "after": "claude-4" },
         }]))
     );
+}
+
+#[test]
+fn backend_kind_serde_is_stable_for_old_records_and_round_trips_host() {
+    use super::BackendKind;
+    // Wire forms already on disk must keep deserializing unchanged.
+    assert_eq!(
+        serde_json::from_value::<BackendKind>(serde_json::json!({"type": "local"})).unwrap(),
+        BackendKind::Local
+    );
+    assert_eq!(
+        serde_json::from_value::<BackendKind>(
+            serde_json::json!({"type": "provider", "id": "kubernetes", "config": {"ns": "a"}})
+        )
+        .unwrap(),
+        BackendKind::Provider {
+            id: "kubernetes".into(),
+            config: serde_json::json!({"ns": "a"}),
+        }
+    );
+    let host = BackendKind::Host {
+        host_pubkey: "ab".repeat(32),
+    };
+    let wire = serde_json::to_value(&host).unwrap();
+    assert_eq!(
+        wire,
+        serde_json::json!({"type": "host", "host_pubkey": "ab".repeat(32)})
+    );
+    assert_eq!(serde_json::from_value::<BackendKind>(wire).unwrap(), host);
+    assert_eq!(
+        serde_json::to_value(BackendKind::Local).unwrap(),
+        serde_json::json!({"type": "local"})
+    );
+
+    // A pre-hosts record (no backend field) is Local; a host record survives
+    // a full record round trip with its deployment receipt.
+    let base = serde_json::json!({
+        "pubkey": "abcd", "name": "A", "relay_url": "", "acp_command": "",
+        "agent_command": "", "agent_args": [], "mcp_command": "",
+        "turn_timeout_seconds": 0, "system_prompt": null, "created_at": "",
+        "updated_at": "", "last_started_at": null, "last_stopped_at": null,
+        "last_exit_code": null, "last_error": null
+    });
+    let old: ManagedAgentRecord = serde_json::from_value(base.clone()).unwrap();
+    assert_eq!(old.backend, BackendKind::Local);
+    let mut with_host = base;
+    with_host["backend"] = serde_json::json!({"type": "host", "host_pubkey": "cd".repeat(32)});
+    with_host["backend_agent_id"] = serde_json::json!("cd".repeat(32));
+    let record: ManagedAgentRecord = serde_json::from_value(with_host).unwrap();
+    let again: ManagedAgentRecord =
+        serde_json::from_value(serde_json::to_value(&record).unwrap()).unwrap();
+    assert_eq!(
+        again.backend,
+        BackendKind::Host {
+            host_pubkey: "cd".repeat(32)
+        }
+    );
+    assert_eq!(again.backend_agent_id, Some("cd".repeat(32)));
 }

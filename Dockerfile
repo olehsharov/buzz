@@ -9,7 +9,18 @@
 #
 # Multi-arch is handled by running this same Dockerfile on native amd64 and
 # native arm64 runners (see .github/workflows/docker.yml). The Dockerfile
-# itself is platform-agnostic; do not add --platform pins.
+# itself is platform-agnostic; do not add --platform pins. The one exception
+# is the `host-bundle` stage, which cross-compiles Sprig for BOTH Linux
+# architectures on the build platform, so every image serves both.
+#
+# Agent-host installer: the image serves `install.sh`, the static Sprig
+# tarballs for x86_64 + aarch64 Linux and `SHA256SUMS` at
+# https://<relay>/host/ (from /srv/buzz/web/host). The macOS `buzz` cannot be
+# built in Docker: release builds must first run, on an Apple Silicon Mac,
+#   ARCHIVE_BASENAME=buzz-aarch64-apple-darwin DIST_DIR=host-artifacts \
+#     ./scripts/build-sprig.sh <version>
+# and the image picks up host-artifacts/buzz-*-apple-darwin.tar.gz. Without
+# it the installer tells macOS users to install Buzz.app instead.
 
 ARG RUST_VERSION=1.95
 ARG NODE_VERSION=24
@@ -126,6 +137,53 @@ COPY web/ web/
 COPY admin-web/ admin-web/
 RUN pnpm -C web build && pnpm -C admin-web build
 
+# ─── Stage 4b: agent-host bundle (install.sh + Sprig for both Linux arches) ─
+# Runs once on the build platform and cross-compiles with cargo-zigbuild, so
+# an arm64 image and an amd64 image carry the same two static musl binaries.
+FROM --platform=$BUILDPLATFORM rust:1.95-alpine3.22@sha256:064dfc925d68d1a63f4fd2871bd7dc6e6ea56692989a487185855d62885d90aa AS host-bundle
+ARG EXTRA_CA_CERTS
+COPY --chmod=0644 ${EXTRA_CA_CERTS:-Dockerfile} /tmp/extra-ca/src
+RUN apk add --no-cache bash build-base ca-certificates cmake git musl-dev perl pkgconf protoc tar zig \
+    && if [ -n "${EXTRA_CA_CERTS}" ]; then \
+        cp /tmp/extra-ca/src /usr/local/share/ca-certificates/extra-proxy-ca.crt \
+        && update-ca-certificates; \
+    fi
+ENV CARGO_HTTP_CAINFO=/etc/ssl/certs/ca-certificates.crt
+RUN cargo install cargo-zigbuild --locked --version 0.20.1
+WORKDIR /build
+COPY . .
+RUN rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+ARG BUZZ_SOURCE_SHA=unknown
+ARG BUZZ_HOST_VERSION=0.0.0-dev
+# Package with scripts/build-sprig.sh (SKIP_BUILD=1) so the tarballs carry
+# the same links and sprig.json as every other Sprig build.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target,id=buzz-host-bundle-target \
+    set -e; \
+    cargo zigbuild --locked --profile sprig -p sprig \
+        --target x86_64-unknown-linux-musl \
+        --target aarch64-unknown-linux-musl; \
+    for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do \
+        SKIP_BUILD=1 SPRIG_BIN_DIR="target/$t/sprig" GIT_SHA="${BUZZ_SOURCE_SHA}" \
+        DIST_DIR=/out ARCHIVE_BASENAME="sprig-$t" \
+        ./scripts/build-sprig.sh "${BUZZ_HOST_VERSION}" "$t"; \
+    done
+# Optional prebuilt macOS artifact (see the header). The directory always
+# exists in the build context; a missing tarball just leaves macOS out.
+COPY host-artifacts/ /tmp/host-artifacts/
+RUN cp scripts/install-buzz-host.sh /out/install.sh \
+    && chmod 0644 /out/install.sh \
+    && for f in /tmp/host-artifacts/buzz-*-apple-darwin.tar.gz; do \
+        [ -f "$f" ] && cp "$f" /out/; \
+    done; \
+    cd /out && rm -f ./*.sha256 && sha256sum -- *.tar.gz > SHA256SUMS \
+    && cat SHA256SUMS
+
+# Just the bundle, for inspection or publishing elsewhere:
+#   docker buildx build --target host-bundle-files -o type=local,dest=out .
+FROM scratch AS host-bundle-files
+COPY --from=host-bundle /out /
+
 # ─── Stage 5: shared runtime ────────────────────────────────────────────────
 FROM debian:${DEBIAN_VERSION}-slim AS runtime-base
 
@@ -152,6 +210,8 @@ RUN apt-get update \
 
 COPY --from=web-builder /build/web/dist                 /srv/buzz/web
 COPY --from=web-builder /build/admin-web/dist           /srv/buzz/admin-web
+# Agent-host installer, served publicly at /host/ (router.rs).
+COPY --from=host-bundle /out                            /srv/buzz/web/host
 
 # The invite landing page is always served from the bundled web UI. Repository
 # browser routes require the separate BUZZ_SERVE_GIT_WEB_GUI=true opt-in. The

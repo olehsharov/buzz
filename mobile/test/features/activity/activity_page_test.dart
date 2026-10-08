@@ -1081,7 +1081,6 @@ class _FakeReadStateNotifier extends ReadStateNotifier {
     isReady: true,
     pubkey: 'me_pk',
     contexts: Map.unmodifiable(_contexts),
-    version: 1,
   );
 
   @override

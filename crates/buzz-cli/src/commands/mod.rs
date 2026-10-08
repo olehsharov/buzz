@@ -7,6 +7,7 @@ pub mod feed;
 pub mod gifs;
 pub mod issues;
 pub mod mem;
+mod mention_all;
 pub mod messages;
 pub mod moderation;
 pub mod notes;

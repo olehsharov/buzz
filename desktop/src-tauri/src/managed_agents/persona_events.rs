@@ -307,17 +307,50 @@ pub async fn flush_pending_events(
     flush_pending_events_at(db_path, state, &relay_url, &owner_keys).await
 }
 
-/// Resolve and flush only the currently active `(relay, owner)` scope.
+/// Resolve and flush every bound `(relay, owner)` scope: the main window's
+/// active community plus each community window's. A community window writes
+/// its own community's scope while it is open, so its pending rows publish
+/// to that community's relay without waiting for the main window to switch.
 ///
-/// The scope snapshots its relay, owner keys, and database path together
+/// Each scope snapshots its relay, owner keys, and database path together
 /// before network work starts. Switching communities during the flush cannot
-/// redirect rows from the old scope into the new relay.
-pub async fn flush_active_pending_events(
+/// redirect rows from one scope into another relay. One failing scope does
+/// not stop the others; the first error is returned after all were tried.
+pub async fn flush_bound_pending_events(
     app: &tauri::AppHandle,
     state: &AppState,
 ) -> Result<u32, String> {
-    let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
-    flush_pending_events_at(&scope.db_path, state, &scope.relay_url, &scope.owner_keys).await
+    let mut seen = std::collections::HashSet::new();
+    let mut accepted = 0;
+    let mut first_error = None;
+    for relay_url in crate::window_relay::bound_relay_urls(state) {
+        if !seen.insert(crate::relay::community_relay_key(&relay_url)) {
+            continue;
+        }
+        let flushed =
+            match crate::managed_agents::retention::retention_scope_for(app, state, &relay_url) {
+                Ok(scope) => {
+                    flush_pending_events_at(
+                        &scope.db_path,
+                        state,
+                        &scope.relay_url,
+                        &scope.owner_keys,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+        match flushed {
+            Ok(count) => accepted += count,
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(accepted),
+    }
 }
 
 pub fn active_pending_event(

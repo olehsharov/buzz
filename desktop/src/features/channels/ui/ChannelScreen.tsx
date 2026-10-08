@@ -54,6 +54,7 @@ import { resolveTimelineQueryLoadingState } from "@/features/messages/lib/timeli
 import { useFetchOlderMessages } from "@/features/messages/useFetchOlderMessages";
 import { useIndependentThreadPanel } from "@/features/messages/useIndependentThreadPanel";
 import { useThreadReplies } from "@/features/messages/useThreadReplies";
+import { useChannelStreamDrafts } from "@/features/messages/useChannelStreamDrafts";
 import { useChannelTyping } from "@/features/messages/useChannelTyping";
 import type { TimelineMessage } from "@/features/messages/types";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
@@ -297,6 +298,12 @@ export function ChannelScreen({
     latestMessageEvent,
     relaySelfPubkey,
   );
+  const streamDrafts = useChannelStreamDrafts(
+    activeChannel,
+    resolvedMessages,
+    threadReplyEvents,
+    relaySelfPubkey,
+  );
   const activeDmParticipantPubkeys = React.useMemo(
     () =>
       activeChannel?.channelType === "dm"
@@ -324,6 +331,13 @@ export function ChannelScreen({
       mergeChannelKnownAgentPubkeys(channelMembers, managedAgents, relayAgents),
     [channelMembers, managedAgents, relayAgents],
   );
+  // Keyed by author set, not draft content, so streaming frames do not
+  // rebuild the profile query input.
+  const streamDraftPubkeyKey = [
+    ...new Set(streamDrafts.map((draft) => draft.pubkey)),
+  ]
+    .sort()
+    .join(",");
   const messageProfilePubkeys = React.useMemo(
     () => [
       ...new Set([
@@ -331,12 +345,14 @@ export function ChannelScreen({
         ...activeDmParticipantPubkeys,
         ...knownAgentPubkeys,
         ...typingEntries.map((entry) => entry.pubkey),
+        ...(streamDraftPubkeyKey ? streamDraftPubkeyKey.split(",") : []),
       ]),
     ],
     [
       activeDmParticipantPubkeys,
       knownAgentPubkeys,
       messageEventProfilePubkeys,
+      streamDraftPubkeyKey,
       typingEntries,
     ],
   );
@@ -972,6 +988,7 @@ export function ChannelScreen({
                   isJoining={joinChannelMutation.isPending}
                   onJoinChannel={joinChannelMutation.mutateAsync}
                     typingPubkeys={humanTypingPubkeys}
+                    streamDrafts={streamDrafts}
                   />,
                   searchTarget,
                 )}

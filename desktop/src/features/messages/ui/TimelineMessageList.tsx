@@ -21,12 +21,14 @@ import { buildMainTimelineEntries } from "@/features/messages/lib/threadPanel";
 import type { MainTimelineEntry } from "@/features/messages/lib/threadPanel";
 import type { ChannelWindowThreadSummary } from "@/features/messages/lib/channelWindowStore";
 import { buildVideoReviewContextsByMessageId } from "@/features/messages/lib/videoReviewContext";
+import type { StreamDraft } from "@/features/messages/lib/streamDrafts";
 import type { TimelineMessage } from "@/features/messages/types";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import type { ChannelType } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
 import { channelChrome } from "@/shared/layout/chromeLayout";
 import { DayDivider } from "./DayDivider";
+import { StreamDraftRows } from "./StreamDraftRows";
 import { MessageRowItem, SystemRow } from "./TimelineMessageRow";
 import { TimelineRowShell } from "./TimelineRowShell";
 import { UnreadDivider } from "./UnreadDivider";
@@ -104,6 +106,8 @@ type TimelineMessageListProps = {
   threadUnreadCounts?: ReadonlyMap<string, number>;
   /** Content rendered as the first virtual row before channel history. */
   leadingContent?: React.ReactNode;
+  /** Live reply ghosts (top-level scope) rendered after the last row. */
+  streamDrafts?: readonly StreamDraft[];
   /** Hide date boundaries for a huddle's live transcript. */
   hideDayDividers?: boolean;
   /** Show speaker identity on every row instead of grouping consecutive messages. */
@@ -160,6 +164,7 @@ export const TimelineMessageList = React.memo(function TimelineMessageList({
   threadUnreadCounts,
   unfollowThreadById,
   leadingContent,
+  streamDrafts,
   historyExhausted = false,
   hideDayDividers = false,
   alwaysShowMessageIdentity = false,
@@ -326,6 +331,17 @@ export const TimelineMessageList = React.memo(function TimelineMessageList({
     ],
   );
 
+  // Ghosts hand off against the RENDERED rows so a landing reply replaces its
+  // ghost in one commit, even while this list renders a deferred snapshot.
+  const trailingContent = streamDrafts ? (
+    <StreamDraftRows
+      currentPubkey={currentPubkey}
+      drafts={streamDrafts}
+      profiles={profiles}
+      renderedMessages={messages}
+    />
+  ) : null;
+
   if (useVirtualizer) {
     return (
       <VirtualizedTimelineRows
@@ -333,6 +349,7 @@ export const TimelineMessageList = React.memo(function TimelineMessageList({
         historyExhausted={historyExhausted}
         hideDayDividers={hideDayDividers}
         leadingContent={leadingContent}
+        trailingContent={trailingContent}
         onAtBottomStateChange={onAtBottomStateChange}
         onStartReached={onStartReached}
         onVirtualizerApiChange={onVirtualizerApiChange}
@@ -374,6 +391,7 @@ export const TimelineMessageList = React.memo(function TimelineMessageList({
           ))}
         </section>
       ))}
+      {trailingContent}
     </div>
   );
 });
@@ -392,6 +410,12 @@ type VirtualizedTimelineRowsProps = {
   historyExhausted: boolean;
   hideDayDividers: boolean;
   leadingContent?: React.ReactNode;
+  /**
+   * Rendered inside the always-present bottom-spacer row, so content that
+   * comes and goes (live reply ghosts) never changes the virtual key stream
+   * that prepend `shift` admission depends on.
+   */
+  trailingContent?: React.ReactNode;
   onAtBottomStateChange?: (atBottom: boolean) => void;
   onStartReached?: () => boolean;
   onVirtualizerApiChange?: (api: TimelineVirtualizerApi | null) => void;
@@ -432,6 +456,7 @@ function VirtualizedTimelineRows({
   historyExhausted,
   hideDayDividers,
   leadingContent,
+  trailingContent,
   onAtBottomStateChange,
   onStartReached,
   onVirtualizerApiChange,
@@ -764,11 +789,13 @@ function VirtualizedTimelineRows({
           {(item) => {
             if (item.kind === "bottom-spacer") {
               return (
-                <div
-                  aria-hidden
-                  className="h-[var(--composer-overlay-height,6rem)]"
-                  key={virtualizedItemKey(item)}
-                />
+                <div key={virtualizedItemKey(item)}>
+                  {trailingContent}
+                  <div
+                    aria-hidden
+                    className="h-[var(--composer-overlay-height,6rem)]"
+                  />
+                </div>
               );
             }
             if (item.kind === "leading-content") {

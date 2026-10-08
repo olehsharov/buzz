@@ -275,6 +275,17 @@ pub fn load_managed_agents<R: tauri::Runtime>(
     Ok(records)
 }
 
+/// Load the keyed agent *instances* WITHOUT touching the keyring, for
+/// read-only callers that never need an agent's private key (e.g. community
+/// membership filters on polled directory reads).
+pub(crate) fn load_managed_agents_without_keys<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+) -> Result<Vec<ManagedAgentRecord>, String> {
+    let mut records = load_agent_store(app)?;
+    records.retain(|record| !record.pubkey.is_empty());
+    Ok(records)
+}
+
 /// Load the key-less agent *definitions* (former personas) from the unified
 /// store. The persona compatibility shim (`load_personas`) presents these in
 /// the legacy shape via `to_definition_view`.
@@ -403,8 +414,27 @@ pub(crate) fn save_agent_definitions<R: tauri::Runtime>(
 ) -> Result<(), String> {
     let mut instances = load_agent_store(app)?;
     instances.retain(|record| !record.pubkey.is_empty());
+    // The persona view (`AgentDefinition`) does not carry the community pin,
+    // so a definition saved through it arrives unassigned: keep the stored
+    // community of the same slug instead of losing it on every persona save.
+    let stored_communities: HashMap<String, String> = load_agent_definitions(app)?
+        .into_iter()
+        .filter_map(|record| Some((record.slug?, record.relay_url)))
+        .filter(|(_, relay)| !relay.trim().is_empty())
+        .collect();
     let mut definitions = definitions.to_vec();
     definitions.retain(|record| record.pubkey.is_empty());
+    for definition in &mut definitions {
+        if definition.relay_url.trim().is_empty() {
+            if let Some(relay) = definition
+                .slug
+                .as_ref()
+                .and_then(|slug| stored_communities.get(slug))
+            {
+                definition.relay_url = relay.clone();
+            }
+        }
+    }
     write_agent_store(app, definitions, instances)
 }
 
@@ -419,6 +449,11 @@ fn write_agent_store<R: tauri::Runtime>(
     definitions.sort_by(|left, right| left.slug.cmp(&right.slug));
     let mut all = definitions;
     all.extend(instances);
+    // Write-time net: a record saved without a community belongs to the
+    // active one (see `community_scope`).
+    if let Some(relay) = super::community_scope::stamp_relay_for_save(app) {
+        super::community_scope::stamp_unassigned(&mut all, &relay);
+    }
 
     let path = managed_agents_store_path(app)?;
     let payload = serde_json::to_vec_pretty(&all)

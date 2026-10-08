@@ -6,6 +6,12 @@ use crate::relay_admission::{reset_rate_limit_gate, TEST_SERIAL};
 use tauri::Manager;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// The relay a main-window invocation resolves (the workspace override).
+fn main_relay<R: tauri::Runtime>(app: &tauri::App<R>) -> crate::window_relay::WindowRelay {
+    crate::window_relay::WindowRelay::resolve(&app.state::<crate::app_state::AppState>(), "main")
+        .unwrap()
+}
+
 #[tokio::test]
 async fn presence_command_preserves_query_failure_and_successful_absence() {
     let _serial = TEST_SERIAL.lock().await;
@@ -60,7 +66,7 @@ async fn presence_command_preserves_query_failure_and_successful_absence() {
             .unwrap();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            get_presence(vec!["a".repeat(64)], app.state()),
+            get_presence(vec!["a".repeat(64)], main_relay(&app), app.state()),
         )
         .await
         .unwrap();
@@ -96,8 +102,11 @@ async fn presence_command_transport_failure_is_not_offline() {
         .manage(state)
         .build(tauri::test::mock_context(tauri::test::noop_assets()))
         .unwrap();
-    let result = get_presence(vec!["a".repeat(64)], app.state()).await;
+    let result = get_presence(vec!["a".repeat(64)], main_relay(&app), app.state()).await;
     assert!(result.is_err(), "transport failure must reject: {result:?}");
     // Empty input does not require a relay and remains a genuine empty result.
-    assert!(get_presence(vec![], app.state()).await.unwrap().is_empty());
+    assert!(get_presence(vec![], main_relay(&app), app.state())
+        .await
+        .unwrap()
+        .is_empty());
 }

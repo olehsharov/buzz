@@ -17,7 +17,7 @@ use crate::commands::{
         decode_team_snapshot_from_bytes, MAX_TEAM_SNAPSHOT_JSON_BYTES, MAX_TEAM_SNAPSHOT_PNG_BYTES,
     },
 };
-use crate::relay::{classify_request_error, relay_api_base_url_with_override, relay_error_message};
+use crate::relay::{classify_request_error, relay_error_message};
 
 /// Maximum download size: 50 MiB. Prevents OOM from oversized responses.
 pub(super) const MAX_DOWNLOAD_BYTES: u64 = 50 * 1024 * 1024;
@@ -66,10 +66,11 @@ pub(super) fn validate_download_url(url: &str, relay_base: &str) -> Result<(), S
 pub async fn download_image(
     url: String,
     app: tauri::AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
     // SSRF protection: only allow downloads from the relay's /media/ path.
-    let relay_base = relay_api_base_url_with_override(&state);
+    let relay_base = relay.api_base();
     validate_download_url(&url, &relay_base)?;
 
     // Infer filename from the URL path (e.g. "abcdef123.jpg" from a Blossom URL).
@@ -90,7 +91,7 @@ pub async fn download_image(
         .unwrap_or("png")
         .to_string();
 
-    let bytes = fetch_blob_bytes(&url, &state).await?;
+    let bytes = fetch_blob_bytes(&url, &state, &relay_base).await?;
 
     // Validate the downloaded content is actually a supported media type.
     detect_and_validate_mime(&bytes)?;
@@ -113,10 +114,11 @@ pub async fn download_file(
     url: String,
     filename: String,
     app: tauri::AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<bool, String> {
     // SSRF protection: only allow downloads from the relay's /media/ path.
-    let relay_base = relay_api_base_url_with_override(&state);
+    let relay_base = relay.api_base();
     validate_download_url(&url, &relay_base)?;
 
     // The imeta filename is the only human-readable name we have; sanitize it
@@ -129,7 +131,7 @@ pub async fn download_file(
         .and_then(|e| e.to_str())
         .map(|e| e.to_string());
 
-    let bytes = fetch_blob_bytes(&url, &state).await?;
+    let bytes = fetch_blob_bytes(&url, &state, &relay_base).await?;
 
     // Reuse the upload-side allow/deny policy: rejects executables, HTML, and
     // other types the relay would never have accepted, while permitting the
@@ -154,12 +156,13 @@ pub async fn download_file(
 pub async fn copy_image_to_clipboard(
     url: String,
     app: tauri::AppHandle,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let relay_base = relay_api_base_url_with_override(&state);
+    let relay_base = relay.api_base();
     validate_download_url(&url, &relay_base)?;
 
-    let bytes = fetch_blob_bytes(&url, &state).await?;
+    let bytes = fetch_blob_bytes(&url, &state, &relay_base).await?;
     detect_and_validate_mime(&bytes)?;
 
     let img =
@@ -230,8 +233,12 @@ pub async fn copy_text_to_clipboard(
 /// Fetch blob bytes from a (pre-validated) relay media URL through the app's
 /// HTTP client, enforcing the download size cap. The caller is responsible for
 /// validating the URL origin and for any content-type checks on the result.
-async fn fetch_blob_bytes(url: &str, state: &State<'_, AppState>) -> Result<Vec<u8>, String> {
-    fetch_blob_bytes_with_cap(url, state, MAX_DOWNLOAD_BYTES, None).await
+async fn fetch_blob_bytes(
+    url: &str,
+    state: &State<'_, AppState>,
+    relay_base: &str,
+) -> Result<Vec<u8>, String> {
+    fetch_blob_bytes_with_cap(url, state, relay_base, MAX_DOWNLOAD_BYTES, None).await
 }
 
 /// The command-facing error for a media-fetch response status, or `None` if
@@ -256,6 +263,7 @@ fn redirect_refusal_error(status: reqwest::StatusCode) -> Option<String> {
 pub(super) async fn fetch_blob_bytes_with_cap(
     url: &str,
     state: &State<'_, AppState>,
+    relay_base: &str,
     cap: u64,
     cancellation: Option<&CancellationToken>,
 ) -> Result<Vec<u8>, String> {
@@ -265,11 +273,10 @@ pub(super) async fn fetch_blob_bytes_with_cap(
     // 3xx is returned verbatim and rejected by the `is_success` check below.
     let mut req = state.media_fetch_client.get(url).timeout(DOWNLOAD_TIMEOUT);
 
-    // Every caller pre-validates `url` against the relay origin via
-    // `validate_download_url`, satisfying the mint_media_get_auth safety
-    // contract (the token never leaves the relay origin).
-    let relay_base = relay_api_base_url_with_override(state);
-    if let Some(auth) = mint_media_get_auth(state, &relay_base) {
+    // Every caller pre-validates `url` against `relay_base` (its window's
+    // relay origin) via `validate_download_url`, satisfying the
+    // mint_media_get_auth safety contract (the token never leaves that origin).
+    if let Some(auth) = mint_media_get_auth(state, relay_base) {
         req = req.header("authorization", auth);
     }
 
@@ -454,10 +461,11 @@ pub async fn fetch_snapshot_bytes(
     filename: String,
     expected_sha256: String,
     expected_size: usize,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<tauri::ipc::Response, String> {
     // ── Pre-fetch validation ──────────────────────────────────────────────
-    let relay_base = relay_api_base_url_with_override(&state);
+    let relay_base = relay.api_base();
     validate_download_url(&url, &relay_base)?;
 
     // Sanitize the filename and verify it is a recognised snapshot extension.
@@ -479,7 +487,7 @@ pub async fn fetch_snapshot_bytes(
     ensure_declared_size_within_cap(expected_size, kind)?;
 
     // ── Bounded fetch ─────────────────────────────────────────────────────
-    let bytes = fetch_blob_bytes_with_cap(&url, &state, cap, None).await?;
+    let bytes = fetch_blob_bytes_with_cap(&url, &state, &relay_base, cap, None).await?;
 
     // ── Post-fetch validation ─────────────────────────────────────────────
     // 1. Byte length must equal the declared imeta size.

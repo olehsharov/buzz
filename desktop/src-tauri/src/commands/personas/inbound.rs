@@ -21,6 +21,9 @@ mod inbound_tests;
 // runner (same constraint as `persona_events::tests::flush_barrier`).
 #[cfg(all(test, not(target_os = "windows")))]
 mod catalog_reconcile_tests;
+// Unix-only: drives a scripted provider fixture.
+#[cfg(all(test, unix))]
+mod access_reconcile_tests;
 
 #[derive(Debug)]
 enum InboundRuntimeRefresh {
@@ -28,12 +31,9 @@ enum InboundRuntimeRefresh {
         pubkey: String,
         relay_urls: Vec<String>,
     },
-    Provider {
+    Remote {
         pubkey: String,
-        provider_id: String,
-        config: serde_json::Value,
-        cached_binary_path: Option<String>,
-        agent_json: Result<serde_json::Value, String>,
+        target: super::super::agents::access_transition::RemoteAccessRedeploy,
     },
 }
 
@@ -76,13 +76,22 @@ pub async fn reconcile_inbound_persona_event(
     event_json: String,
     arrival_relay_url: String,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
 ) -> Result<(), String> {
     // Captured before the blocking reconcile stops the runtime: a community
     // removed while this restart runs refuses its start.
     let admission = crate::managed_agents::AdmissionSnapshot::capture(&app.state::<AppState>());
     let blocking_app = app.clone();
+    // The invoking window's community owns the scope: an event that arrived
+    // on any other relay is dropped by the arrival check below.
+    let community_relay = relay.ws_url().to_string();
     let restart = tokio::task::spawn_blocking(move || {
-        reconcile_inbound_persona_event_blocking(event_json, arrival_relay_url, blocking_app)
+        reconcile_inbound_persona_event_blocking(
+            event_json,
+            arrival_relay_url,
+            community_relay,
+            blocking_app,
+        )
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))??;
@@ -104,43 +113,16 @@ pub async fn reconcile_inbound_persona_event(
                 )
             })?;
         }
-        Some(InboundRuntimeRefresh::Provider {
-            pubkey,
-            provider_id,
-            config,
-            cached_binary_path,
-            agent_json,
-        }) => {
+        Some(InboundRuntimeRefresh::Remote { pubkey, target }) => {
             let state = app.state::<AppState>();
-            let agent_json = match agent_json {
-                Ok(agent_json) => agent_json,
-                Err(error) => {
-                    let message = format!(
-                        "Inbound agent access was saved, but its provider deployment could not be refreshed safely: {error}"
-                    );
-                    super::super::agents::provider_access::persist_failure(
-                        &app, &state, &pubkey, &message,
-                    )?;
-                    let _ = app.emit("agents-data-changed", ());
-                    return Err(message);
-                }
-            };
-            super::super::agents::deploy_to_provider(
-                &app,
-                &state,
-                &pubkey,
-                &provider_id,
-                &config,
-                agent_json,
-                cached_binary_path.as_deref(),
-                None,
-                None,
-                None,
+            let result = super::super::agents::access_transition::redeploy_for_access_policy(
+                &app, &state, &pubkey, &target,
             )
-            .await
-            .map_err(|error| {
+            .await;
+            let _ = app.emit("agents-data-changed", ());
+            result.map_err(|error| {
                 format!(
-                    "Inbound agent access was saved, but its provider deployment failed to refresh with the new policy: {error}"
+                    "Inbound agent access was saved, but redeploying the agent with the new policy failed: {error}"
                 )
             })?;
         }
@@ -152,8 +134,10 @@ pub async fn reconcile_inbound_persona_event(
 fn reconcile_inbound_persona_event_blocking<R: tauri::Runtime>(
     event_json: String,
     arrival_relay_url: String,
+    community_relay: String,
     app: AppHandle<R>,
 ) -> Result<Option<InboundRuntimeRefresh>, String> {
+    let community_relay = community_relay.as_str();
     use crate::managed_agents::{
         agent_events::managed_agent_content_from_event,
         load_managed_agents, load_teams,
@@ -183,7 +167,7 @@ fn reconcile_inbound_persona_event_blocking<R: tauri::Runtime>(
     // in its `a` tag (`<target_kind>:<owner>:<d_tag>`). Handled before the
     // upsert dispatch because its coordinate and retention key differ.
     if kind == KIND_DELETION {
-        reconcile_inbound_tombstone(&event, &arrival_relay_url, &app, &state)?;
+        reconcile_inbound_tombstone(&event, &arrival_relay_url, &app, &state, community_relay)?;
         return Ok(None);
     }
 
@@ -232,6 +216,7 @@ fn reconcile_inbound_persona_event_blocking<R: tauri::Runtime>(
     let Some(scope) = crate::managed_agents::retention::arrival_retention_scope(
         &app,
         &state,
+        community_relay,
         &arrival_relay_url,
     )?
     else {
@@ -298,6 +283,7 @@ fn reconcile_inbound_persona_event_blocking<R: tauri::Runtime>(
                 super::super::teams::refresh_team_catalog_heads_for_persona(
                     &app,
                     &state,
+                    community_relay,
                     &persona_id,
                 );
             }
@@ -326,7 +312,13 @@ fn reconcile_inbound_persona_event_blocking<R: tauri::Runtime>(
             let teams = load_teams(&app)?;
             let personas = load_personas(&app)?;
             if let Some(team) = teams.iter().find(|record| record.id == team_id) {
-                super::super::teams::refresh_team_catalog_head(&app, &state, team, &personas);
+                super::super::teams::refresh_team_catalog_head(
+                    &app,
+                    &state,
+                    community_relay,
+                    team,
+                    &personas,
+                );
             }
         }
         KIND_MANAGED_AGENT => {
@@ -346,54 +338,35 @@ fn reconcile_inbound_persona_event_blocking<R: tauri::Runtime>(
                     .iter_mut()
                     .find(|record| record.pubkey == d_tag)
                     .ok_or_else(|| format!("agent {d_tag} disappeared during inbound apply"))?;
-                match &record.backend {
-                    crate::managed_agents::BackendKind::Local => {
-                        let mut runtimes = state
-                            .managed_agent_processes
-                            .lock()
-                            .map_err(|error| error.to_string())?;
-                        let mut relay_urls =
-                            crate::managed_agents::managed_agent_runtime_keys(&runtimes, &d_tag)
-                                .into_iter()
-                                .map(|key| key.relay_url)
-                                .collect::<Vec<_>>();
-                        if relay_urls.is_empty() && record.runtime_pid.is_some() {
-                            relay_urls.push(crate::relay::effective_agent_relay_url(
-                                &record.relay_url,
-                                &crate::relay::relay_ws_url_with_override(&state),
-                            ));
-                        }
-                        if !relay_urls.is_empty() {
-                            crate::managed_agents::stop_managed_agent_process(
-                                &app,
-                                record,
-                                &mut runtimes,
-                            )?;
-                            runtime_refresh = Some(InboundRuntimeRefresh::Local {
-                                pubkey: d_tag.clone(),
-                                relay_urls,
-                            });
-                        }
-                    }
-                    crate::managed_agents::BackendKind::Provider { id, config }
-                        if record.backend_agent_id.is_some() =>
-                    {
-                        // Persist the unacknowledged policy transition in the
-                        // same write as the narrowed policy. If the process
-                        // exits before or during deployment, workspace apply
-                        // can still recover it in every build.
-                        record.provider_policy_pending = true;
-                        runtime_refresh = Some(InboundRuntimeRefresh::Provider {
+                use super::super::agents::access_transition::{
+                    plan_access_runtime_transition, AccessRuntimeTransition,
+                };
+                let mut runtimes = state
+                    .managed_agent_processes
+                    .lock()
+                    .map_err(|error| error.to_string())?;
+                // A deployed remote agent is marked pending in the same write
+                // as the inbound policy, so workspace apply can recover a
+                // redeploy that fails or never runs.
+                match plan_access_runtime_transition(record, true, &runtimes, community_relay) {
+                    AccessRuntimeTransition::None => {}
+                    AccessRuntimeTransition::RestartLocal { relay_urls } => {
+                        crate::managed_agents::stop_managed_agent_process(
+                            &app,
+                            record,
+                            &mut runtimes,
+                        )?;
+                        runtime_refresh = Some(InboundRuntimeRefresh::Local {
                             pubkey: d_tag.clone(),
-                            provider_id: id.clone(),
-                            config: config.clone(),
-                            cached_binary_path: record.provider_binary_path.clone(),
-                            agent_json: super::super::agents::build_deploy_payload(
-                                &app, &state, record,
-                            ),
+                            relay_urls,
                         });
                     }
-                    crate::managed_agents::BackendKind::Provider { .. } => {}
+                    AccessRuntimeTransition::Redeploy(target) => {
+                        runtime_refresh = Some(InboundRuntimeRefresh::Remote {
+                            pubkey: d_tag.clone(),
+                            target,
+                        });
+                    }
                 }
             }
             save_managed_agents(&app, &agents)?;
@@ -526,6 +499,7 @@ fn reconcile_inbound_tombstone<R: tauri::Runtime>(
     arrival_relay_url: &str,
     app: &AppHandle<R>,
     state: &AppState,
+    community_relay: &str,
 ) -> Result<(), String> {
     use crate::managed_agents::{
         load_managed_agents, load_teams,
@@ -560,8 +534,12 @@ fn reconcile_inbound_tombstone<R: tauri::Runtime>(
     // local edit is a no-op. Scoped to the arrival community, so a workspace
     // switch since arrival drops the tombstone instead of retaining it — and
     // deleting a record — in the wrong community's store.
-    let Some(scope) =
-        crate::managed_agents::retention::arrival_retention_scope(app, state, arrival_relay_url)?
+    let Some(scope) = crate::managed_agents::retention::arrival_retention_scope(
+        app,
+        state,
+        community_relay,
+        arrival_relay_url,
+    )?
     else {
         return Ok(());
     };
@@ -640,11 +618,21 @@ fn reconcile_inbound_tombstone<R: tauri::Runtime>(
     // swallows so a retention hiccup never blocks the disk-authoritative delete.
     match target_kind {
         KIND_TEAM => {
-            super::super::teams::tombstone_team_catalog_head(app, state, &target_d_tag);
+            super::super::teams::tombstone_team_catalog_head(
+                app,
+                state,
+                community_relay,
+                &target_d_tag,
+            );
         }
         KIND_PERSONA => {
             if let Some(persona_id) = &deleted_persona_id {
-                super::super::teams::refresh_team_catalog_heads_for_persona(app, state, persona_id);
+                super::super::teams::refresh_team_catalog_heads_for_persona(
+                    app,
+                    state,
+                    community_relay,
+                    persona_id,
+                );
             }
         }
         _ => {}

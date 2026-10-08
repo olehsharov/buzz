@@ -293,7 +293,12 @@ pub async fn get_agent_config_surface(
         ),
     )?;
     let session_cache = state.get_session_cache(&runtime_key);
-    let global = crate::managed_agents::load_global_agent_config(&app).unwrap_or_default();
+    // The agent's own community's defaults (the runtime key's relay above).
+    let global = crate::managed_agents::load_agent_defaults_for_record(
+        &app,
+        &record,
+        &runtime_key.relay_url,
+    );
 
     // #3493: for claude agents, resolve the settings.json and .claude.json paths
     // from the agent's effective CLAUDE_CONFIG_DIR env var (if set), falling

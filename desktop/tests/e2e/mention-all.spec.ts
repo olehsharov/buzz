@@ -1,0 +1,283 @@
+import { expect, test, type Page } from "@playwright/test";
+import { waitForAnimations } from "../helpers/animations";
+import { installMockBridge, TEST_IDENTITIES } from "../helpers/bridge";
+
+// `general` roster: the viewer (owner), Alice (a relay agent that answers
+// anyone in `general`), Bob, and "mira", a member whose profile alone marks it
+// as an agent and that no agent directory lets the viewer mention. `@all`
+// reaches every person plus every agent the sender may mention: Alice and Bob.
+const GENERAL_RECIPIENTS = [
+  TEST_IDENTITIES.alice.pubkey,
+  TEST_IDENTITIES.bob.pubkey,
+];
+// `agents` roster: the viewer (owner), Charlie (`bot` role, a relay agent
+// registered only in `general`, so it cannot answer here) and "nadia", seeded
+// below as a relay agent the viewer owns in `agents`. Only nadia is tagged.
+const OWNED_RELAY_AGENT =
+  "a1b2c3d4e5f60718293a4b5c6d7e8f90112233445566778899aabbccddeeff00";
+const VIEWER = "deadbeef".repeat(8);
+const AGENTS_RECIPIENTS = [OWNED_RELAY_AGENT];
+const MARKER = ["buzz:mention-group", "all"];
+const OUT = "test-results/mention-all";
+
+type SentEvent = { content: string; pubkeys: string[]; tags: string[][] };
+
+async function sent(page: Page, content: string): Promise<SentEvent[]> {
+  return page.evaluate((content) => {
+    const signed = (window.__BUZZ_E2E_SIGNED_EVENTS__ ?? [])
+      .filter((event) => event.content === content)
+      .map((event) => ({
+        content: event.content,
+        pubkeys: event.tags
+          .filter((tag) => tag[0] === "p")
+          .map((tag) => tag[1])
+          .sort(),
+        tags: event.tags,
+      }));
+    if (signed.length > 0) return signed;
+    // Sends that need the acknowledged REST path go through native IPC.
+    return (window.__BUZZ_E2E_COMMAND_LOG__ ?? [])
+      .filter((call) => call.command === "send_channel_message")
+      .map(
+        (call) =>
+          call.payload as {
+            content: string;
+            mentionPubkeys?: string[];
+            mentionTags?: string[][] | null;
+          },
+      )
+      .filter((payload) => payload.content === content)
+      .map((payload) => ({
+        content: payload.content,
+        pubkeys: [...(payload.mentionPubkeys ?? [])].sort(),
+        tags: payload.mentionTags ?? [],
+      }));
+  }, content);
+}
+
+async function open(
+  page: Page,
+  channel: string,
+  extra?: string[],
+  bridge?: Parameters<typeof installMockBridge>[1],
+) {
+  await installMockBridge(page, {
+    ...bridge,
+    ...(extra ? { extraChannelMembers: { [channel]: extra } } : {}),
+  });
+  await page.goto("/");
+  await page.getByTestId(`channel-${channel}`).click();
+  await expect(page.getByTestId("chat-title")).toHaveText(channel);
+}
+
+test("picking @all notifies every person and eligible agent, and renders one pill", async ({
+  page,
+}) => {
+  await open(page, "general");
+  const input = page.getByTestId("message-input");
+  await input.click();
+  await page.keyboard.type("@al");
+  const option = page.getByTestId("mention-suggestion-group-all");
+  await expect(option).toBeVisible();
+  await expect(option).toContainText("@all");
+  await expect(option).toContainText("Notify 2 members in this channel");
+  await expect(option.getByRole("button")).toHaveAccessibleName(
+    "Mention @all: Notify 2 members in this channel",
+  );
+  await waitForAnimations(page);
+  await page
+    .getByTestId("mention-autocomplete")
+    .screenshot({ path: `${OUT}/01-autocomplete.png` });
+
+  await option.getByRole("button").click();
+  await page.keyboard.type("standup moved to 3pm");
+  const content = "@all standup moved to 3pm";
+  await expect(input).toHaveText(content);
+  await page.keyboard.press("Enter");
+
+  await expect
+    .poll(() => sent(page, content))
+    .toEqual([
+      expect.objectContaining({ pubkeys: [...GENERAL_RECIPIENTS].sort() }),
+    ]);
+  const [event] = await sent(page, content);
+  expect(event.tags.filter((tag) => tag[0] === MARKER[0])).toEqual([MARKER]);
+
+  const row = page
+    .getByTestId("message-timeline")
+    .getByTestId("message-row")
+    .filter({ hasText: "standup moved to 3pm" })
+    .last();
+  const pill = row.locator('[data-mention-kind="group"]');
+  await expect(pill).toHaveCount(1);
+  await expect(pill).toHaveText("all");
+  await expect(pill).toHaveAttribute(
+    "aria-label",
+    "@all, everyone in this channel",
+  );
+  // One group pill, not one chip per recipient.
+  await expect(row.locator("[data-mention]")).toHaveCount(1);
+  await waitForAnimations(page);
+  await row.screenshot({ path: `${OUT}/02-rendered-message.png` });
+
+  // Editing keeps the original marker (the edit itself never re-notifies)
+  // and the edit composer does not offer the group.
+  await row.hover();
+  await row.getByRole("button", { name: "More actions" }).click();
+  await page.getByRole("menuitem", { name: "Edit message" }).click();
+  await expect(page.getByTestId("edit-target")).toBeVisible();
+  await input.press("End");
+  await page.keyboard.type(" @al");
+  await expect(page.getByTestId("mention-autocomplete")).toBeVisible();
+  await expect(page.getByTestId("mention-suggestion-group-all")).toHaveCount(0);
+  await input.fill("@all standup moved to 3pm today");
+  await page.getByTestId("send-message").click();
+  await expect(page.getByTestId("edit-target")).toHaveCount(0);
+  const edited = page
+    .getByTestId("message-timeline")
+    .getByTestId("message-row")
+    .filter({ hasText: "standup moved to 3pm today" })
+    .last();
+  await expect(edited.locator('[data-mention-kind="group"]')).toHaveCount(1);
+  const edits = await page.evaluate(() =>
+    (window.__BUZZ_E2E_COMMAND_LOG__ ?? [])
+      .filter((call) => call.command === "edit_message")
+      .map(
+        (call) =>
+          (call.payload as { input: { mentionPubkeys: string[] } }).input,
+      ),
+  );
+  expect(edits.at(-1)?.mentionPubkeys).toEqual([]);
+});
+
+test("a typed @all resolves to the group like a picked one", async ({
+  page,
+}) => {
+  await open(page, "general");
+  const input = page.getByTestId("message-input");
+  await input.fill("@all typed hello");
+  await input.press("Escape");
+  await page.getByTestId("send-message").click();
+  await expect
+    .poll(() => sent(page, "@all typed hello"))
+    .toEqual([
+      expect.objectContaining({ pubkeys: [...GENERAL_RECIPIENTS].sort() }),
+    ]);
+});
+
+test("@all in a channel of agents tags the eligible ones and skips the rest", async ({
+  page,
+}) => {
+  await open(page, "agents", undefined, {
+    relayAgents: [
+      {
+        pubkey: OWNED_RELAY_AGENT,
+        name: "nadia",
+        ownerPubkey: VIEWER,
+        respondTo: "owner-only",
+        channelNames: ["agents"],
+      },
+    ],
+  });
+  const input = page.getByTestId("message-input");
+  await input.click();
+  await page.keyboard.type("@al");
+  const option = page.getByTestId("mention-suggestion-group-all");
+  await expect(option).toContainText("Notify 1 member in this channel");
+  await expect(option.getByRole("button")).not.toHaveAttribute(
+    "aria-disabled",
+    "true",
+  );
+  await input.fill("@all agents sync");
+  await input.press("Escape");
+  await page.getByTestId("send-message").click();
+  await expect
+    .poll(() => sent(page, "@all agents sync"))
+    .toEqual([
+      expect.objectContaining({ pubkeys: [...AGENTS_RECIPIENTS].sort() }),
+    ]);
+  const [event] = await sent(page, "@all agents sync");
+  expect(event.tags.filter((tag) => tag[0] === MARKER[0])).toEqual([MARKER]);
+});
+
+test("@all over the cap is disabled with a reason and blocks typed sends", async ({
+  page,
+}) => {
+  // 50 extra members + Alice and Bob = 52 besides the sender.
+  const extra = Array.from({ length: 50 }, (_, index) =>
+    (index + 1).toString(16).padStart(64, "7"),
+  );
+  await open(page, "general", extra);
+  const input = page.getByTestId("message-input");
+  await input.click();
+  await page.keyboard.type("@al");
+  const option = page.getByTestId("mention-suggestion-group-all");
+  await expect(option).toContainText("@all can notify at most 50 members");
+  const button = option.getByRole("button");
+  await expect(button).toHaveAttribute("aria-disabled", "true");
+  // aria-disabled is not native `disabled`: force the pointer press through
+  // Playwright's actionability gate to prove the handler itself refuses it.
+  await button.click({ force: true });
+  await expect(input).toHaveText("@al");
+  // Arrow onto the entry, then Enter and Tab: still not inserted.
+  const index = Number(
+    await option.getAttribute("data-mention-suggestion-index"),
+  );
+  for (let step = 0; step < index; step += 1) {
+    await page.keyboard.press("ArrowDown");
+  }
+  await expect(option).toHaveClass(/bg-accent text-accent-foreground/);
+  await page.keyboard.press("Enter");
+  await expect(input).toHaveText("@al");
+  await page.keyboard.press("Tab");
+  await expect(input).toHaveText("@al");
+  await expect(option).toBeVisible();
+  await waitForAnimations(page);
+  await page
+    .getByTestId("mention-autocomplete")
+    .screenshot({ path: `${OUT}/03-autocomplete-over-cap.png` });
+
+  await input.fill("@all over the cap");
+  await input.press("Escape");
+  await page.getByTestId("send-message").click();
+  await expect(
+    page
+      .getByText(
+        "@all can notify at most 50 members. This channel has 52 besides you.",
+      )
+      .first(),
+  ).toBeVisible();
+  await expect(input).toHaveText("@all over the cap");
+  expect(await sent(page, "@all over the cap")).toEqual([]);
+});
+
+test("a large roster still lists @all first on @a, @al and @all", async ({
+  page,
+}) => {
+  // Real channels: nearly every hex key contains "a", so every member matches
+  // `@a`. Behind 50+ such members the group fell past the suggestion cap.
+  const extra = Array.from({ length: 60 }, (_, index) =>
+    (index + 1).toString(16).padStart(64, "a"),
+  );
+  await open(page, "general", extra);
+  const input = page.getByTestId("message-input");
+  await input.click();
+  const option = page.getByTestId("mention-suggestion-group-all");
+  for (const key of ["@a", "l", "l"]) {
+    await page.keyboard.type(key);
+    await expect(option).toBeInViewport();
+    await expect(option).toHaveAttribute("data-mention-suggestion-index", "0");
+  }
+  await expect(option).toContainText("@all can notify at most 50 members");
+});
+
+test("DMs never offer @all", async ({ page }) => {
+  await open(page, "alice-tyler");
+  const input = page.getByTestId("message-input");
+  await input.click();
+  await page.keyboard.type("@");
+  await expect(page.getByTestId("mention-autocomplete")).toBeVisible();
+  await expect(page.getByTestId("mention-suggestion-group-all")).toHaveCount(0);
+  await page.keyboard.type("all");
+  await expect(page.getByTestId("mention-suggestion-group-all")).toHaveCount(0);
+});

@@ -412,7 +412,7 @@ async fn restart_setup_mode_agents_after_install(
     use crate::{
         app_state::AppState,
         managed_agents::{
-            agent_readiness, known_acp_runtime, load_global_agent_config, load_managed_agents,
+            agent_readiness, known_acp_runtime, load_community_agent_defaults, load_managed_agents,
             load_personas, record_agent_command, resolve_effective_agent_env, AgentReadiness,
             BackendKind,
         },
@@ -425,7 +425,7 @@ async fn restart_setup_mode_agents_after_install(
     let candidates = tokio::task::spawn_blocking(move || {
         let records = load_managed_agents(&app_for_scan).unwrap_or_default();
         let personas = load_personas(&app_for_scan).unwrap_or_default();
-        let global = load_global_agent_config(&app_for_scan).unwrap_or_default();
+        let defaults = load_community_agent_defaults(&app_for_scan).unwrap_or_default();
 
         // Read the runtimes map to check setup_mode stamps.
         let state_inner = app_for_scan.state::<AppState>();
@@ -450,7 +450,7 @@ async fn restart_setup_mode_agents_after_install(
                     record,
                     &personas,
                     known_acp_runtime(&effective_cmd),
-                    &global,
+                    defaults.for_agent(&app_for_scan, record),
                 );
                 let now_ready = matches!(agent_readiness(&effective), AgentReadiness::Ready);
                 let pid_alive = runtimes.iter().any(|(key, runtime)| {
@@ -504,9 +504,9 @@ async fn restart_single_agent_after_install(
         app_state::AppState,
         managed_agents::{
             agent_readiness, current_instance_id, find_managed_agent_mut, known_acp_runtime,
-            load_global_agent_config, load_managed_agents, load_personas, record_agent_command,
-            resolve_effective_agent_env, save_managed_agents, stop_managed_agent_process,
-            sync_managed_agent_processes, AgentReadiness, BackendKind,
+            load_agent_defaults_for_agent, load_managed_agents, load_personas,
+            record_agent_command, resolve_effective_agent_env, save_managed_agents,
+            stop_managed_agent_process, sync_managed_agent_processes, AgentReadiness, BackendKind,
         },
     };
     use tauri::Manager;
@@ -558,7 +558,7 @@ async fn restart_single_agent_after_install(
         }
 
         let personas = load_personas(&app_for_stop).unwrap_or_default();
-        let global = load_global_agent_config(&app_for_stop).unwrap_or_default();
+        let global = load_agent_defaults_for_agent(&app_for_stop, record);
 
         let effective_cmd = record_agent_command(record, &personas);
         let runtime_matches =
@@ -1023,7 +1023,7 @@ pub async fn discover_managed_agent_prereqs(
     .map_err(|e| format!("spawn_blocking failed: {e}"))
 }
 
-mod relay_directory;
+pub(crate) mod relay_directory;
 #[cfg(test)]
 use relay_directory::advance_relay_cursor;
 pub use relay_directory::{list_relay_agents, revalidate_relay_agents};

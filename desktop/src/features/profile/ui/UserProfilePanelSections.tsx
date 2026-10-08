@@ -7,6 +7,7 @@ import { useAgentWorking } from "@/features/agents/agentWorkingSignal";
 import { agentPresenceStartBlockReason } from "@/features/agents/lib/useAgentAvailability";
 import {
   getManagedAgentPrimaryActionLabel,
+  getManagedAgentRestartLabel,
   isManagedAgentActive,
 } from "@/features/agents/lib/managedAgentControlActions";
 import { RestartDiffBadge } from "@/features/agents/ui/RestartDiffBadge";
@@ -209,6 +210,10 @@ export function ProfileSummaryView({
   });
 
   const showMemoriesTab = isOwner === true && Boolean(pubkey);
+  const agentRestartLabel =
+    isOwner === true && managedAgent
+      ? getManagedAgentRestartLabel(managedAgent)
+      : null;
   const showInstructionBlock =
     isOwner === true &&
     (agentInstruction !== null || handleEditPersona !== undefined);
@@ -447,14 +452,8 @@ export function ProfileSummaryView({
               ? handleAgentPrimaryAction
               : undefined
           }
-          onAgentRestart={
-            isOwner === true &&
-            managedAgent?.backend.type === "local" &&
-            (managedAgent.status === "running" ||
-              managedAgent.status === "deployed")
-              ? handleAgentRestart
-              : undefined
-          }
+          agentRestartLabel={agentRestartLabel ?? undefined}
+          onAgentRestart={agentRestartLabel ? handleAgentRestart : undefined}
           isFollowing={isFollowing}
           huddlePending={isBot ? undefined : isHuddlePending}
           messagePending={isMessagePending}

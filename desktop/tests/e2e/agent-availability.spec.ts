@@ -107,6 +107,50 @@ test("saved deployment with offline presence is not shown as online", async ({
   );
 });
 
+test("a shut-down remote deployment can be redeployed from its profile", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    managedAgents: [
+      {
+        pubkey: LOCAL,
+        name: "Offline deployment",
+        status: "deployed",
+        backend: { type: "provider", id: "fixture", config: {} },
+        channelNames: ["agents"],
+      },
+    ],
+  });
+  await page.goto("/#/agents");
+  await page
+    .getByRole("button", { name: "Offline deployment agent profile" })
+    .click();
+  await expect(page.getByTestId("user-profile-presence-badge")).toHaveAttribute(
+    "aria-label",
+    "Offline",
+  );
+  // `!shutdown` leaves the record "deployed", so the primary action stays
+  // Shutdown; Redeploy is the explicit way back (deploy is idempotent).
+  await expect(
+    page.getByTestId("user-profile-agent-primary-action"),
+  ).toHaveAttribute("aria-label", "Shutdown");
+  const redeploy = page.getByTestId("user-profile-agent-restart");
+  await expect(redeploy).toHaveAttribute("aria-label", "Redeploy agent");
+  await redeploy.click();
+  await expect(
+    page.locator("[data-sonner-toast]").filter({
+      hasText: "Redeploying Offline deployment.",
+    }),
+  ).toBeVisible();
+  expect(
+    await page.evaluate(() =>
+      (window.__BUZZ_E2E_COMMANDS__ ?? []).filter((command) =>
+        ["start_managed_agent", "stop_managed_agent"].includes(command),
+      ),
+    ),
+  ).toEqual(["start_managed_agent"]);
+});
+
 test("missing snapshot is offline but failed reads cannot reuse cached online", async ({
   page,
 }) => {

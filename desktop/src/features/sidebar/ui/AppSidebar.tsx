@@ -78,6 +78,7 @@ import {
 import { useProtectedVisibleDirectMessages } from "@protected-feature-components";
 
 export function AppSidebar({
+  hasCommunityRail: hasCommunityRailProp,
   addCommunityPrefill,
   activeCommunity,
   channels,
@@ -124,6 +125,7 @@ export function AppSidebar({
   onSelectHome,
   onSelectChannel,
   onOpenSearchResult,
+  onOpenSearchResultInNewWindow,
   searchChannels,
   searchFocusRequests,
   onSelectSettings,
@@ -516,7 +518,9 @@ export function AppSidebar({
     >
       <div
         className={`relative flex min-h-0 flex-1 flex-col overflow-hidden ${
-          communities.length > 1 ? "md:-ml-[11px] md:w-[calc(100%+11px)]" : ""
+          (hasCommunityRailProp ?? communities.length > 1)
+            ? "md:-ml-[11px] md:w-[calc(100%+11px)]"
+            : ""
         }`}
         data-sidebar-background
         data-testid="app-sidebar-scroll-anchor"
@@ -532,6 +536,7 @@ export function AppSidebar({
           onCreateChannel={handleOpenCreateChannel}
           onOpenDm={onOpenDm}
           onOpenSearchResult={onOpenSearchResult}
+          onOpenSearchResultInNewWindow={onOpenSearchResultInNewWindow}
           onSelectChannel={onSelectChannel}
           searchChannels={searchChannels}
           searchFocusRequest={searchFocusRequests[0]}

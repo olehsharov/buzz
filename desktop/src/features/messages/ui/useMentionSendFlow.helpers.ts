@@ -7,6 +7,11 @@ import {
 import type { QueuedMediaAttachment } from "@/features/messages/lib/backgroundMediaUploadStore";
 import type { PreparedBackgroundLinkPreviews } from "@/features/messages/lib/linkPreviewPreparationStore";
 import type { DraftMentionRef } from "@/features/messages/lib/useDrafts";
+import {
+  type MentionAllSendResolution,
+  mentionAllCombinedCapError,
+} from "@/features/messages/lib/mentionAllAudience";
+import { mentionAllMarkerTag } from "@/shared/lib/mentionGroup";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { MENTION_REFERENCE_TAG } from "@/shared/lib/resolveMentionNames";
 
@@ -180,7 +185,8 @@ export function isManagedAgentRunning(agent: ManagedAgent) {
 }
 
 export function isProviderBackedAgent(agent: ManagedAgent) {
-  return agent.backend.type === "provider";
+  // Machine agents deploy over the relay too: same "deployed" semantics.
+  return agent.backend.type === "provider" || agent.backend.type === "host";
 }
 
 /** Carry captured recipient identity through composer clearing and uploads. */
@@ -214,4 +220,30 @@ export function withoutInvitingRecipients(draft: PendingNonMemberMentionSend) {
       nonMemberPubkeys,
     ),
   };
+}
+
+/**
+ * Fold a send-time `@all` resolution into the outgoing recipients, or return
+ * the visible reason the send must stop before anything is cleared or created.
+ * `pendingPersonaCount` reserves room for persona agents the send will create.
+ */
+export function planMentionAllSend({
+  otherRecipientPubkeys,
+  pendingPersonaCount,
+  resolution,
+}: {
+  otherRecipientPubkeys: Iterable<string>;
+  pendingPersonaCount: number;
+  resolution: MentionAllSendResolution;
+}): { error: string } | { recipients: string[]; tags: string[][] } {
+  if (resolution.status === "none") return { recipients: [], tags: [] };
+  if (resolution.status === "blocked") return { error: resolution.message };
+  const recipients = uniqueNormalizedPubkeys(resolution.recipients);
+  const capError = mentionAllCombinedCapError(
+    uniqueNormalizedPubkeys([...otherRecipientPubkeys, ...recipients]).length +
+      pendingPersonaCount,
+  );
+  return capError
+    ? { error: capError }
+    : { recipients, tags: [mentionAllMarkerTag()] };
 }

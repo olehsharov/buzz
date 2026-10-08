@@ -32,7 +32,7 @@ use uuid::Uuid;
 use crate::acp::{
     extract_model_config_options, extract_model_state, extract_thought_level_config_id,
     model_in_catalog, resolve_model_switch_method, AcpClient, AcpError, EnvVar, McpServer,
-    ModelSwitchMethod, StopReason, SystemPromptTransport, BUZZ_PI_ACP_NAME,
+    ModelSwitchMethod, SessionNewResponse, StopReason, SystemPromptTransport, BUZZ_PI_ACP_NAME,
 };
 use crate::config::{compose_scoped_session_title, DedupMode, PermissionMode};
 use crate::observer;
@@ -42,6 +42,7 @@ use crate::queue::{
     PromptProfile, PromptProfileLookup, ThreadTags,
 };
 use crate::relay::{ChannelInfo, RestClient};
+use crate::resume_store::ResumeForkStore;
 use crate::scope::SessionScope;
 
 /// Window within which agent activity before a hard-cap death qualifies
@@ -121,6 +122,10 @@ pub struct ChannelDeliveryState {
     /// this ACP session. Hydrated threads use bounded overfetch so exact event-ID
     /// deduplication does not unnecessarily shrink the new-context window.
     pub hydrated_thread_roots: VecDeque<String>,
+    /// A turn in this live session was cancelled. The adapter's cancel also
+    /// stops every background subagent/task the turn started, so the next
+    /// prompt must say so; cleared once a prompt carrying that notice succeeds.
+    pub background_work_cancelled: bool,
 }
 
 /// Per-channel session IDs, turn counters, and delivery state.
@@ -464,7 +469,8 @@ fn apply_completed_before_control_signal(
 /// a value is needed after a move, or match by reference.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ControlSignal {
-    /// Stop the current turn and drop its triggering batch.
+    /// Stop the current turn and drop its triggering batch. A clean stop
+    /// keeps the session (see `control_cancel_keeps_session`).
     Cancel,
     /// Stop the current turn and requeue its triggering batch for a merged
     /// re-prompt framed as a **supersede**: the new request replaces the old.
@@ -730,6 +736,113 @@ pub enum PromptOutcome {
     /// `CancelReason` on the batch (steer/interrupt requeue, explicit cancel
     /// drops) rather than the hard-cap's unconditional dead-letter.
     CancelDrainTimeout(Duration),
+    /// The scope's provider session is gone or has ended (the adapter said so,
+    /// or resuming it failed). Fail fast: the batch is dead-lettered with this
+    /// reason posted where the user sees it, no new session is started, and
+    /// every later message for the scope fails the same way until the owner
+    /// sends `!rotate`. See [`DeadSessions`].
+    SessionDead(String),
+    /// The turn was refused before reaching the agent because the harness
+    /// could not durably record what it needs to keep the conversation (the
+    /// restart journal or the scope-session map). The batch is dead-lettered
+    /// with this reason in its thread — running without the record would lose
+    /// the turn or the conversation silently on the next restart.
+    Refused(String),
+}
+
+/// Scopes whose provider session is gone, with the reason shown to the user.
+///
+/// A dead session is never silently replaced: starting a new session would
+/// drop everything the agent knew in that conversation without anyone
+/// noticing. Instead every message for the scope fails visibly with the
+/// recorded reason until the owner sends `!rotate`, which is the only way to
+/// start fresh. Process-local: a restarted harness re-tries the session (a
+/// bound scope resumes its fork; a journaled turn resumes its session) and
+/// fails fast again if it is still gone.
+#[derive(Debug, Clone, Default)]
+pub struct DeadSessions(Arc<Mutex<HashMap<SessionScope, String>>>);
+
+impl DeadSessions {
+    /// Record that `scope`'s session is gone for `reason`.
+    pub fn mark(&self, scope: SessionScope, reason: String) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope, reason);
+    }
+
+    /// The reason `scope`'s session is dead, if it is.
+    pub fn reason(&self, scope: &SessionScope) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(scope)
+            .cloned()
+    }
+
+    /// The owner asked for a fresh session (`!rotate`).
+    pub fn clear(&self, scope: &SessionScope) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(scope)
+            .is_some()
+    }
+}
+
+/// Whether `error` from `session/prompt` says the session itself is gone or
+/// has ended, rather than this one turn failing. Matches what
+/// `claude-agent-acp` returns: `Session not found` (unknown session id),
+/// `The Claude Agent session has ended` (its query stream closed), and
+/// `RESOURCE_NOT_FOUND` / `No conversation found` for a missing transcript. A
+/// `-32002` that names a missing *model* is a configuration error, not this.
+pub(crate) fn is_dead_session_error(error: &AcpError) -> bool {
+    let AcpError::AgentError { code, message } = error else {
+        return false;
+    };
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("model not found") {
+        return false;
+    }
+    *code == ACP_RESOURCE_NOT_FOUND
+        || lower.contains("session not found")
+        || lower.contains("session has ended")
+        || lower.contains("no conversation found")
+}
+
+/// Record that `scope`'s session `session_id` is gone because of `error`:
+/// log it at ERROR with the adapter's code and message, drop the scope's
+/// session state, drop any journaled turn or pending restart for it, and
+/// mark the scope dead. Returns the reason shown to the user.
+fn mark_session_dead(
+    agent: &mut OwnedAgent,
+    ctx: &PromptContext,
+    scope: &SessionScope,
+    session_id: &str,
+    error: &AcpError,
+) -> String {
+    let (code, message) = match error {
+        AcpError::AgentError { code, message } => (Some(*code), message.clone()),
+        other => (None, other.to_string()),
+    };
+    tracing::error!(
+        target: "pool::session",
+        scope = %scope.telemetry_label(),
+        session_id,
+        code,
+        message = %message,
+        "provider session is gone — not starting a new one; failing this scope until !rotate"
+    );
+    let code_text = code.map(|c| format!(" (code {c})")).unwrap_or_default();
+    let reason = format!(
+        "my session {session_id} for this conversation is gone{code_text}: {message}. \
+         I won't start a new session on my own, because that would lose everything from this \
+         conversation. The owner can send !rotate to start a fresh session."
+    );
+    agent.state.invalidate_scope(scope);
+    ctx.turn_journal.discard(scope);
+    ctx.dead_sessions.mark(scope.clone(), reason.clone());
+    reason
 }
 
 /// Immutable config subset shared (via `Arc`) by all spawned prompt tasks.
@@ -937,6 +1050,19 @@ pub struct PromptContext {
     /// the desktop keys per (agent, relay) pair, e.g. `session_config_captured`,
     /// mirroring the `managed_agent_runtime_lifecycle` frames.
     pub relay_url: String,
+    /// Provider session the first channel/DM session continues, with the
+    /// store recording its fork. `None` when `BUZZ_ACP_RESUME_SESSION` is
+    /// unset or already consumed by this process.
+    pub resume_session: ResumeSessionSlot,
+    /// Scopes whose provider session is gone; see [`DeadSessions`].
+    pub dead_sessions: DeadSessions,
+    /// Durable journal of turns in flight, resumed after a restart.
+    pub turn_journal: crate::turn_journal::TurnJournal,
+    /// Durable scope → provider-session map; see [`crate::scope_sessions`].
+    pub scope_sessions: crate::scope_sessions::ScopeSessions,
+    /// Live reply streaming (NIP-SD drafts). `None` when `--stream off` or
+    /// for isolated tasks.
+    pub stream: Option<crate::stream_draft::StreamRuntime>,
 }
 
 impl AgentPool {
@@ -1131,6 +1257,28 @@ impl AgentPool {
         mut has_pending_work: impl FnMut(&SessionScope) -> bool,
     ) {
         self.held_since.retain(|scope, _| has_pending_work(scope));
+    }
+
+    /// Whether a worker other than `agent_index` may still hold `scope`'s
+    /// provider session live: the scope's recorded owner is another worker
+    /// that is checked out (busy), or idle with a session for the scope. A
+    /// worker that was torn down (idle-pool sleep), crashed or respawned holds
+    /// nothing, so the scope's session may be resumed elsewhere.
+    pub fn scope_held_by_other_worker(&self, scope: &SessionScope, agent_index: usize) -> bool {
+        let Some(owner) = self.session_owners.get(scope) else {
+            return false;
+        };
+        if owner.agent_index == agent_index {
+            return false;
+        }
+        self.task_map
+            .values()
+            .any(|meta| meta.agent_index == owner.agent_index)
+            || self
+                .agents
+                .get(owner.agent_index)
+                .and_then(Option::as_ref)
+                .is_some_and(|agent| agent.state.sessions.contains_key(scope))
     }
 
     /// Whether any idle agent already has a session for `scope`.
@@ -1578,6 +1726,318 @@ struct NewSessionChannelContext<'a> {
     channel_type: Option<&'a str>,
 }
 
+/// Provider session to continue from (`BUZZ_ACP_RESUME_SESSION`) and the
+/// durable store recording which fork continues it.
+#[derive(Debug, Clone)]
+pub struct PendingResume {
+    /// Validated source provider session ID.
+    pub source: String,
+    /// Where the source -> fork record for this agent lives.
+    pub store: ResumeForkStore,
+}
+
+/// The `BUZZ_ACP_RESUME_SESSION` continuation shared by every worker.
+///
+/// The first channel/DM session created in the process claims it, and once
+/// continuing the source succeeds the continuation is *bound* to that scope
+/// on that worker. Exactly one `(scope, worker)` pair ever owns the binding.
+/// When that scope's session is lost to a failure (agent exit, transport or
+/// protocol error, timeout), the next session that worker creates for the
+/// same scope continues the recorded fork again instead of starting fresh.
+/// A deliberate rotation [releases](Self::release) the binding instead. Every
+/// other scope, and the same scope on another worker, starts fresh: a second
+/// live holder of the fork would race the first on its transcript.
+#[derive(Debug, Clone, Default)]
+pub struct ResumeSessionSlot(Arc<Mutex<ResumeSlotState>>);
+
+#[derive(Debug, Default)]
+struct ResumeSlotState {
+    /// Not yet claimed. `None` once claimed, or while the first claim is in
+    /// flight, so concurrent workers never both continue the source.
+    pending: Option<PendingResume>,
+    /// The scope and worker whose live session continues the source.
+    bound: Option<BoundResume>,
+    /// The only scope allowed the first claim: a turn restored from the
+    /// journal ran in the recorded fork, so its scope takes the binding.
+    reserved: Option<SessionScope>,
+}
+
+#[derive(Debug)]
+struct BoundResume {
+    scope: SessionScope,
+    agent_index: usize,
+    pending: PendingResume,
+}
+
+/// A continuation claimed for one session creation; settle it with
+/// [`ResumeSessionSlot::settle`].
+enum ResumeClaim {
+    /// First claim in this process: binds on success, returns on failure.
+    First(PendingResume),
+    /// The owning scope lost its session; continue the recorded fork again.
+    Rebind(PendingResume),
+}
+
+impl ResumeClaim {
+    fn pending(&self) -> &PendingResume {
+        match self {
+            Self::First(pending) | Self::Rebind(pending) => pending,
+        }
+    }
+}
+
+impl ResumeSessionSlot {
+    /// Slot holding `pending` until the first channel/DM session claims it.
+    pub fn new(pending: Option<PendingResume>) -> Self {
+        Self(Arc::new(Mutex::new(ResumeSlotState {
+            pending,
+            bound: None,
+            reserved: None,
+        })))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ResumeSlotState> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The continuation `agent_index` must use for a new session of `scope`,
+    /// if any: the bound one for the owning scope, else the unclaimed one.
+    ///
+    /// The binding follows its scope to a new worker once no other live
+    /// worker holds the fork (`held_elsewhere` is false): after an idle-pool
+    /// sleep, a crash or a respawn the old worker is gone, and whichever
+    /// worker runs the scope next continues the fork. While another live
+    /// worker may hold it, a second worker never resumes it.
+    fn claim(
+        &self,
+        scope: &SessionScope,
+        agent_index: usize,
+        held_elsewhere: bool,
+    ) -> Option<ResumeClaim> {
+        let mut state = self.lock();
+        if let Some(bound) = state.bound.as_mut() {
+            if bound.scope != *scope || (bound.agent_index != agent_index && held_elsewhere) {
+                return None;
+            }
+            bound.agent_index = agent_index;
+            return Some(ResumeClaim::Rebind(bound.pending.clone()));
+        }
+        if state.reserved.as_ref().is_some_and(|r| r != scope) {
+            return None;
+        }
+        state.pending.take().map(ResumeClaim::First)
+    }
+
+    /// Reserve the unclaimed continuation for `scope` when `session_id` is
+    /// the fork it would continue: a turn restored from the journal ran in
+    /// that fork, so `scope` — not whichever scope first starts a session —
+    /// must own the binding (two holders of one fork would race on its
+    /// transcript). Returns whether it reserved. An unreadable fork record
+    /// is an error, never "not the fork".
+    pub(crate) fn reserve_for_restored(
+        &self,
+        scope: &SessionScope,
+        session_id: &str,
+        cwd: &str,
+    ) -> std::io::Result<bool> {
+        let mut state = self.lock();
+        let Some(pending) = &state.pending else {
+            return Ok(false);
+        };
+        if pending.store.load(&pending.source, cwd)?.as_deref() != Some(session_id) {
+            return Ok(false);
+        }
+        state.reserved = Some(scope.clone());
+        Ok(true)
+    }
+
+    /// Record the outcome of continuing `claim`. A successful first claim
+    /// binds the continuation to `(scope, agent_index)`; a failed one returns
+    /// it so the next new session retries rather than silently starting
+    /// fresh. A rebind stays bound either way.
+    fn settle(&self, claim: ResumeClaim, scope: &SessionScope, agent_index: usize, ok: bool) {
+        let ResumeClaim::First(pending) = claim else {
+            return;
+        };
+        let mut state = self.lock();
+        if ok {
+            state.bound = Some(BoundResume {
+                scope: scope.clone(),
+                agent_index,
+                pending,
+            });
+        } else if state.pending.is_none() && state.bound.is_none() {
+            state.pending = Some(pending);
+        }
+    }
+
+    /// Whether `scope` owns the binding (its sessions continue the fork).
+    pub(crate) fn is_bound_to(&self, scope: &SessionScope) -> bool {
+        self.lock()
+            .bound
+            .as_ref()
+            .is_some_and(|b| b.scope == *scope)
+    }
+
+    /// Drop the binding if `scope` owns it: the scope's session is being
+    /// rotated on purpose (`!rotate`, context or turn limit), so later sessions
+    /// for it start fresh instead of continuing the fork again. Re-applying
+    /// after a limit-driven rotation would land straight back in the context
+    /// that triggered it. The fork record stays on disk for the next process.
+    pub(crate) fn release(&self, scope: &SessionScope) {
+        let mut state = self.lock();
+        if state.reserved.as_ref() == Some(scope) {
+            state.reserved = None;
+        }
+        if state.bound.as_ref().is_some_and(|b| b.scope == *scope) {
+            if let Some(bound) = state.bound.take() {
+                tracing::info!(
+                    target: "pool::session",
+                    "scope {} rotated; provider session {} is no longer continued",
+                    scope.telemetry_label(),
+                    bound.pending.source
+                );
+            }
+        }
+    }
+
+    /// Source of the unclaimed continuation, for tests.
+    #[cfg(test)]
+    fn pending_source(&self) -> Option<String> {
+        self.lock().pending.as_ref().map(|p| p.source.clone())
+    }
+
+    /// Scope and worker owning the binding, for tests.
+    #[cfg(test)]
+    fn bound_owner(&self) -> Option<(SessionScope, usize)> {
+        self.lock()
+            .bound
+            .as_ref()
+            .map(|b| (b.scope.clone(), b.agent_index))
+    }
+}
+
+/// ACP `RESOURCE_NOT_FOUND`: what `claude-agent-acp` returns when
+/// `session/resume` names a session with no transcript.
+const ACP_RESOURCE_NOT_FOUND: i64 = -32002;
+
+/// Whether `error` from `session/resume` of `session_id` says that session no
+/// longer exists (as opposed to a transient or configuration failure). Older
+/// adapters wrap the cause in a generic error whose detail names the session.
+fn is_resume_session_missing(error: &AcpError, session_id: &str) -> bool {
+    match error {
+        AcpError::AgentError { code, .. } if *code == ACP_RESOURCE_NOT_FOUND => true,
+        AcpError::AgentError { message, .. } => {
+            let lower = message.to_ascii_lowercase();
+            message.contains(session_id)
+                && (lower.contains("not found") || lower.contains("no conversation found"))
+        }
+        _ => false,
+    }
+}
+
+/// Continue the configured provider session as a live session with the
+/// harness setup parameters. The source session is never written to.
+///
+/// If a previous process already forked the source (recorded in the store),
+/// that fork is resumed so the agent keeps what it did in Buzz since. If the
+/// recorded fork no longer exists, the source is forked again with a warning
+/// and the record replaced. Otherwise the source is forked, the fork resumed,
+/// and the fork recorded — only after the resume succeeded, so a failed
+/// resume never leaves a record pointing at an unusable fork.
+async fn continue_provider_session(
+    agent: &mut OwnedAgent,
+    pending: &PendingResume,
+    cwd: &str,
+    mcp_servers: Vec<McpServer>,
+    system_prompt: Option<SystemPromptTransport<'_>>,
+    session_title: Option<&str>,
+) -> Result<SessionNewResponse, AcpError> {
+    if !agent.acp.fork_resume_supported() {
+        return Err(AcpError::Protocol(format!(
+            "BUZZ_ACP_RESUME_SESSION is set, but agent {:?} does not advertise \
+             sessionCapabilities.fork and .resume",
+            agent.agent_name
+        )));
+    }
+    let source = pending.source.as_str();
+    if let Some(fork) = pending.store.load(source, cwd)? {
+        match agent
+            .acp
+            .session_resume_full(
+                &fork,
+                cwd,
+                mcp_servers.clone(),
+                system_prompt.clone(),
+                session_title,
+            )
+            .await
+        {
+            Ok(resp) => {
+                if resp.session_id != fork {
+                    pending.store.save(source, cwd, &resp.session_id)?;
+                }
+                tracing::info!(
+                    target: "pool::session",
+                    "continuing provider session {source} via its recorded fork {}",
+                    resp.session_id
+                );
+                return Ok(resp);
+            }
+            Err(error) if is_resume_session_missing(&error, &fork) => {
+                tracing::warn!(
+                    target: "pool::session",
+                    "recorded fork {fork} of provider session {source} no longer exists \
+                     ({error}); forking the source again — work done in that fork is lost"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let forked = agent.acp.session_fork(source, cwd).await?;
+    let resp = agent
+        .acp
+        .session_resume_full(&forked, cwd, mcp_servers, system_prompt, session_title)
+        .await?;
+    pending.store.save(source, cwd, &resp.session_id)?;
+    tracing::info!(
+        target: "pool::session",
+        "continuing provider session {source} as fork {}",
+        resp.session_id
+    );
+    Ok(resp)
+}
+
+/// The provider session a new session for `scope` must resume instead of
+/// starting fresh: a turn restored from the journal first, else the session
+/// the scope last ran in (from the durable scope map) when the adapter can
+/// resume and no other live worker may still hold it. `None` means a genuinely
+/// new conversation.
+fn session_to_resume(
+    ctx: &PromptContext,
+    agent: &OwnedAgent,
+    scope: &SessionScope,
+) -> Option<String> {
+    if let Some(restored) = ctx.turn_journal.restart_session(scope) {
+        return Some(restored);
+    }
+    if ctx.scope_sessions.held_elsewhere(scope) {
+        return None;
+    }
+    let known = ctx.scope_sessions.session_for(scope)?;
+    if !agent.acp.resume_supported() {
+        tracing::warn!(
+            target: "pool::session",
+            scope = %scope.telemetry_label(),
+            "agent {:?} cannot resume sessions; scope {} starts a new session instead of {known}",
+            agent.agent_name,
+            scope.telemetry_label()
+        );
+        return None;
+    }
+    Some(known)
+}
+
 async fn create_session_and_apply_model(
     agent: &mut OwnedAgent,
     ctx: &PromptContext,
@@ -1623,20 +2083,90 @@ async fn create_session_and_apply_model(
         ctx.session_title.as_deref(),
     );
 
-    let resp = agent
-        .acp
-        .session_new_full(
-            &ctx.cwd,
-            mcp_servers,
-            session_new_system_prompt(
-                is_goose,
-                agent.protocol_version,
-                &agent.agent_name,
-                combined_system_prompt.as_deref(),
-            ),
-            session_title.as_deref(),
-        )
-        .await?;
+    let system_prompt = session_new_system_prompt(
+        is_goose,
+        agent.protocol_version,
+        &agent.agent_name,
+        combined_system_prompt.as_deref(),
+    );
+    // Only channel/DM sessions continue a configured provider session;
+    // heartbeat and isolated-task sessions always start fresh.
+    let resume_claim = channel.scope.and_then(|scope| {
+        let held_elsewhere = ctx.scope_sessions.held_elsewhere(scope);
+        Some((
+            scope,
+            ctx.resume_session
+                .claim(scope, agent.index, held_elsewhere)?,
+        ))
+    });
+    let resp = match resume_claim {
+        Some((scope, claim)) => {
+            if matches!(claim, ResumeClaim::Rebind(_)) {
+                tracing::info!(
+                    target: "pool::session",
+                    "scope {} lost its session; continuing provider session {} again",
+                    scope.telemetry_label(),
+                    claim.pending().source
+                );
+            }
+            let result = continue_provider_session(
+                agent,
+                claim.pending(),
+                &ctx.cwd,
+                mcp_servers,
+                system_prompt,
+                session_title.as_deref(),
+            )
+            .await;
+            ctx.resume_session
+                .settle(claim, scope, agent.index, result.is_ok());
+            result?
+        }
+        None => match channel
+            .scope
+            .and_then(|scope| session_to_resume(ctx, agent, scope))
+        {
+            // The scope already has a provider session (a turn restored from
+            // the journal, or the session its last worker held): continue it.
+            // Never falls back to a new session — the caller fails the scope
+            // fast if this errors.
+            Some(known) => {
+                if !agent.acp.resume_supported() {
+                    return Err(AcpError::Protocol(format!(
+                        "cannot resume session {known}: agent {:?} does not advertise \
+                         sessionCapabilities.resume",
+                        agent.agent_name
+                    )));
+                }
+                tracing::info!(
+                    target: "pool::session",
+                    "resuming session {known} for scope {}",
+                    channel.scope.map(SessionScope::telemetry_label).unwrap_or_default()
+                );
+                agent
+                    .acp
+                    .session_resume_full(
+                        &known,
+                        &ctx.cwd,
+                        mcp_servers,
+                        system_prompt,
+                        session_title.as_deref(),
+                    )
+                    .await?
+            }
+            None => {
+                agent
+                    .acp
+                    .session_new_full(
+                        &ctx.cwd,
+                        mcp_servers,
+                        system_prompt,
+                        session_title.as_deref(),
+                    )
+                    .await?
+            }
+        },
+    };
 
     if is_goose && agent.goose_system_prompt_supported != Some(false) {
         if let Some(prompt) = combined_system_prompt.as_deref() {
@@ -2390,6 +2920,7 @@ fn send_prompt_result(
     batch: Option<FlushBatch>,
 ) {
     agent.acp.clear_steer_rx();
+    agent.acp.clear_stream_sink();
     let _ = result_tx.send(PromptResult {
         agent,
         source,
@@ -2501,6 +3032,23 @@ pub async fn run_prompt_task(
         .map(|b| b.events.iter().map(|be| be.routing_event_id()).collect())
         .unwrap_or_default();
     let _reaction_guard = ReactionGuard::new(ctx.rest_client.clone(), reaction_ids.clone());
+
+    // A dead session is never replaced behind the user's back: fail this
+    // message with the recorded reason until the owner sends `!rotate`.
+    if let Some(reason) = source
+        .scope()
+        .and_then(|scope| ctx.dead_sessions.reason(scope))
+    {
+        send_prompt_result(
+            &result_tx,
+            &turn_id,
+            agent,
+            source,
+            PromptOutcome::SessionDead(reason),
+            batch,
+        );
+        return;
+    }
 
     // Resolve project authority exactly once, before any ACP session creation or
     // initial-message delivery. An indeterminate result is a local relay-state
@@ -2664,6 +3212,20 @@ pub async fn run_prompt_task(
             if let Some(sid) = agent.state.sessions.get(scope) {
                 (sid.clone(), false)
             } else {
+                // Whether this creation continues a session the scope already
+                // had (restored turn, remembered session, or bound fork). If
+                // that fails the scope fails fast — never a retry that would
+                // end in a new session.
+                let resumed: Option<String> =
+                    session_to_resume(&ctx, &agent, scope).or_else(|| {
+                        (ctx.resume_session.is_bound_to(scope)
+                            && !ctx.scope_sessions.held_elsewhere(scope))
+                        .then(|| {
+                            ctx.scope_sessions
+                                .session_for(scope)
+                                .unwrap_or_else(|| "(its recorded fork)".to_string())
+                        })
+                    });
                 // The title includes channel and, for thread sessions, the
                 // canonical root prefix so sibling sessions are distinguishable.
                 // DMs, unresolved, and unnamed channels omit the channel name.
@@ -2687,7 +3249,31 @@ pub async fn run_prompt_task(
                             "created session {sid} for channel {cid} (scope {})",
                             scope.telemetry_label()
                         );
+                        // Remember the scope's session so the next worker
+                        // resumes it. Without the record a pool sleep or a
+                        // restart would start the scope over unseen, so a
+                        // failed write refuses the turn visibly.
+                        if let Err(error) = ctx.scope_sessions.record(scope, &sid) {
+                            tracing::error!(
+                                target: "pool::session",
+                                scope = %scope.telemetry_label(),
+                                session_id = %sid,
+                                "{error}"
+                            );
+                            send_prompt_result(
+                                &result_tx,
+                                &turn_id,
+                                agent,
+                                source,
+                                PromptOutcome::Refused(format!(
+                                    "couldn't save which session this conversation uses: {error}"
+                                )),
+                                batch,
+                            );
+                            return;
+                        }
                         agent.state.sessions.insert(scope.clone(), sid.clone());
+                        ctx.turn_journal.finish_restart(scope);
                         agent
                             .state
                             .deliveries
@@ -2710,6 +3296,22 @@ pub async fn run_prompt_task(
                             source,
                             PromptOutcome::AgentExited,
                             requeue_batch_if_queue(&ctx, batch),
+                        );
+                        return;
+                    }
+                    Err(e) if resumed.is_some() => {
+                        // Resuming the scope's known session failed. Same rule
+                        // as a dead session: fail fast and visibly, never a
+                        // new session in its place.
+                        let known = resumed.clone().unwrap_or_default();
+                        let reason = mark_session_dead(&mut agent, &ctx, scope, &known, &e);
+                        send_prompt_result(
+                            &result_tx,
+                            &turn_id,
+                            agent,
+                            source,
+                            PromptOutcome::SessionDead(reason),
+                            batch,
                         );
                         return;
                     }
@@ -2999,6 +3601,12 @@ pub async fn run_prompt_task(
     // failed or cancelled first turn must not make its retry assume that the
     // provider retained any of that thread's context.
     let mut pending_hydrated_thread_roots = HashSet::new();
+    // Whether this prompt tells the agent a cancel stopped its background
+    // work; cleared from the session's delivery state once it succeeds.
+    let mut background_work_notice = false;
+    // Live reply draft for channel turns (NIP-SD). Dropping it on any exit
+    // path below abandons the stream; only a returned prompt finishes it.
+    let mut reply_stream: Option<crate::stream_draft::ReplyStream> = None;
     let prompt_sections: Vec<String> = if let Some(text) = prompt_text {
         // Heartbeats create their session before this point, so a Goose method-not-found
         // probe has already selected the correct framing for this process.
@@ -3056,6 +3664,21 @@ pub async fn run_prompt_task(
             .map(|delivery| &delivery.delivered_event_ids)
             .cloned()
             .unwrap_or_default();
+        // A merged re-prompt whose cancelled events this live session already
+        // received: the interrupted turn ran here and the session kept it (see
+        // `control_cancel_keeps_session`), so the prompt says it was
+        // interrupted instead of restating the original request as new. A
+        // replacement session starts with empty deliveries, so it gets the
+        // full restatement.
+        background_work_notice = agent
+            .state
+            .deliveries
+            .get(&b.scope)
+            .is_some_and(|delivery| delivery.background_work_cancelled);
+        let cancelled_turn_in_session = !b.cancelled_events.is_empty()
+            && b.cancelled_events
+                .iter()
+                .all(|event| delivered_ids.contains(&event.event.id.to_hex()));
         let conversation_context = if ctx.context_message_limit > 0 {
             fetch_conversation_context_for_target(
                 b.channel_id,
@@ -3088,6 +3711,13 @@ pub async fn run_prompt_task(
 
         let profile_lookup =
             fetch_prompt_profile_lookup(b, conversation_context.as_ref(), &ctx.rest_client).await;
+        if let Some(runtime) = ctx.stream.as_ref() {
+            let target = crate::stream_draft::ReplyTarget {
+                channel_id: b.channel_id,
+                thread: crate::queue::turn_reply_thread(b, is_dm, profile_lookup.as_ref()),
+            };
+            reply_stream = Some(crate::stream_draft::ReplyStream::start(runtime, target));
+        }
 
         let known_names: Vec<&str> = profile_lookup
             .iter()
@@ -3120,6 +3750,12 @@ pub async fn run_prompt_task(
                 team_instructions: standing.team_instructions,
                 agent_canvas: standing.agent_canvas,
                 standing_context_sent,
+                cancelled_turn_in_session,
+                background_work_cancelled: background_work_notice,
+                reply_autopost: ctx
+                    .stream
+                    .as_ref()
+                    .is_some_and(crate::stream_draft::StreamRuntime::autoposts),
             },
         )
     } else {
@@ -3193,6 +3829,39 @@ pub async fn run_prompt_task(
         "turn starting for {}",
         prompt_label(&source)
     );
+    if let Some(stream) = &reply_stream {
+        agent.acp.install_stream_sink(stream.sink());
+    }
+    // Journal the channel turn before its prompt goes out, so a harness that
+    // shuts down (or dies) before the turn completes can resume it in this
+    // same session on its next start. The guard removes the record when the
+    // turn ends, except when the harness is shutting down mid-turn.
+    //
+    // No record, no turn: running it unjournaled could lose it to a restart
+    // unseen, so a failed write refuses the turn with the reason in its thread.
+    let journaled = match (&source, &batch) {
+        (PromptSource::Channel(_), Some(b)) => ctx.turn_journal.begin(b, &session_id, &ctx.cwd),
+        _ => Ok(crate::turn_journal::TurnJournalGuard::disarmed()),
+    };
+    let mut turn_journal = match journaled {
+        Ok(guard) => guard,
+        Err(error) => {
+            tracing::error!(
+                target: "turn_journal",
+                "refusing turn for {}: couldn't save restart record: {error}",
+                prompt_label(&source)
+            );
+            send_prompt_result(
+                &result_tx,
+                &turn_id,
+                agent,
+                source,
+                PromptOutcome::Refused(format!("couldn't save restart record: {error}")),
+                batch,
+            );
+            return;
+        }
+    };
 
     // When control_rx is Some (channel tasks), wrap the prompt in select! so
     // the main loop can cancel, interrupt, or rotate it. Heartbeats
@@ -3247,7 +3916,47 @@ pub async fn run_prompt_task(
                         {
                             Ok(stop_reason) => {
                                 log_stop_reason(&source, &stop_reason);
-                                agent.state.invalidate(&source);
+                                if control_cancel_keeps_session(
+                                    &control_signal,
+                                    &stop_reason,
+                                    &source,
+                                ) {
+                                    // The adapter settled the turn cleanly and
+                                    // still holds the session, including what
+                                    // the agent did in this turn. Keep it so the
+                                    // requeued batch continues there instead of
+                                    // in a fresh session. The prompt reached the
+                                    // session, so its delivery is committed: the
+                                    // re-prompt must not resend standing context
+                                    // or context events the session already has.
+                                    if let PromptSource::Channel(scope) = &source {
+                                        tracing::info!(
+                                            target: "pool::session",
+                                            "keeping session {session_id} for scope {} after a clean control cancel",
+                                            scope.telemetry_label()
+                                        );
+                                        let standing_sent = !agent.has_system_prompt_support();
+                                        record_scope_delivery_success(
+                                            &mut agent,
+                                            scope.clone(),
+                                            standing_sent,
+                                            &pending_delivered_event_ids,
+                                            &pending_hydrated_thread_roots,
+                                        );
+                                        // The cancel stopped every background
+                                        // subagent the turn started; the kept
+                                        // session still remembers launching
+                                        // them, so the next prompt says so.
+                                        agent
+                                            .state
+                                            .deliveries
+                                            .entry(scope.clone())
+                                            .or_default()
+                                            .background_work_cancelled = true;
+                                    }
+                                } else {
+                                    agent.state.invalidate(&source);
+                                }
                                 let retry_batch =
                                     requeue_cancelled_batch(&ctx, control_signal, batch);
 
@@ -3338,6 +4047,7 @@ pub async fn run_prompt_task(
                             );
                         }
                         log_stop_reason(&source, &StopReason::EndTurn);
+                        turn_journal.complete();
                         if let PromptSource::Channel(scope) = &source {
                             let standing_sent = !agent.has_system_prompt_support();
                             record_scope_delivery_success(
@@ -3378,11 +4088,64 @@ pub async fn run_prompt_task(
         }
     };
 
+    // The session is gone (see `is_dead_session_error`). Fail fast: no new
+    // session, no retry against the same dead session (the batch is
+    // dead-lettered with the reason posted to its thread), and the scope stays
+    // dead so the next message for it fails with the same reason until the
+    // owner sends `!rotate`.
+    if let (Err(error), PromptSource::Channel(scope)) = (&prompt_result, &source) {
+        if is_dead_session_error(error) {
+            let reason = mark_session_dead(&mut agent, &ctx, scope, &session_id, error);
+            let usage = agent.acp.take_turn_usage();
+            publish_agent_turn_metric(
+                &ctx,
+                usage,
+                observer_channel_id,
+                &session_id,
+                &turn_id,
+                Some(buzz_core::agent_turn_metric::StopReason::Error),
+            )
+            .await;
+            send_prompt_result(
+                &result_tx,
+                &turn_id,
+                agent,
+                source,
+                PromptOutcome::SessionDead(reason),
+                batch,
+            );
+            return;
+        }
+    }
+
     match prompt_result {
         Ok(stop_reason) => {
             log_stop_reason(&source, &stop_reason);
+            agent.acp.clear_stream_sink();
+            if let Some(stream) = reply_stream.take() {
+                if let Some(outcome) = stream.finish(&stop_reason, &ctx.rest_client).await {
+                    // Never go dark: a lost autopost is visible in the feed.
+                    agent
+                        .acp
+                        .observe("reply_autopost", outcome.observer_payload());
+                }
+            }
 
-            if let PromptSource::Channel(scope) = &source {
+            // A turn that ends `cancelled` while the harness shuts down did
+            // not run to completion: its journal record is kept for resume on
+            // restart and its events are not marked delivered.
+            let interrupted_by_shutdown =
+                stop_reason == StopReason::Cancelled && ctx.turn_journal.shutting_down();
+            if !interrupted_by_shutdown {
+                turn_journal.complete();
+            }
+            if interrupted_by_shutdown {
+                tracing::info!(
+                    target: "pool::prompt",
+                    "turn for {} cancelled during shutdown — not marking its events delivered",
+                    prompt_label(&source)
+                );
+            } else if let PromptSource::Channel(scope) = &source {
                 let standing_sent = !agent.has_system_prompt_support();
                 record_scope_delivery_success(
                     &mut agent,
@@ -3391,6 +4154,11 @@ pub async fn run_prompt_task(
                     &pending_delivered_event_ids,
                     &pending_hydrated_thread_roots,
                 );
+                if background_work_notice {
+                    if let Some(delivery) = agent.state.deliveries.get_mut(scope) {
+                        delivery.background_work_cancelled = false;
+                    }
+                }
             } else if !agent.has_system_prompt_support() {
                 agent.state.heartbeat_standing_context_sent = true;
             }
@@ -3425,6 +4193,10 @@ pub async fn run_prompt_task(
                     "rotating session for {source:?} after {stop_reason:?}",
                 );
                 agent.state.invalidate(&source);
+                if let PromptSource::Channel(scope) = &source {
+                    ctx.resume_session.release(scope);
+                    ctx.scope_sessions.forget(scope);
+                }
             }
 
             let core_stop = acp_stop_to_core(&stop_reason);
@@ -4893,6 +5665,30 @@ fn requeue_batch_if_queue(ctx: &PromptContext, batch: Option<FlushBatch>) -> Opt
 /// that reason stamped onto [`FlushBatch::cancel_reason`]. `Cancel`/`Rotate`
 /// drop the batch entirely. The reason is consumed by the main loop at requeue
 /// time (`requeue_as_cancelled`) and ultimately by `format_prompt`.
+/// Whether a control-signal cancel that the adapter settled with
+/// `stop_reason` leaves the channel scope's provider session in place.
+///
+/// A mid-turn delivery (`Steer`/`Interrupt`) or an explicit `!cancel` that the
+/// adapter answered with a clean `cancelled` keeps it: the adapter interrupted
+/// the turn but kept the session, so the requeued batch (or, after `!cancel`,
+/// the next message) continues in that same session. Every other outcome — a
+/// rotate, a model switch (which needs a new session under the new model), or
+/// a turn that ended any other way — invalidates as before. Cancel failures
+/// never reach this check; they invalidate in
+/// [`classify_control_cancel_failure`]'s arm.
+fn control_cancel_keeps_session(
+    signal: &ControlSignal,
+    stop_reason: &StopReason,
+    source: &PromptSource,
+) -> bool {
+    matches!(source, PromptSource::Channel(_))
+        && matches!(
+            signal,
+            ControlSignal::Steer | ControlSignal::Interrupt | ControlSignal::Cancel
+        )
+        && *stop_reason == StopReason::Cancelled
+}
+
 #[inline]
 fn requeue_cancelled_batch(
     ctx: &PromptContext,
@@ -5660,7 +6456,7 @@ async fn clear_reactions(rest: crate::relay::RestClient, event_ids: Vec<String>)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use serde_json::json;
@@ -8319,6 +9115,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 standing_context_sent: true,
                 delivered_event_ids: HashSet::from(["event-a".into()]),
                 hydrated_thread_roots: VecDeque::from(["root-a".into()]),
+                background_work_cancelled: false,
             },
         );
         s.deliveries.insert(
@@ -8327,6 +9124,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
                 standing_context_sent: true,
                 delivered_event_ids: HashSet::from(["event-b".into()]),
                 hydrated_thread_roots: VecDeque::from(["root-b".into()]),
+                background_work_cancelled: false,
             },
         );
         s.heartbeat_session = Some("sess-hb".into());
@@ -8664,6 +9462,56 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         };
         agent.state.sessions.insert(scope, "sess".into());
         agent
+    }
+
+    /// A scope's session counts as held by another worker only while its
+    /// recorded owner is a different worker that is busy, or idle with the
+    /// session. After a pool sleep (no owners), a respawn (owner slot empty or
+    /// without the session) or on the owner itself, the session may be
+    /// resumed.
+    #[tokio::test]
+    async fn scope_held_by_other_worker_tracks_live_holders_only() {
+        let scope = SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+        let other = SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+
+        // Fresh pool, as after an idle-pool sleep: nobody holds anything.
+        let mut pool = AgentPool::from_slots(vec![None, None]);
+        assert!(!pool.scope_held_by_other_worker(&scope, 1));
+
+        pool.record_scope_owner(scope.clone(), 0);
+        assert!(
+            !pool.scope_held_by_other_worker(&scope, 0),
+            "the owner itself"
+        );
+        assert!(
+            !pool.scope_held_by_other_worker(&scope, 1),
+            "owner slot empty (crashed / respawning)"
+        );
+
+        mark_agent_busy(&mut pool, 0, other.clone());
+        assert!(pool.scope_held_by_other_worker(&scope, 1), "owner busy");
+
+        let mut pool = AgentPool::from_slots(vec![
+            Some(idle_agent_with_session(0, scope.clone()).await),
+            None,
+        ]);
+        pool.record_scope_owner(scope.clone(), 0);
+        assert!(
+            pool.scope_held_by_other_worker(&scope, 1),
+            "owner idle with it"
+        );
+
+        let mut pool =
+            AgentPool::from_slots(vec![Some(idle_agent_with_session(0, other).await), None]);
+        pool.record_scope_owner(scope.clone(), 0);
+        assert!(
+            !pool.scope_held_by_other_worker(&scope, 1),
+            "owner respawned without the session"
+        );
     }
 
     // `hold_decision` is gated on the scope variant (not session policy),
@@ -9225,6 +10073,8 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             PromptOutcome::Error(_) => "Error",
             PromptOutcome::ProjectContextIndeterminate(_) => "ProjectContextIndeterminate",
             PromptOutcome::Cancelled => "Cancelled",
+            PromptOutcome::SessionDead(_) => "SessionDead",
+            PromptOutcome::Refused(_) => "Refused",
             PromptOutcome::Ok(_) => "Ok",
         };
         assert_eq!(
@@ -10402,7 +11252,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
         );
     }
 
-    pub(super) fn make_prompt_context_no_owner() -> PromptContext {
+    pub(crate) fn make_prompt_context_no_owner() -> PromptContext {
         let agent_keys = nostr::Keys::generate();
         make_prompt_context_impl(&agent_keys, None)
     }
@@ -10455,6 +11305,11 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             memory_enabled: false,
             harness_name: "goose".to_string(),
             relay_url: "ws://127.0.0.1:3000".to_string(),
+            resume_session: ResumeSessionSlot::default(),
+            dead_sessions: DeadSessions::default(),
+            turn_journal: crate::turn_journal::TurnJournal::default(),
+            scope_sessions: crate::scope_sessions::ScopeSessions::default(),
+            stream: None,
         }
     }
 
@@ -11788,6 +12643,727 @@ done"#
     const OPTS_MODEL_A_AND_B: &str = r#"[{"configId":"model","category":"model","currentValue":"model-a","options":[{"value":"model-a"},{"value":"model-b"}]}]"#;
 
     #[tokio::test]
+    async fn resume_session_forks_then_resumes_first_scoped_session_only() {
+        let (mut agent, observer) = spawn_resume_agent(RESUME_CAPS, FORK_OK).await;
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.session_title = Some("Fizz".into());
+        let state = tempfile::tempdir().expect("state dir");
+        ctx.resume_session = pending_slot("src-1", state.path());
+        let first = SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+        let second = SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&first))
+            .await
+            .expect("resumed session");
+        assert_eq!(sid, "fork-1");
+        assert_eq!(pending_source(&ctx), None, "slot is consumed");
+        assert_eq!(
+            recorded_fork(&ctx, state.path(), "src-1").as_deref(),
+            Some("fork-1"),
+            "the resumed fork is recorded"
+        );
+
+        let fork = acp_write(&observer, "session/fork").expect("session/fork sent");
+        assert_eq!(fork["params"]["sessionId"], "src-1");
+        assert_eq!(fork["params"]["cwd"], ctx.cwd);
+        let resume = acp_write(&observer, "session/resume").expect("session/resume sent");
+        assert_eq!(resume["params"]["sessionId"], "fork-1");
+        assert_eq!(resume["params"]["cwd"], ctx.cwd);
+        assert_eq!(resume["params"]["_meta"]["sessionTitle"], "Fizz");
+        assert!(resume["params"]["mcpServers"].is_array());
+        assert!(acp_write(&observer, "session/new").is_none());
+
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&second))
+            .await
+            .expect("fresh session");
+        assert!(
+            sid.starts_with("new-"),
+            "second scope starts fresh, got {sid}"
+        );
+        assert_eq!(
+            acp_writes(&observer, "session/fork"),
+            1,
+            "fork happens once"
+        );
+    }
+
+    /// The scope that consumed the resume owns it: when its session is lost
+    /// (invalidated for a failure), the next session for that scope on that
+    /// worker continues the recorded fork again — no new fork, no fresh
+    /// session. Other scopes stay fresh; another worker takes the binding over
+    /// only once the old worker can no longer hold the fork.
+    #[tokio::test]
+    async fn resume_binding_reapplies_recorded_fork_after_owner_scope_loses_session() {
+        let (mut agent, observer) = spawn_resume_agent(RESUME_CAPS, FORK_OK).await;
+        let mut ctx = make_prompt_context_no_owner();
+        let state = tempfile::tempdir().expect("state dir");
+        ctx.resume_session = pending_slot("src-1", state.path());
+        let bound = conversation();
+        let other = conversation();
+
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&bound))
+            .await
+            .expect("first session continues the source");
+        assert_eq!(sid, "fork-1");
+        assert_eq!(
+            ctx.resume_session.bound_owner(),
+            Some((bound.clone(), agent.index)),
+            "the consuming scope and worker own the binding"
+        );
+        agent.state.sessions.insert(bound.clone(), sid);
+
+        // A real failure drops the bound scope's session.
+        assert!(agent.state.invalidate_scope(&bound));
+
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&bound))
+            .await
+            .expect("the bound scope continues its fork again");
+        assert_eq!(sid, "fork-1");
+        assert_eq!(
+            acp_writes(&observer, "session/fork"),
+            1,
+            "never forks twice"
+        );
+        assert_eq!(acp_writes(&observer, "session/resume"), 2);
+        assert!(acp_write(&observer, "session/new").is_none());
+
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&other))
+            .await
+            .expect("an unbound scope starts fresh");
+        assert!(sid.starts_with("new-"), "unbound scope got {sid}");
+
+        // While its old worker may still hold the fork live, another worker
+        // must not resume it a second time.
+        agent.index = 1;
+        ctx.scope_sessions.set_held_elsewhere(&bound, true);
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&bound))
+            .await
+            .expect("another worker starts the bound scope fresh");
+        assert!(sid.starts_with("new-"), "other worker got {sid}");
+        assert_eq!(acp_writes(&observer, "session/fork"), 1);
+        assert_eq!(acp_writes(&observer, "session/resume"), 2);
+        assert_eq!(ctx.resume_session.bound_owner(), Some((bound.clone(), 0)));
+
+        // Once the old worker is gone (pool sleep, crash, respawn), the
+        // binding moves to whichever worker runs the scope next.
+        ctx.scope_sessions.set_held_elsewhere(&bound, false);
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&bound))
+            .await
+            .expect("the new worker continues the fork");
+        assert_eq!(sid, "fork-1");
+        assert_eq!(
+            acp_writes(&observer, "session/fork"),
+            1,
+            "never forks twice"
+        );
+        assert_eq!(acp_writes(&observer, "session/resume"), 3);
+        assert_eq!(ctx.resume_session.bound_owner(), Some((bound.clone(), 1)));
+    }
+
+    /// A bound scope re-applied in a respawned process (same worker): a
+    /// failing resume of the recorded fork propagates and keeps the binding;
+    /// a fork that is gone re-forks the source, as on first use.
+    /// After a model switch drops the bound scope's session, its next session
+    /// resumes the same fork and then switches that resumed session to the new
+    /// model — the agent keeps its context on the new model.
+    #[tokio::test]
+    async fn resume_binding_resumes_fork_on_the_switched_model() {
+        let script = format!(
+            r#"while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  [ -z "$id" ] && continue
+  sid=$(printf '%s' "$line" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) body='"result":{{"protocolVersion":2,"agentCapabilities":{{"sessionCapabilities":{RESUME_CAPS}}}}}' ;;
+    *'"method":"session/fork"'*) body='"result":{{"sessionId":"fork-1"}}' ;;
+    *'"method":"session/resume"'*) body='"result":{{"sessionId":"'"$sid"'","configOptions":{OPTS_MODEL_A_AND_B}}}' ;;
+    *'"method":"session/new"'*) body='"result":{{"sessionId":"new-'"$id"'"}}' ;;
+    *) body='"result":{{}}' ;;
+  esac
+  printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"','"$body"'}}'
+done"#
+        );
+        let mut acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn model resume ACP script");
+        acp.initialize().await.expect("initialize");
+        let mut agent = switching_agent(acp, "model-a");
+        agent.desired_model = None;
+        let observer = observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(observer.clone()), 0);
+        let mut ctx = make_prompt_context_no_owner();
+        let state = tempfile::tempdir().expect("state dir");
+        ctx.resume_session = pending_slot("src-1", state.path());
+        let bound = conversation();
+        create_session_and_apply_model(&mut agent, &ctx, None, scoped(&bound))
+            .await
+            .expect("binds");
+
+        // The busy/idle model-switch paths invalidate the scope's session and
+        // set the desired model; the next session for the scope rebinds.
+        agent.state.invalidate_scope(&bound);
+        agent.desired_model = Some("model-b".into());
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&bound))
+            .await
+            .expect("resumes the fork on the new model");
+        assert_eq!(sid, "fork-1", "the same fork, not a new session");
+        assert_eq!(acp_writes(&observer, "session/fork"), 1);
+        assert_eq!(acp_writes(&observer, "session/resume"), 2);
+        assert!(acp_write(&observer, "session/new").is_none());
+        let switch = observer
+            .snapshot()
+            .into_iter()
+            .rev()
+            .find(|e| e.kind == "acp_write" && e.payload["method"] == "session/set_config_option")
+            .expect("model switch sent")
+            .payload;
+        assert_eq!(switch["params"]["sessionId"], "fork-1");
+        assert_eq!(switch["params"]["value"], "model-b");
+    }
+
+    /// A turn restored from the journal that ran in the bound fork reserves
+    /// the pending continuation for its scope, so no other scope claims it
+    /// first. A turn in another session reserves nothing.
+    #[tokio::test]
+    async fn restored_turn_in_the_fork_reserves_the_binding_for_its_scope() {
+        let state = tempfile::tempdir().expect("state dir");
+        let ctx = make_prompt_context_no_owner();
+        ResumeForkStore::new(state.path(), "agent-hex")
+            .save("src-1", &ctx.cwd, "fork-1")
+            .expect("seed record");
+        let slot = pending_slot("src-1", state.path());
+        let restored = conversation();
+        let other = conversation();
+
+        assert!(!slot
+            .reserve_for_restored(&restored, "some-other-session", &ctx.cwd)
+            .expect("readable"));
+        assert!(
+            slot.claim(&other, 0, false).is_some(),
+            "unreserved: anyone claims"
+        );
+
+        let slot = pending_slot("src-1", state.path());
+        assert!(slot
+            .reserve_for_restored(&restored, "fork-1", &ctx.cwd)
+            .expect("readable"));
+        assert!(
+            slot.claim(&other, 0, false).is_none(),
+            "another scope cannot claim"
+        );
+        assert!(matches!(
+            slot.claim(&restored, 0, false),
+            Some(ResumeClaim::First(_))
+        ));
+    }
+
+    /// A deliberate rotation releases the binding: the rotated scope then
+    /// starts fresh rather than landing back in the fork, and no other scope
+    /// picks the continuation up.
+    #[tokio::test]
+    async fn resume_binding_release_makes_owner_scope_start_fresh() {
+        let (mut agent, observer) = spawn_resume_agent(RESUME_CAPS, FORK_OK).await;
+        let mut ctx = make_prompt_context_no_owner();
+        let state = tempfile::tempdir().expect("state dir");
+        ctx.resume_session = pending_slot("src-1", state.path());
+        let bound = conversation();
+        create_session_and_apply_model(&mut agent, &ctx, None, scoped(&bound))
+            .await
+            .expect("binds");
+
+        ctx.resume_session.release(&conversation());
+        assert!(
+            ctx.resume_session.bound_owner().is_some(),
+            "another scope cannot release the binding"
+        );
+        ctx.resume_session.release(&bound);
+        assert_eq!(ctx.resume_session.bound_owner(), None);
+        assert_eq!(pending_source(&ctx), None, "nothing is pending again");
+
+        for scope in [&bound, &conversation()] {
+            let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(scope))
+                .await
+                .expect("fresh session");
+            assert!(sid.starts_with("new-"), "got {sid}");
+        }
+        assert_eq!(acp_writes(&observer, "session/fork"), 1);
+        assert_eq!(acp_writes(&observer, "session/resume"), 1);
+        assert_eq!(
+            recorded_fork(&ctx, state.path(), "src-1").as_deref(),
+            Some("fork-1"),
+            "the record survives for the next process"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_binding_reapply_failures_propagate_and_missing_fork_reforks() {
+        let state = tempfile::tempdir().expect("state dir");
+        let mut ctx = make_prompt_context_no_owner();
+        ResumeForkStore::new(state.path(), "agent-hex")
+            .save("src-1", &ctx.cwd, "fork-0")
+            .expect("seed record");
+        ctx.resume_session = pending_slot("src-1", state.path());
+        let scope = conversation();
+
+        let (mut agent, _observer) = spawn_resume_agent(RESUME_CAPS, FORK_OK).await;
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&scope))
+            .await
+            .expect("binds the recorded fork");
+        assert_eq!(sid, "fork-0");
+
+        let (mut agent, observer) =
+            spawn_resume_agent_failing(RESUME_CAPS, FORK_OK, "fork-0", RESUME_BROKEN).await;
+        let err = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&scope))
+            .await
+            .expect_err("a failed re-apply must not fall back to a fresh session");
+        assert!(
+            matches!(err, AcpError::AgentError { code: -32603, .. }),
+            "{err:?}"
+        );
+        assert!(acp_write(&observer, "session/new").is_none());
+        assert!(acp_write(&observer, "session/fork").is_none());
+        assert_eq!(
+            ctx.resume_session.bound_owner(),
+            Some((scope.clone(), 0)),
+            "a failed re-apply keeps the binding for the retry"
+        );
+
+        let (mut agent, observer) =
+            spawn_resume_agent_failing(RESUME_CAPS, FORK_OK, "fork-0", SESSION_MISSING).await;
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&scope))
+            .await
+            .expect("a gone fork re-forks the source");
+        assert_eq!(sid, "fork-1");
+        assert_eq!(acp_writes(&observer, "session/fork"), 1);
+        assert!(acp_write(&observer, "session/new").is_none());
+        assert_eq!(
+            recorded_fork(&ctx, state.path(), "src-1").as_deref(),
+            Some("fork-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_session_is_not_consumed_by_unscoped_sessions() {
+        let (mut agent, observer) = spawn_resume_agent(RESUME_CAPS, FORK_OK).await;
+        let mut ctx = make_prompt_context_no_owner();
+        let state = tempfile::tempdir().expect("state dir");
+        ctx.resume_session = pending_slot("src-1", state.path());
+
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, unscoped())
+            .await
+            .expect("heartbeat session");
+        assert!(sid.starts_with("new-"));
+        assert!(acp_write(&observer, "session/fork").is_none());
+        assert_eq!(
+            pending_source(&ctx),
+            Some("src-1".to_string()),
+            "heartbeat/isolated sessions leave the resume pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_session_failure_propagates_and_stays_pending() {
+        let fork_error = r#""error":{"code":-32602,"message":"no such session"}"#;
+        let (mut agent, observer) = spawn_resume_agent(RESUME_CAPS, fork_error).await;
+        let mut ctx = make_prompt_context_no_owner();
+        let state = tempfile::tempdir().expect("state dir");
+        ctx.resume_session = pending_slot("src-1", state.path());
+        let scope = SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+
+        let err = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&scope))
+            .await
+            .expect_err("fork failure must not fall back to a fresh session");
+        assert!(
+            matches!(err, AcpError::AgentError { code: -32602, .. }),
+            "{err:?}"
+        );
+        assert!(acp_write(&observer, "session/new").is_none());
+        assert_eq!(pending_source(&ctx), Some("src-1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn resume_session_failure_surfaces_adapter_error_details() {
+        // claude-agent-acp's shape when the source transcript is not under the
+        // harness cwd: a bare -32603 whose cause lives only in `data.details`.
+        let fork_error = r#""error":{"code":-32603,"message":"Internal error","data":{"details":"Session src-1 not found in project directory for /home/u"}}"#;
+        let (mut agent, _observer) = spawn_resume_agent(RESUME_CAPS, fork_error).await;
+        let mut ctx = make_prompt_context_no_owner();
+        let state = tempfile::tempdir().expect("state dir");
+        ctx.resume_session = pending_slot("src-1", state.path());
+        let scope = SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+
+        let err = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&scope))
+            .await
+            .expect_err("fork failure must propagate");
+        match err {
+            AcpError::AgentError { code, message } => {
+                assert_eq!(code, -32603);
+                assert_eq!(
+                    message,
+                    "Internal error: Session src-1 not found in project directory for /home/u"
+                );
+            }
+            other => panic!("expected AgentError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_session_requires_advertised_fork_and_resume() {
+        let (mut agent, observer) = spawn_resume_agent(r#"{"fork":{}}"#, FORK_OK).await;
+        let mut ctx = make_prompt_context_no_owner();
+        let state = tempfile::tempdir().expect("state dir");
+        ctx.resume_session = pending_slot("src-1", state.path());
+        let scope = SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        };
+
+        let err = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&scope))
+            .await
+            .expect_err("missing resume capability must refuse");
+        assert!(matches!(err, AcpError::Protocol(_)), "{err:?}");
+        assert!(acp_write(&observer, "session/fork").is_none());
+        assert!(acp_write(&observer, "session/new").is_none());
+        assert_eq!(pending_source(&ctx), Some("src-1".to_string()));
+    }
+
+    fn pending_slot(source: &str, state_root: &std::path::Path) -> ResumeSessionSlot {
+        ResumeSessionSlot::new(Some(PendingResume {
+            source: source.into(),
+            store: ResumeForkStore::new(state_root, "agent-hex"),
+        }))
+    }
+
+    fn pending_source(ctx: &PromptContext) -> Option<String> {
+        ctx.resume_session.pending_source()
+    }
+
+    fn recorded_fork(
+        ctx: &PromptContext,
+        state_root: &std::path::Path,
+        source: &str,
+    ) -> Option<String> {
+        ResumeForkStore::new(state_root, "agent-hex")
+            .load(source, &ctx.cwd)
+            .expect("record readable")
+    }
+
+    fn conversation() -> SessionScope {
+        SessionScope::Conversation {
+            channel_id: Uuid::new_v4(),
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_session_second_process_resumes_recorded_fork_without_forking() {
+        let state = tempfile::tempdir().expect("state dir");
+        let scope = conversation();
+
+        // First process forks the source and records the fork.
+        let (mut agent, _observer) = spawn_resume_agent(RESUME_CAPS, FORK_OK).await;
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.resume_session = pending_slot("src-1", state.path());
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&scope))
+            .await
+            .expect("first process continues the source");
+        assert_eq!(sid, "fork-1");
+
+        // A restarted process (fresh adapter, context and slot; same state)
+        // resumes that fork instead of forking the source again.
+        let fork_would_be_new = r#""result":{"sessionId":"fork-2"}"#;
+        let (mut agent, observer) = spawn_resume_agent(RESUME_CAPS, fork_would_be_new).await;
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.resume_session = pending_slot("src-1", state.path());
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&scope))
+            .await
+            .expect("second process continues the recorded fork");
+        assert_eq!(sid, "fork-1");
+        assert!(
+            acp_write(&observer, "session/fork").is_none(),
+            "no new fork"
+        );
+        let resume = acp_write(&observer, "session/resume").expect("session/resume sent");
+        assert_eq!(resume["params"]["sessionId"], "fork-1");
+        assert_eq!(pending_source(&ctx), None, "slot is consumed");
+        assert_eq!(
+            recorded_fork(&ctx, state.path(), "src-1").as_deref(),
+            Some("fork-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_session_records_fork_only_after_resume_succeeds() {
+        let state = tempfile::tempdir().expect("state dir");
+        let (mut agent, observer) =
+            spawn_resume_agent_failing(RESUME_CAPS, FORK_OK, "fork-1", RESUME_BROKEN).await;
+        let mut ctx = make_prompt_context_no_owner();
+        ctx.resume_session = pending_slot("src-1", state.path());
+
+        let err = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&conversation()))
+            .await
+            .expect_err("resume failure propagates");
+        assert!(
+            matches!(err, AcpError::AgentError { code: -32603, .. }),
+            "{err:?}"
+        );
+        assert_eq!(acp_writes(&observer, "session/fork"), 1);
+        assert_eq!(
+            recorded_fork(&ctx, state.path(), "src-1"),
+            None,
+            "an unresumed fork is never recorded"
+        );
+        assert_eq!(pending_source(&ctx).as_deref(), Some("src-1"));
+    }
+
+    #[tokio::test]
+    async fn resume_session_reforks_source_when_recorded_fork_is_gone() {
+        let state = tempfile::tempdir().expect("state dir");
+        let (mut agent, observer) =
+            spawn_resume_agent_failing(RESUME_CAPS, FORK_OK, "gone-fork", SESSION_MISSING).await;
+        let mut ctx = make_prompt_context_no_owner();
+        ResumeForkStore::new(state.path(), "agent-hex")
+            .save("src-1", &ctx.cwd, "gone-fork")
+            .expect("seed record");
+        ctx.resume_session = pending_slot("src-1", state.path());
+
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&conversation()))
+            .await
+            .expect("re-forks the source");
+        assert_eq!(sid, "fork-1");
+        let fork = acp_write(&observer, "session/fork").expect("source forked again");
+        assert_eq!(fork["params"]["sessionId"], "src-1");
+        assert_eq!(acp_writes(&observer, "session/resume"), 2);
+        assert_eq!(
+            recorded_fork(&ctx, state.path(), "src-1").as_deref(),
+            Some("fork-1"),
+            "the stale record is replaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_session_other_recorded_fork_failures_propagate_and_keep_record() {
+        let state = tempfile::tempdir().expect("state dir");
+        let (mut agent, observer) =
+            spawn_resume_agent_failing(RESUME_CAPS, FORK_OK, "kept-fork", RESUME_BROKEN).await;
+        let mut ctx = make_prompt_context_no_owner();
+        ResumeForkStore::new(state.path(), "agent-hex")
+            .save("src-1", &ctx.cwd, "kept-fork")
+            .expect("seed record");
+        ctx.resume_session = pending_slot("src-1", state.path());
+
+        let err = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&conversation()))
+            .await
+            .expect_err("a non-missing resume failure propagates");
+        assert!(
+            matches!(err, AcpError::AgentError { code: -32603, .. }),
+            "{err:?}"
+        );
+        assert!(acp_write(&observer, "session/fork").is_none(), "no re-fork");
+        assert!(acp_write(&observer, "session/new").is_none());
+        assert_eq!(
+            recorded_fork(&ctx, state.path(), "src-1").as_deref(),
+            Some("kept-fork")
+        );
+        assert_eq!(pending_source(&ctx).as_deref(), Some("src-1"));
+    }
+
+    #[tokio::test]
+    async fn resume_session_unreadable_record_propagates_without_forking() {
+        let state = tempfile::tempdir().expect("state dir");
+        let (mut agent, observer) = spawn_resume_agent(RESUME_CAPS, FORK_OK).await;
+        let mut ctx = make_prompt_context_no_owner();
+        let store = ResumeForkStore::new(state.path(), "agent-hex");
+        store
+            .save("src-1", &ctx.cwd, "fork-0")
+            .expect("seed record");
+        std::fs::write(store.record_path("src-1", &ctx.cwd), b"{torn").expect("corrupt");
+        ctx.resume_session = pending_slot("src-1", state.path());
+
+        let err = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&conversation()))
+            .await
+            .expect_err("a corrupt record is not treated as absent");
+        assert!(matches!(err, AcpError::Io(_)), "{err:?}");
+        assert!(acp_write(&observer, "session/fork").is_none());
+        assert_eq!(pending_source(&ctx).as_deref(), Some("src-1"));
+    }
+
+    #[tokio::test]
+    async fn resume_session_different_source_forks_fresh() {
+        let state = tempfile::tempdir().expect("state dir");
+        let (mut agent, observer) = spawn_resume_agent(RESUME_CAPS, FORK_OK).await;
+        let mut ctx = make_prompt_context_no_owner();
+        ResumeForkStore::new(state.path(), "agent-hex")
+            .save("src-old", &ctx.cwd, "old-fork")
+            .expect("seed record for the previous source");
+        ctx.resume_session = pending_slot("src-new", state.path());
+
+        let sid = create_session_and_apply_model(&mut agent, &ctx, None, scoped(&conversation()))
+            .await
+            .expect("continues the new source");
+        assert_eq!(sid, "fork-1");
+        let fork = acp_write(&observer, "session/fork").expect("new source forked");
+        assert_eq!(fork["params"]["sessionId"], "src-new");
+        let resume = acp_write(&observer, "session/resume").expect("resume sent");
+        assert_eq!(resume["params"]["sessionId"], "fork-1");
+        assert_eq!(
+            recorded_fork(&ctx, state.path(), "src-new").as_deref(),
+            Some("fork-1")
+        );
+        assert_eq!(
+            recorded_fork(&ctx, state.path(), "src-old").as_deref(),
+            Some("old-fork"),
+            "the old source's record is untouched"
+        );
+    }
+
+    #[test]
+    fn resume_session_missing_classification() {
+        let agent_error = |code, message: &str| AcpError::AgentError {
+            code,
+            message: message.into(),
+        };
+        let cases = [
+            (agent_error(-32002, "Resource not found"), true),
+            (
+                agent_error(
+                    -32603,
+                    "Internal error: No conversation found with session ID: f1",
+                ),
+                true,
+            ),
+            (
+                agent_error(-32603, "Internal error: Session f1 not found"),
+                true,
+            ),
+            (
+                agent_error(-32603, "Internal error: Session other not found"),
+                false,
+            ),
+            (
+                agent_error(-32603, "Internal error: f1 rate limited"),
+                false,
+            ),
+            (agent_error(-32603, "Internal error"), false),
+            (AcpError::Protocol("f1 not found".into()), false),
+        ];
+        for (error, missing) in cases {
+            assert_eq!(
+                is_resume_session_missing(&error, "f1"),
+                missing,
+                "{error:?}"
+            );
+        }
+    }
+
+    const RESUME_CAPS: &str = r#"{"fork":{},"resume":{}}"#;
+    const FORK_OK: &str = r#""result":{"sessionId":"fork-1"}"#;
+    const SESSION_MISSING: &str =
+        r#""error":{"code":-32002,"message":"Resource not found","data":{"uri":"gone"}}"#;
+    const RESUME_BROKEN: &str = r#""error":{"code":-32603,"message":"Internal error"}"#;
+
+    /// Scripted ACP keyed on method: `initialize` advertises
+    /// `sessionCapabilities` = `caps`, `session/fork` answers `fork_reply`,
+    /// `session/resume` echoes the requested session, `session/new` mints
+    /// `new-<id>`.
+    async fn spawn_resume_agent(
+        caps: &str,
+        fork_reply: &str,
+    ) -> (OwnedAgent, observer::ObserverHandle) {
+        spawn_resume_agent_failing(caps, fork_reply, "none", "").await
+    }
+
+    /// Like [`spawn_resume_agent`], but `session/resume` of `failing_session`
+    /// answers `failing_reply`.
+    async fn spawn_resume_agent_failing(
+        caps: &str,
+        fork_reply: &str,
+        failing_session: &str,
+        failing_reply: &str,
+    ) -> (OwnedAgent, observer::ObserverHandle) {
+        let script = format!(
+            r#"while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  [ -z "$id" ] && continue
+  sid=$(printf '%s' "$line" | sed -n 's/.*"sessionId":"\([^"]*\)".*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) body='"result":{{"protocolVersion":2,"agentCapabilities":{{"sessionCapabilities":{caps}}}}}' ;;
+    *'"method":"session/fork"'*) body='{fork_reply}' ;;
+    *'"method":"session/resume"'*)
+      if [ "$sid" = '{failing_session}' ]; then body='{failing_reply}'
+      else body='"result":{{"sessionId":"'"$sid"'"}}'; fi ;;
+    *'"method":"session/new"'*) body='"result":{{"sessionId":"new-'"$id"'"}}' ;;
+    *) body='"result":{{}}' ;;
+  esac
+  printf '%s\n' '{{"jsonrpc":"2.0","id":'"$id"','"$body"'}}'
+done"#
+        );
+        let mut acp = AcpClient::spawn("bash", &["-c".to_string(), script], &[], false)
+            .await
+            .expect("spawn resume ACP script");
+        acp.initialize().await.expect("initialize");
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "resume-test-agent".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+        };
+        let observer = observer::ObserverHandle::in_process();
+        agent.acp.set_observer(Some(observer.clone()), 0);
+        (agent, observer)
+    }
+
+    fn scoped(scope: &SessionScope) -> NewSessionChannelContext<'_> {
+        NewSessionChannelContext {
+            huddle_instructions: None,
+            canvas: None,
+            name: None,
+            scope: Some(scope),
+            channel_type: None,
+        }
+    }
+
+    fn unscoped() -> NewSessionChannelContext<'static> {
+        NewSessionChannelContext {
+            huddle_instructions: None,
+            canvas: None,
+            name: None,
+            scope: None,
+            channel_type: None,
+        }
+    }
+
+    fn acp_writes(observer: &observer::ObserverHandle, method: &str) -> usize {
+        observer
+            .snapshot()
+            .into_iter()
+            .filter(|e| e.kind == "acp_write" && e.payload["method"] == method)
+            .count()
+    }
+
+    fn acp_write(observer: &observer::ObserverHandle, method: &str) -> Option<serde_json::Value> {
+        observer
+            .snapshot()
+            .into_iter()
+            .find(|e| e.kind == "acp_write" && e.payload["method"] == method)
+            .map(|e| e.payload)
+    }
+
+    #[tokio::test]
     async fn session_new_sends_policy_specific_base_and_scope_specific_title() {
         use crate::scope::SessionPolicy;
 
@@ -12416,3 +13992,15 @@ done"#
 #[cfg(all(test, unix))]
 #[path = "pool/pi_prompt_tests.rs"]
 mod pi_prompt_tests;
+
+#[cfg(all(test, unix))]
+#[path = "pool/stream_draft_tests.rs"]
+mod stream_draft_tests;
+
+#[cfg(all(test, unix))]
+#[path = "pool/control_cancel_tests.rs"]
+mod control_cancel_tests;
+
+#[cfg(all(test, unix))]
+#[path = "pool/session_recovery_tests.rs"]
+mod session_recovery_tests;

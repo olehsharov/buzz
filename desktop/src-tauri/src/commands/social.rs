@@ -10,7 +10,7 @@ use crate::{
         ContactEntry, ContactListResponse, NoteReactionSummary, UserNoteInfo, UserNotesResponse,
     },
     nostr_convert,
-    relay::{query_relay, submit_event, SubmitEventResponse},
+    relay::{query_relay_at, submit_event_at, SubmitEventResponse},
 };
 
 fn e_tag_id(tag: &Tag) -> Option<&String> {
@@ -57,6 +57,7 @@ pub async fn publish_note(
     reply_to: Option<String>,
     mention_pubkeys: Option<Vec<String>>,
     media_tags: Option<Vec<Vec<String>>>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<SubmitEventResponse, String> {
     let reply_id = reply_to
@@ -66,17 +67,19 @@ pub async fn publish_note(
     let mention_refs: Vec<&str> = mentions.iter().map(|s| s.as_str()).collect();
     let media = media_tags.unwrap_or_default();
     let builder = events::build_note(&content, reply_id, &mention_refs, &media)?;
-    submit_event(builder, &state).await
+    submit_event_at(builder, &state, &relay.api_base()).await
 }
 
 /// Fetch a user's NIP-02 contact list (kind:3).
 #[tauri::command]
 pub async fn get_contact_list(
     pubkey: String,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<ContactListResponse, String> {
-    let events = query_relay(
+    let events = query_relay_at(
         &state,
+        &relay.api_base(),
         &[serde_json::json!({
             "kinds": [3],
             "authors": [pubkey],
@@ -103,6 +106,7 @@ pub async fn get_contact_list(
 #[tauri::command]
 pub async fn set_contact_list(
     contacts: Vec<ContactEntry>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<SubmitEventResponse, String> {
     let tuples: Vec<(&str, Option<&str>, Option<&str>)> = contacts
@@ -117,7 +121,7 @@ pub async fn set_contact_list(
         .collect();
 
     let builder = events::build_contact_list(&tuples)?;
-    submit_event(builder, &state).await
+    submit_event_at(builder, &state, &relay.api_base()).await
 }
 
 /// Fetch global NIP-01 kind:1 notes without an author filter.
@@ -126,6 +130,7 @@ pub async fn get_global_notes(
     limit: Option<u32>,
     before: Option<i64>,
     before_id: Option<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<UserNotesResponse, String> {
     let _ = before_id;
@@ -139,7 +144,12 @@ pub async fn get_global_notes(
         filter.insert("until".to_string(), serde_json::json!(t));
     }
 
-    let events = query_relay(&state, &[serde_json::Value::Object(filter)]).await?;
+    let events = query_relay_at(
+        &state,
+        &relay.api_base(),
+        &[serde_json::Value::Object(filter)],
+    )
+    .await?;
     Ok(nostr_convert::user_notes_from_events(&events))
 }
 
@@ -155,11 +165,13 @@ fn validate_note_id(note_id: &str) -> Result<(), String> {
 #[tauri::command]
 pub async fn get_note(
     note_id: String,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<Option<UserNoteInfo>, String> {
     validate_note_id(&note_id)?;
-    let events = query_relay(
+    let events = query_relay_at(
         &state,
+        &relay.api_base(),
         &[serde_json::json!({
             "kinds": [1],
             "ids": [note_id],
@@ -180,6 +192,7 @@ const MAX_NOTE_IDS: usize = 200;
 #[tauri::command]
 pub async fn get_note_reactions(
     note_ids: Vec<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<Vec<NoteReactionSummary>, String> {
     if note_ids.is_empty() {
@@ -195,8 +208,9 @@ pub async fn get_note_reactions(
         validate_note_id(note_id)?;
     }
 
-    let events = query_relay(
+    let events = query_relay_at(
         &state,
+        &relay.api_base(),
         &[serde_json::json!({
             "kinds": [7],
             "#e": note_ids,
@@ -209,8 +223,9 @@ pub async fn get_note_reactions(
     let deletion_events = if reaction_ids.is_empty() {
         Vec::new()
     } else {
-        query_relay(
+        query_relay_at(
             &state,
+            &relay.api_base(),
             &[serde_json::json!({
                 "kinds": [5],
                 "#e": reaction_ids,
@@ -266,12 +281,14 @@ pub async fn get_note_reactions(
 pub async fn get_liked_notes(
     author_pubkey: String,
     limit: Option<u32>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<UserNotesResponse, String> {
     let cap = limit.unwrap_or(50).min(MAX_NOTE_IDS as u32) as usize;
     let reaction_fetch_limit = (cap * 4).min(1000);
-    let mut reactions = query_relay(
+    let mut reactions = query_relay_at(
         &state,
+        &relay.api_base(),
         &[serde_json::json!({
             "kinds": [7],
             "authors": [author_pubkey],
@@ -285,8 +302,9 @@ pub async fn get_liked_notes(
     let deletions = if reaction_ids.is_empty() {
         Vec::new()
     } else {
-        query_relay(
+        query_relay_at(
             &state,
+            &relay.api_base(),
             &[serde_json::json!({
                 "kinds": [5],
                 "authors": [author_pubkey],
@@ -324,8 +342,9 @@ pub async fn get_liked_notes(
         });
     }
 
-    let events = query_relay(
+    let events = query_relay_at(
         &state,
+        &relay.api_base(),
         &[serde_json::json!({
             "kinds": [1],
             "ids": target_ids,
@@ -352,6 +371,7 @@ const MAX_TIMELINE_PUBKEYS: usize = 100;
 pub async fn get_notes_timeline(
     pubkeys: Vec<String>,
     limit_per_user: Option<u32>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<UserNotesResponse, String> {
     if pubkeys.is_empty() {
@@ -373,8 +393,9 @@ pub async fn get_notes_timeline(
     let per_user = limit_per_user.unwrap_or(10).min(50) as usize;
     let cap: usize = (per_user * pubkeys.len()).min(200);
 
-    let events = query_relay(
+    let events = query_relay_at(
         &state,
+        &relay.api_base(),
         &[serde_json::json!({
             "kinds": [1],
             "authors": pubkeys,

@@ -148,6 +148,10 @@ type MockInstallRuntimeResult = {
 type MockBridgeOptions = {
   /** Tauri window label exposed to the app. Defaults to the main window. */
   windowLabel?: string;
+  /** One-time `take_popout_launch` payload for a `popout-<uuid>` window. */
+  popoutLaunch?: { route: string; community: unknown } | null;
+  /** Community ids whose `community-<id>` window is already open. */
+  openCommunityWindowIds?: string[];
   ttsSettings?: {
     version: number;
     agentTextToSpeech: boolean;
@@ -221,6 +225,8 @@ type MockBridgeOptions = {
     mcp?: MockCommandAvailability;
   };
   managedAgents?: MockManagedAgentSeed[];
+  /** List only the applied community's agents, as the native list does. */
+  scopeManagedAgentsToCommunity?: boolean;
   /** Result returned by the mocked `add_agent_to_huddle` command. */
   addAgentToHuddleResult?: {
     ephemeral_added: boolean;
@@ -270,6 +276,8 @@ type MockBridgeOptions = {
   /** Sequenced add-member failures. A string fails that call; null succeeds. */
   addChannelMembersErrors?: (string | null)[];
   channelMembersReadDelayMs?: number;
+  /** Extra human members appended to a mock channel's roster, by name. */
+  extraChannelMembers?: Record<string, string[]>;
   channelsReadError?: string;
   /** Reject successive mock `get_channels` calls, then resume. */
   channelsReadErrors?: (string | null)[];
@@ -619,6 +627,18 @@ type MockBridgeOptions = {
    * backend selector in the create-agent dialog.
    */
   backendProviders?: Array<{ id: string; binaryPath: string }>;
+  /**
+   * Approved agent hosts returned by `list_agent_hosts`; `online` sets their
+   * kind:20001 presence, `lastSeenSecsAgo` their last status frame.
+   */
+  agentHosts?: Array<{
+    pubkey: string;
+    name: string;
+    os?: string;
+    arch?: string;
+    online?: boolean;
+    lastSeenSecsAgo?: number;
+  }>;
   /**
    * Result returned by `probe_backend_provider`. Defaults to
    * `{ ok: false, error: "mock: no providers available" }`.

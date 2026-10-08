@@ -2,6 +2,8 @@ import { listen } from "@tauri-apps/api/event";
 import { useEffect } from "react";
 import { toast } from "sonner";
 
+import { isMainWindow } from "@/shared/lib/windowKind";
+
 const MIGRATION_TOAST_KEY = "buzz-legacy-nest-migrated-notified";
 
 /**
@@ -19,9 +21,15 @@ const MIGRATION_TOAST_KEY = "buzz-legacy-nest-migrated-notified";
  *
  * Mounted at the app root ahead of the community-init effect so the listener
  * is registered before the first `apply_workspace` call.
+ *
+ * Main window only: the backend targets these events at "main", but a global
+ * `listen` in any window (huddle companion, pop-out) also receives them, which
+ * would show the same toast twice.
  */
 export function useNestNotifications(): void {
+  const ownsNestNotifications = isMainWindow();
   useEffect(() => {
+    if (!ownsNestNotifications) return;
     const unlistenReposError = listen<string>("repos-dir-error", (event) => {
       toast.error("Repos directory not applied", {
         description: event.payload,
@@ -42,5 +50,5 @@ export function useNestNotifications(): void {
       void unlistenReposError.then((fn) => fn());
       void unlistenMigrated.then((fn) => fn());
     };
-  }, []);
+  }, [ownsNestNotifications]);
 }

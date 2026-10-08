@@ -25,6 +25,7 @@ import {
   canSubmitWhereToRun,
   emptyWhereToRunDraft,
   resolveBackendIntent,
+  type WhereToRunDraft,
 } from "./whereToRunIntent";
 
 type AgentDialogCreateProps = {
@@ -32,6 +33,13 @@ type AgentDialogCreateProps = {
   embedded?: boolean;
   submitLabel?: string;
   initialValues?: CreatePersonaInput | null;
+  /**
+   * Seeds the "Run on" draft once, at mount (agent drafts that name a
+   * provider). Absent or null starts on this computer.
+   */
+  initialRunDraft?: WhereToRunDraft | null;
+  /** Owner-facing notes shown above the form (agent-draft adjustments). */
+  reviewNotices?: readonly string[];
   onDirtyChange?: (dirty: boolean) => void;
   onOpenChange: (open: boolean) => void;
   definitionError: Error | null;
@@ -114,17 +122,58 @@ export function AgentDialog(props: AgentDialogProps) {
     );
   }
   if (props.mode === "definition-edit") {
-    // A definition has no instance and no run draft, so the run location stays
-    // unknown and the warning uses its local-wording fallback.
     const { mode: _mode, ...definitionProps } = props;
+    if (props.initialValues && !("id" in props.initialValues)) {
+      // Duplicate/import creates and starts a new agent, so it owns a run
+      // draft exactly like the create flow.
+      return <DefinitionCreateDialogRouter {...definitionProps} />;
+    }
+    // An edit has no new instance and no run draft, so the run location stays
+    // unknown and the warning uses its local-wording fallback.
     return <AgentDefinitionDialog {...definitionProps} />;
   }
   return <AgentCreateDialogRouter {...props} />;
 }
 
+export function DefinitionCreateDialogRouter({
+  onSubmit,
+  open,
+  ...definitionProps
+}: Omit<AgentDialogDefinitionEditProps, "mode">) {
+  const [runDraft, setRunDraft] = React.useState(emptyWhereToRunDraft);
+  React.useEffect(() => {
+    if (open) setRunDraft(emptyWhereToRunDraft);
+  }, [open]);
+
+  return (
+    <AgentRunLocationProvider runLocation={runLocationForRunOn(runDraft.runOn)}>
+      <AgentDefinitionDialog
+        {...definitionProps}
+        createRunSection={
+          <WhereToRunSection
+            draft={runDraft}
+            isPending={definitionProps.isPending}
+            onDraftChange={setRunDraft}
+          />
+        }
+        createSubmitBlocked={!canSubmitWhereToRun(runDraft)}
+        onSubmit={(input, options) =>
+          onSubmit(input, {
+            ...options,
+            backendIntent: resolveBackendIntent(runDraft),
+          })
+        }
+        open={open}
+      />
+    </AgentRunLocationProvider>
+  );
+}
+
 function AgentCreateDialogRouter({
   embedded,
   initialValues: providedInitialValues,
+  initialRunDraft,
+  reviewNotices,
   onOpenChange,
   definitionError,
   isDefinitionPending,
@@ -134,7 +183,9 @@ function AgentCreateDialogRouter({
   onDirtyChange,
   onSubmitDefinition,
 }: AgentDialogCreateProps) {
-  const [runDraft, setRunDraft] = React.useState(emptyWhereToRunDraft);
+  const [runDraft, setRunDraft] = React.useState(
+    () => initialRunDraft ?? emptyWhereToRunDraft,
+  );
   const initialValues = React.useMemo(
     () => providedInitialValues ?? createPersonaDialogState().initialValues,
     [providedInitialValues],
@@ -157,6 +208,7 @@ function AgentCreateDialogRouter({
             }}
           />
         }
+        createNotices={reviewNotices}
         createSubmitBlocked={!canSubmitWhereToRun(runDraft)}
         description={copy.description}
         embedded={embedded}

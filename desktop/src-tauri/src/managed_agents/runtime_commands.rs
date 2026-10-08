@@ -4,12 +4,12 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use super::{
     agent_readiness, append_log_marker, current_instance_id, find_managed_agent_mut,
-    load_global_agent_config, load_managed_agents, load_personas, managed_agent_runtime_log_path,
-    process_is_running, record_agent_command, resolve_effective_agent_env, save_managed_agents,
-    spawn_agent_child, terminate_process, terminate_untracked_pair_runtime,
-    write_agent_runtime_receipt, AgentReadiness, BackendKind, ManagedAgentPairRuntime,
-    ManagedAgentRuntimeKey, ManagedAgentRuntimeLifecycle, ManagedAgentRuntimeReceipt,
-    ManagedAgentRuntimeStatus,
+    load_community_agent_defaults, load_managed_agents, load_personas,
+    managed_agent_runtime_log_path, process_is_running, record_agent_command,
+    resolve_effective_agent_env, save_managed_agents, spawn_agent_child, terminate_process,
+    terminate_untracked_pair_runtime, write_agent_runtime_receipt, AgentReadiness, BackendKind,
+    ManagedAgentPairRuntime, ManagedAgentRuntimeKey, ManagedAgentRuntimeLifecycle,
+    ManagedAgentRuntimeReceipt, ManagedAgentRuntimeStatus,
 };
 use crate::app_state::AppState;
 
@@ -23,7 +23,7 @@ fn status_for<R: tauri::Runtime>(
     requested_relay_url: Option<String>,
 ) -> ManagedAgentRuntimeStatus {
     let personas = load_personas(app).unwrap_or_default();
-    let global = load_global_agent_config(app).unwrap_or_default();
+    let defaults = load_community_agent_defaults(app).unwrap_or_default();
     status_for_with(
         app,
         record,
@@ -32,7 +32,7 @@ fn status_for<R: tauri::Runtime>(
         requested_relay_url,
         StatusInputs {
             personas: &personas,
-            global: &global,
+            defaults: &defaults,
         },
     )
 }
@@ -41,7 +41,8 @@ fn status_for<R: tauri::Runtime>(
 /// callers (list, reconcile) hit disk once instead of once per row.
 struct StatusInputs<'a> {
     personas: &'a [super::AgentDefinition],
-    global: &'a super::GlobalAgentConfig,
+    /// Every community's defaults; each row reads its own agent's community.
+    defaults: &'a super::CommunityAgentDefaults,
 }
 
 fn status_for_with<R: tauri::Runtime>(
@@ -52,7 +53,8 @@ fn status_for_with<R: tauri::Runtime>(
     requested_relay_url: Option<String>,
     inputs: StatusInputs<'_>,
 ) -> ManagedAgentRuntimeStatus {
-    let StatusInputs { personas, global } = inputs;
+    let StatusInputs { personas, defaults } = inputs;
+    let global = defaults.for_record(record, &key.relay_url);
     let command = record_agent_command(record, personas);
     let metadata = super::known_acp_runtime(&command);
     let effective = resolve_effective_agent_env(record, personas, metadata, global);
@@ -147,7 +149,7 @@ pub async fn list_managed_agent_runtimes(
         // on every status event — load the per-row status inputs once, outside
         // the locks, instead of hitting disk per row while holding them.
         let personas = load_personas(&app).unwrap_or_default();
-        let global = load_global_agent_config(&app).unwrap_or_default();
+        let defaults = load_community_agent_defaults(&app).unwrap_or_default();
         let state = app.state::<AppState>();
         let _transition = state
             .managed_agent_runtime_transition
@@ -189,7 +191,7 @@ pub async fn list_managed_agent_runtimes(
                     None,
                     StatusInputs {
                         personas: &personas,
-                        global: &global,
+                        defaults: &defaults,
                     },
                 );
                 emit_status(&app, &status);
@@ -208,7 +210,7 @@ pub async fn list_managed_agent_runtimes(
                 None,
                 StatusInputs {
                     personas: &personas,
-                    global: &global,
+                    defaults: &defaults,
                 },
             ))
         }));
@@ -272,6 +274,15 @@ fn start_pair<R: tauri::Runtime>(
     if expected_updated_at.is_some_and(|expected| record.updated_at != expected) {
         return Err("managed agent changed while runtime reconciliation was in flight".into());
     }
+    // An agent belongs to ONE community: refuse a pair on any other relay
+    // (attach, mention wake, members sidebar, reconcile) instead of spawning
+    // it where it must not run.
+    crate::relay::ensure_agent_belongs_to_relay(
+        &record.name,
+        &record.relay_url,
+        &crate::relay::relay_ws_url_with_override(&state),
+        &relay_url,
+    )?;
     let key = ManagedAgentRuntimeKey::new(pubkey, &relay_url)?;
     let mut runtimes = state
         .managed_agent_processes
@@ -486,11 +497,88 @@ fn unkeyable_failed_status(
     }
 }
 
+/// The (agent, relay) pairs a reconcile over `communities` should start: each
+/// local auto-start agent only on its OWN community's relay (narrows #2122).
+/// An unassigned record counts as the active workspace's.
+fn reconcile_jobs(
+    records: &[super::ManagedAgentRecord],
+    communities: &[super::ManagedAgentCommunityTarget],
+    workspace_relay: &str,
+) -> Vec<(super::ManagedAgentRecord, String)> {
+    let mut jobs = Vec::new();
+    for community in communities {
+        for record in records.iter().filter(|record| {
+            record.start_on_app_launch
+                && record.backend == BackendKind::Local
+                && crate::relay::agent_belongs_to_relay(
+                    &record.relay_url,
+                    workspace_relay,
+                    &community.relay_url,
+                )
+        }) {
+            jobs.push((record.clone(), community.relay_url.clone()));
+        }
+    }
+    jobs
+}
+
+/// Tracked pairs whose agent does not belong to the pair's relay.
+fn misplaced_pair_keys<'a>(
+    records: &[super::ManagedAgentRecord],
+    keys: impl IntoIterator<Item = &'a ManagedAgentRuntimeKey>,
+    workspace_relay: &str,
+) -> Vec<ManagedAgentRuntimeKey> {
+    keys.into_iter()
+        .filter(|key| {
+            records
+                .iter()
+                .find(|record| record.pubkey.eq_ignore_ascii_case(&key.pubkey))
+                .is_some_and(|record| {
+                    !crate::relay::agent_belongs_to_relay(
+                        &record.relay_url,
+                        workspace_relay,
+                        &key.relay_url,
+                    )
+                })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Cleanly stop every tracked pair running on a community its agent does
+/// not belong to. A failed stop stays tracked (see `stop_pair`) and is
+/// retried by the next reconcile; it is logged, not fatal to the reconcile.
+fn stop_misplaced_pairs<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    records: &[super::ManagedAgentRecord],
+    workspace_relay: &str,
+) {
+    let misplaced = {
+        let state = app.state::<AppState>();
+        let Ok(runtimes) = state.managed_agent_processes.lock() else {
+            return;
+        };
+        misplaced_pair_keys(records, runtimes.keys(), workspace_relay)
+    };
+    for key in misplaced {
+        match stop_pair(key.pubkey.clone(), key.relay_url.clone(), app.clone()) {
+            Ok(_) => eprintln!(
+                "buzz-desktop: stopped agent {} on {}: it belongs to another community",
+                key.pubkey, key.relay_url
+            ),
+            Err(error) => eprintln!(
+                "buzz-desktop: failed to stop misplaced agent {} on {}: {error}",
+                key.pubkey, key.relay_url
+            ),
+        }
+    }
+}
+
 /// Spawn a lazy harness pair for every eligible (agent, community) pair.
 ///
-/// Eligibility is deliberately gated on `start_on_app_launch`: auto-start is
-/// the *proactive fan-out* policy — "keep this agent warm in every community" —
-/// not a correctness prerequisite. A manual-start agent still works on demand
+/// Each agent is eligible only on its own community's relay. Eligibility is
+/// also gated on `start_on_app_launch`: auto-start is the *proactive* policy —
+/// "keep this agent warm in its community" — not a correctness prerequisite. A manual-start agent still works on demand
 /// everywhere: attaching it to a channel ensures its pair, an @mention wakes a
 /// pair, the members sidebar and Settings controls start pairs, and restore
 /// preserves running pairs across relaunch. Fanning out warm-socket pairs for
@@ -506,18 +594,18 @@ pub async fn reconcile_managed_agent_runtimes(
     // Captured before the probes: a community removed while they run is refused.
     let admission = super::AdmissionSnapshot::capture(&app.state::<AppState>());
     let records = load_managed_agents(&app)?;
-    let mut jobs = Vec::new();
-    for community in communities {
-        for record in records
-            .iter()
-            .filter(|record| record.start_on_app_launch && record.backend == BackendKind::Local)
-        // The legacy per-record relay pin is deliberately ignored here — see
-        // `effective_agent_relay_url`. Every local auto-start agent fans out
-        // to every configured community.
-        {
-            jobs.push((record.clone(), community.relay_url.clone()));
-        }
-    }
+    let workspace_relay = crate::relay::relay_ws_url_with_override(&app.state::<AppState>());
+    // Stop pairs left running on a community their agent does not belong to
+    // (e.g. fanned out by a pre-scoping build) before starting anything.
+    let stop_app = app.clone();
+    let stop_records = records.clone();
+    let stop_workspace = workspace_relay.clone();
+    tokio::task::spawn_blocking(move || {
+        stop_misplaced_pairs(&stop_app, &stop_records, &stop_workspace)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking failed: {e}"))?;
+    let jobs = reconcile_jobs(&records, &communities, &workspace_relay);
     let probes: Vec<_> = stream::iter(jobs)
         .map(|(record, requested)| {
             let state = app.state::<AppState>();
@@ -539,7 +627,7 @@ pub async fn reconcile_managed_agent_runtimes(
     // restart flows.
     tokio::task::spawn_blocking(move || {
         let personas = load_personas(&app).unwrap_or_default();
-        let global = load_global_agent_config(&app).unwrap_or_default();
+        let defaults = load_community_agent_defaults(&app).unwrap_or_default();
         let mut rows = Vec::new();
         for probe in probes {
             match probe {
@@ -567,7 +655,7 @@ pub async fn reconcile_managed_agent_runtimes(
                                 Some(requested),
                                 StatusInputs {
                                     personas: &personas,
-                                    global: &global,
+                                    defaults: &defaults,
                                 },
                             );
                             status.lifecycle = ManagedAgentRuntimeLifecycle::Failed;
@@ -592,7 +680,7 @@ pub async fn reconcile_managed_agent_runtimes(
                                     Some(requested),
                                     StatusInputs {
                                         personas: &personas,
-                                        global: &global,
+                                        defaults: &defaults,
                                     },
                                 );
                                 status.lifecycle = ManagedAgentRuntimeLifecycle::Failed;
@@ -600,7 +688,11 @@ pub async fn reconcile_managed_agent_runtimes(
                                 status
                             }
                             Err(_) => unkeyable_failed_status(
-                                &record, requested, error, &personas, &global,
+                                &record,
+                                requested.clone(),
+                                error,
+                                &personas,
+                                defaults.for_record(&record, &requested),
                             ),
                         };
                     rows.push(status);
@@ -663,20 +755,51 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn legacy_relay_pin_is_ignored_for_fan_out() {
-        // Zero-touch cutover (#2122): a record carrying a creation-era
-        // `relay_url` pin must fan out exactly like an unpinned one — the
-        // stored field is parsed but never consulted. See
-        // `effective_agent_relay_url`.
-        let unpinned = record_with_relay("");
-        let pinned = record_with_relay("wss://one.example");
-        for record in [&unpinned, &pinned] {
-            assert_eq!(
-                crate::relay::effective_agent_relay_url(&record.relay_url, "wss://two.example"),
-                "wss://two.example"
-            );
+    fn community(relay_url: &str) -> super::super::ManagedAgentCommunityTarget {
+        super::super::ManagedAgentCommunityTarget {
+            relay_url: relay_url.into(),
         }
+    }
+
+    #[test]
+    fn fan_out_starts_each_agent_only_on_its_own_community() {
+        // Agents belong to ONE community (narrows #2122): reconcile over two
+        // communities starts a pinned agent only on its own relay.
+        let mut pinned = record_with_relay("wss://one.example");
+        pinned.start_on_app_launch = true;
+        let communities = [
+            community("wss://one.example"),
+            community("wss://two.example"),
+        ];
+
+        let jobs = reconcile_jobs(&[pinned.clone()], &communities, "wss://two.example");
+        let relays: Vec<_> = jobs.iter().map(|(_, relay)| relay.as_str()).collect();
+        assert_eq!(relays, ["wss://one.example"]);
+
+        // An unassigned record belongs to the active workspace only.
+        let mut unassigned = record_with_relay("");
+        unassigned.start_on_app_launch = true;
+        let jobs = reconcile_jobs(&[unassigned], &communities, "wss://two.example");
+        let relays: Vec<_> = jobs.iter().map(|(_, relay)| relay.as_str()).collect();
+        assert_eq!(relays, ["wss://two.example"]);
+
+        // Manual-start agents are never fanned out.
+        pinned.start_on_app_launch = false;
+        assert!(reconcile_jobs(&[pinned], &communities, "wss://two.example").is_empty());
+    }
+
+    #[test]
+    fn misplaced_pairs_are_the_ones_off_their_community() {
+        let record = record_with_relay("wss://one.example");
+        let own = ManagedAgentRuntimeKey::new(record.pubkey.clone(), "wss://one.example").unwrap();
+        let foreign =
+            ManagedAgentRuntimeKey::new(record.pubkey.clone(), "wss://two.example").unwrap();
+        let unknown = ManagedAgentRuntimeKey::new("cc".repeat(32), "wss://two.example").unwrap();
+        let keys = [own, foreign.clone(), unknown];
+        assert_eq!(
+            misplaced_pair_keys(&[record], keys.iter(), "wss://one.example"),
+            vec![foreign]
+        );
     }
 
     #[test]

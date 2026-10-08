@@ -14,6 +14,13 @@ import {
   handleSaveCustomHarness,
   handleDeleteCustomHarness,
 } from "./e2eBridgeCustomHarnesses.ts";
+import {
+  handleMockHostCommand,
+  initMockAgentHosts,
+  markMockAgentOnHost,
+  type MockAgentHostConfig,
+  mockHostPairingOffer,
+} from "./e2eBridgeHosts.ts";
 
 import type {
   ObservedUnreadProjection,
@@ -133,6 +140,10 @@ export type MockManagedAgentSeed = {
   respondToAllowlist?: string[];
   /** Per-agent env vars seeded into the mock store. */
   envVars?: Record<string, string>;
+  /** Community relay the agent belongs to (default: the default relay). */
+  relayUrl?: string;
+  /** Saved access policy not yet delivered by a remote redeploy. */
+  providerPolicyPending?: boolean;
 };
 
 type MockManagedAgentRuntimeSeed = {
@@ -211,6 +222,17 @@ type E2eConfig = {
   mock?: {
     /** Tauri window label exposed to the app. Defaults to the main window. */
     windowLabel?: string;
+    /**
+     * One-time payload returned by `take_popout_launch` (pop-out windows,
+     * label `popout-<uuid>`). Consumed on first read, like the native side;
+     * null/omitted simulates a reloaded pop-out.
+     */
+    popoutLaunch?: { route: string; community: unknown } | null;
+    /**
+     * Community ids whose community window (`community-<id>`) is already
+     * open: `focus_community_window` reports them as focused.
+     */
+    openCommunityWindowIds?: string[];
     ttsSettings?: {
       version: number;
       agentTextToSpeech: boolean;
@@ -313,6 +335,9 @@ type E2eConfig = {
       mcp?: MockCommandAvailability;
     };
     managedAgents?: MockManagedAgentSeed[];
+    /** Mirror the native community scoping of `list_managed_agents`: list
+     *  only agents whose `relay_url` is the applied community's relay. */
+    scopeManagedAgentsToCommunity?: boolean;
     /** Result returned by the mocked `add_agent_to_huddle` command. */
     addAgentToHuddleResult?: {
       ephemeral_added: boolean;
@@ -358,6 +383,8 @@ type E2eConfig = {
     /** Sequenced add-member failures. A string fails that call; null succeeds. */
     addChannelMembersErrors?: (string | null)[];
     channelMembersReadDelayMs?: number;
+    /** Extra human members appended to a mock channel's roster, by name. */
+    extraChannelMembers?: Record<string, string[]>;
     createManagedAgentDelayMs?: number;
     channelTemplates?: ChannelTemplate[];
     channelsReadError?: string;
@@ -604,6 +631,21 @@ type E2eConfig = {
       model: string | null;
       preferred_runtime?: string | null;
     };
+    /**
+     * Agent defaults per community relay, mirroring the native per-community
+     * store: when set, `get_global_agent_config` / `set_global_agent_config`
+     * read and write the applied community's entry (empty when absent) and
+     * `globalAgentConfig` is ignored.
+     */
+    globalAgentConfigByRelay?: Record<
+      string,
+      {
+        env_vars: Record<string, string>;
+        provider: string | null;
+        model: string | null;
+        preferred_runtime?: string | null;
+      }
+    >;
     /** Explicit owner-only agent-access capability; independent of baked defaults. */
     ownerOnlyAccessBuild?: boolean;
     /** File-layer config returned by runtime id. */
@@ -686,6 +728,8 @@ type E2eConfig = {
     backendProviders?: Array<{ id: string; binaryPath: string }>;
     backendProviderProbeResult?: Record<string, unknown>;
     backendProviderProbeDelayMs?: number;
+    /** Approved agent hosts (`list_agent_hosts`) and their presence. */
+    agentHosts?: MockAgentHostConfig[];
   };
   relayHttpUrl?: string;
   relayWsUrl?: string;
@@ -988,8 +1032,10 @@ type RawManagedAgent = {
   auto_restart_on_config_change?: boolean;
   backend:
     | { type: "local" }
-    | { type: "provider"; id: string; config: Record<string, unknown> };
+    | { type: "provider"; id: string; config: Record<string, unknown> }
+    | { type: "host"; host_pubkey: string };
   backend_agent_id: string | null;
+  provider_policy_pending?: boolean;
   respond_to: "owner-only" | "allowlist" | "anyone";
   respond_to_allowlist: string[];
 };
@@ -1332,6 +1378,19 @@ declare global {
       createdAt?: number;
       pubkey?: string;
       threadHeadId?: string;
+    }) => RelayEvent;
+    /** Emit one live reply-draft frame (ephemeral kind 20003). */
+    __BUZZ_E2E_EMIT_MOCK_STREAM_DRAFT__?: (input: {
+      channelName: string;
+      stream: string;
+      seq: number;
+      status: string;
+      content?: string;
+      label?: string;
+      pubkey?: string;
+      threadRootId?: string;
+      threadParentId?: string;
+      createdAt?: number;
     }) => RelayEvent;
     __BUZZ_E2E_INVOKE_MOCK_COMMAND__?: (
       command: string,
@@ -1998,6 +2057,7 @@ function cloneManagedAgent(agent: MockManagedAgent): RawManagedAgent {
     auto_restart_on_config_change: agent.auto_restart_on_config_change ?? true,
     backend: agent.backend ?? { type: "local" as const },
     backend_agent_id: agent.backend_agent_id ?? null,
+    provider_policy_pending: agent.provider_policy_pending ?? false,
     respond_to: agent.respond_to ?? "owner-only",
     respond_to_allowlist: agent.respond_to_allowlist
       ? [...agent.respond_to_allowlist]
@@ -2529,7 +2589,7 @@ function buildSeededManagedAgent(seed: MockManagedAgentSeed): MockManagedAgent {
     // Native serde always emits this key (`null` when unpinned) — the bridge
     // must mirror the wire shape, not omit the key.
     runtime: seed.runtime ?? null,
-    relay_url: DEFAULT_RELAY_WS_URL,
+    relay_url: seed.relayUrl ?? DEFAULT_RELAY_WS_URL,
     acp_command: "buzz-acp",
     agent_command: agentCommand,
     agent_args: agentArgs,
@@ -2557,7 +2617,11 @@ function buildSeededManagedAgent(seed: MockManagedAgentSeed): MockManagedAgent {
     start_on_app_launch: true,
     auto_restart_on_config_change: seed.autoRestartOnConfigChange ?? true,
     backend: seed.backend ?? { type: "local" },
-    backend_agent_id: null,
+    backend_agent_id:
+      seed.backend?.type === "host" && status === "deployed"
+        ? seed.backend.host_pubkey
+        : null,
+    provider_policy_pending: seed.providerPolicyPending ?? false,
     respond_to: seed.respondTo ?? "owner-only",
     respond_to_allowlist: seed.respondToAllowlist ?? [],
     private_key_nsec: `nsec1mock${seed.pubkey.slice(0, 20)}`,
@@ -3353,6 +3417,20 @@ let mockWebsocketSendMutexWedged = false;
 let mockClosedChannelLiveSubscription = false;
 const realSockets = new Map<number, WebSocket>();
 let mockManagedAgents: MockManagedAgent[] = [];
+/** Relay of the last `apply_workspace` — the active community. */
+let mockAppliedRelayUrl: string | null = null;
+/**
+ * Relay a community window bound with `bind_window_community`. Like the
+ * native per-window binding, it scopes every relay read of this window
+ * (relay URL commands and the community agent filter).
+ */
+let mockWindowBoundRelayUrl: string | null = null;
+
+function sameMockRelay(left: string, right: string) {
+  const canonical = (url: string) =>
+    url.trim().replace(/\/+$/, "").toLowerCase();
+  return canonical(left) === canonical(right);
+}
 let mockManagedAgentRuntimes: MockManagedAgentRuntimeRow[] = [];
 let mockBestieAssignment: {
   agent_pubkey: string;
@@ -4444,11 +4522,14 @@ function isRelayMode(config: E2eConfig | undefined): boolean {
 }
 
 function getRelayHttpUrl(config: E2eConfig | undefined): string {
+  if (mockWindowBoundRelayUrl) {
+    return mockWindowBoundRelayUrl.replace(/^ws(s?):/, "http$1:");
+  }
   return config?.relayHttpUrl ?? DEFAULT_RELAY_HTTP_URL;
 }
 
 function getRelayWsUrl(config: E2eConfig | undefined): string {
-  return config?.relayWsUrl ?? DEFAULT_RELAY_WS_URL;
+  return mockWindowBoundRelayUrl ?? config?.relayWsUrl ?? DEFAULT_RELAY_WS_URL;
 }
 
 /**
@@ -7561,8 +7642,11 @@ async function handleGetChannelMembers(
   const identity = getIdentity(config);
   if (!identity) {
     const channel = getMockChannel(args.channelId);
+    const extra = (config?.mock?.extraChannelMembers?.[channel.name] ?? []).map(
+      (pubkey) => createMockMember(pubkey, "member", 60),
+    );
     return {
-      members: cloneMembers(channel.members),
+      members: [...cloneMembers(channel.members), ...extra],
       next_cursor: null,
     };
   }
@@ -8687,12 +8771,28 @@ let installCallCount = 0;
 const installCallCountByRuntime: Record<string, number> = {};
 let addChannelMembersCallCount = 0;
 let setGlobalAgentConfigCallCount = 0;
-let mockGlobalAgentConfig: {
+type MockGlobalAgentConfig = {
   env_vars: Record<string, string>;
   provider: string | null;
   model: string | null;
   preferred_runtime?: string | null;
-} | null = null;
+};
+let mockGlobalAgentConfig: MockGlobalAgentConfig | null = null;
+/** Per-community defaults (see `globalAgentConfigByRelay`); null = app-wide mock. */
+let mockGlobalAgentConfigByRelay: Record<string, MockGlobalAgentConfig> | null =
+  null;
+
+/**
+ * Key of the invoking window's community in `mockGlobalAgentConfigByRelay`:
+ * a community window's bound relay, else the applied (active) community —
+ * the native `WindowRelay` resolution.
+ */
+function mockAgentDefaultsRelayKey(): string {
+  return (mockWindowBoundRelayUrl ?? mockAppliedRelayUrl ?? "")
+    .trim()
+    .replace(/\/+$/, "")
+    .toLowerCase();
+}
 
 // Per-page get_nsec call counter for sequenced error testing.
 let nsecCallCount = 0;
@@ -8872,7 +8972,15 @@ async function handleListManagedAgents(
   config: E2eConfig | undefined,
 ): Promise<RawManagedAgent[]> {
   await delayAgentList(config);
-  return mockManagedAgents.map(cloneManagedAgent);
+  const applied = mockAppliedRelayUrl;
+  const visible =
+    config?.mock?.scopeManagedAgentsToCommunity && applied !== null
+      ? mockManagedAgents.filter(
+          (agent) =>
+            !agent.relay_url || sameMockRelay(agent.relay_url, applied),
+        )
+      : mockManagedAgents;
+  return visible.map(cloneManagedAgent);
 }
 
 function isAgentMemoryListing(
@@ -9611,7 +9719,8 @@ async function handleCreateManagedAgent(
       startOnAppLaunch?: boolean;
       backend?:
         | { type: "local" }
-        | { type: "provider"; id: string; config: Record<string, unknown> };
+        | { type: "provider"; id: string; config: Record<string, unknown> }
+        | { type: "host"; host_pubkey: string };
       respondTo?: "owner-only" | "allowlist" | "anyone";
       respondToAllowlist?: string[];
     };
@@ -9671,7 +9780,9 @@ async function handleCreateManagedAgent(
     persona_id: args.input.personaId ?? null,
     // Create never pins a harness id — the record inherits from the persona.
     runtime: null,
-    relay_url: args.input.relayUrl ?? DEFAULT_RELAY_WS_URL,
+    // Native create always assigns the active community.
+    relay_url:
+      args.input.relayUrl ?? mockAppliedRelayUrl ?? DEFAULT_RELAY_WS_URL,
     acp_command: args.input.acpCommand ?? "buzz-acp",
     agent_command: agentCommand,
     agent_args: agentArgs,
@@ -9713,6 +9824,10 @@ async function handleCreateManagedAgent(
     ],
   };
 
+  if (args.input.spawnAfterCreate && managedAgent.backend.type === "host") {
+    markMockAgentOnHost(managedAgent, managedAgent.backend.host_pubkey);
+    managedAgent.pid = null;
+  }
   mockManagedAgents.unshift(managedAgent);
   if (args.input.spawnAfterCreate && managedAgent.backend.type === "local") {
     // The real create command spawns a pair runtime on the agent's effective
@@ -9864,6 +9979,8 @@ async function handleStartManagedAgent(
     agent.pid = null;
     agent.backend_agent_id =
       agent.backend_agent_id ?? `mock-provider-${agent.pubkey.slice(0, 12)}`;
+    // A successful redeploy delivers the saved access policy.
+    agent.provider_policy_pending = false;
   } else {
     agent.status = "running";
     agent.pid = agent.pid ?? 42000 + mockManagedAgents.indexOf(agent);
@@ -11485,9 +11602,25 @@ export function maybeInstallE2eTauriMocks() {
   mockGlobalAgentConfig = config.mock?.globalAgentConfig
     ? { ...config.mock.globalAgentConfig }
     : null;
+  mockGlobalAgentConfigByRelay = config.mock?.globalAgentConfigByRelay
+    ? Object.fromEntries(
+        Object.entries(config.mock.globalAgentConfigByRelay).map(
+          ([relay, value]) => [
+            relay.trim().replace(/\/+$/, "").toLowerCase(),
+            { ...value },
+          ],
+        ),
+      )
+    : null;
   resetMockRelayMembers(config);
   resetMockRelayAgents(config);
   resetMockManagedAgents(config);
+  initMockAgentHosts(config.mock?.agentHosts, {
+    setPresence: setMockPresenceStatus,
+    relayUrl: DEFAULT_RELAY_WS_URL,
+  });
+  window.__BUZZ_E2E_HOST_PAIRING_OFFER__ = (sas, hello) =>
+    mockHostPairingOffer({ emit }, sas, hello);
   resetMockPersonas(config);
   resetMockTeams(config);
   seedMockSearchProfiles(config);
@@ -11701,6 +11834,35 @@ export function maybeInstallE2eTauriMocks() {
       threadHeadId,
       createdAt,
     );
+  };
+  window.__BUZZ_E2E_EMIT_MOCK_STREAM_DRAFT__ = (input) => {
+    const channel = mockChannels.find(
+      (candidate) => candidate.name === input.channelName,
+    );
+    if (!channel) {
+      throw new Error(`Mock channel ${input.channelName} not found.`);
+    }
+    const tags: string[][] = [
+      ["h", channel.id],
+      ["stream", input.stream],
+      ["seq", String(input.seq)],
+    ];
+    if (input.threadRootId) tags.push(["e", input.threadRootId, "", "root"]);
+    if (input.threadParentId) {
+      tags.push(["e", input.threadParentId, "", "reply"]);
+    }
+    tags.push(["status", input.status]);
+    if (input.label) tags.push(["label", input.label]);
+    const event = createMockEvent(
+      20003,
+      input.content ?? "",
+      tags,
+      input.pubkey ?? CHARLIE_PUBKEY,
+      input.createdAt,
+    );
+    // Ephemeral: delivered to live subscriptions only, never recorded.
+    emitMockLiveEvent(channel.id, event);
+    return event;
   };
   window.__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__ = ({
     channelName,
@@ -12046,7 +12208,34 @@ export function maybeInstallE2eTauriMocks() {
     });
     window.__BUZZ_E2E_COMMAND_LOG__?.push({ command, payload });
 
+    const hostResult = await handleMockHostCommand(command, payload, {
+      emit,
+      setPresence: setMockPresenceStatus,
+      agents: () => mockManagedAgents,
+      relayUrl: DEFAULT_RELAY_WS_URL,
+    });
+    if (hostResult.handled) return hostResult.value;
+
     switch (command) {
+      case "deploy_to_host": {
+        const { pubkey, hostPubkey } = payload as {
+          pubkey: string;
+          hostPubkey: string;
+        };
+        const agent = getMockManagedAgent(pubkey);
+        markMockAgentOnHost(agent, hostPubkey);
+        agent.last_started_at = new Date().toISOString();
+        syncMockRelayAgentsFromManagedAgents();
+        return cloneManagedAgent(agent);
+      }
+      case "undeploy_from_host": {
+        const agent = getMockManagedAgent(
+          (payload as { pubkey: string }).pubkey,
+        );
+        agent.backend_agent_id = null;
+        agent.status = "not_deployed";
+        return cloneManagedAgent(agent);
+      }
       case "get_huddle_state": {
         const snapshot = mockHuddle ? structuredClone(mockHuddle.state) : null;
         const delayMs = activeConfig?.mock?.huddleStateReadDelayMs ?? 0;
@@ -12177,6 +12366,32 @@ export function maybeInstallE2eTauriMocks() {
       case "close_huddle_companion":
         await emit("huddle-companion-returned", null);
         return null;
+      // Pop-out windows. Calls are recorded in __BUZZ_E2E_COMMAND_LOG__.
+      case "open_popout_window":
+        return `popout-${crypto.randomUUID()}`;
+      case "take_popout_launch": {
+        const launchKey = "buzz.e2e.popout-launch-taken.v1";
+        // One-time per window, surviving reloads like the native slot.
+        if (window.sessionStorage.getItem(launchKey) === "1") return null;
+        window.sessionStorage.setItem(launchKey, "1");
+        return activeConfig?.mock?.popoutLaunch ?? null;
+      }
+      case "focus_main_window_route":
+        return null;
+      // Community windows. Calls are recorded in __BUZZ_E2E_COMMAND_LOG__.
+      case "open_community_window":
+        return `community-${(payload as { communityId: string }).communityId}`;
+      case "focus_community_window":
+        return (activeConfig?.mock?.openCommunityWindowIds ?? []).includes(
+          (payload as { communityId: string }).communityId,
+        );
+      case "bind_window_community": {
+        const relayUrl = (payload as { relayUrl: string }).relayUrl;
+        mockWindowBoundRelayUrl = relayUrl;
+        // The window's community is what its agent lists scope to.
+        mockAppliedRelayUrl = relayUrl;
+        return null;
+      }
       case "leave_huddle":
       case "end_huddle":
         mockHuddle = null;
@@ -12902,6 +13117,8 @@ export function maybeInstallE2eTauriMocks() {
         return activeConfig?.mock?.linkPreviewMetadata ?? null;
       }
       case "apply_workspace": {
+        mockAppliedRelayUrl =
+          (payload as { relayUrl?: string } | undefined)?.relayUrl ?? null;
         const applyDelayMs = activeConfig?.mock?.applyCommunityDelayMs ?? 0;
         if (applyDelayMs > 0) {
           return new Promise((resolve) =>
@@ -14290,6 +14507,16 @@ export function maybeInstallE2eTauriMocks() {
       }
       case "get_global_agent_config": {
         // Return the mutable persisted mock value, seeded from the test config.
+        if (mockGlobalAgentConfigByRelay) {
+          return (
+            mockGlobalAgentConfigByRelay[mockAgentDefaultsRelayKey()] ?? {
+              env_vars: {},
+              provider: null,
+              model: null,
+              preferred_runtime: null,
+            }
+          );
+        }
         return (
           mockGlobalAgentConfig ?? {
             env_vars: {},
@@ -14333,7 +14560,12 @@ export function maybeInstallE2eTauriMocks() {
         if (saveDelayMs > 0) {
           await new Promise((resolve) => setTimeout(resolve, saveDelayMs));
         }
-        mockGlobalAgentConfig = savedConfig;
+        if (mockGlobalAgentConfigByRelay) {
+          mockGlobalAgentConfigByRelay[mockAgentDefaultsRelayKey()] =
+            savedConfig;
+        } else {
+          mockGlobalAgentConfig = savedConfig;
+        }
         // In the E2E environment there are no running agents to restart, so
         // the counts default to 0 unless a spec drives them explicitly.
         return {

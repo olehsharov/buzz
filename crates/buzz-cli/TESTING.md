@@ -203,6 +203,26 @@ REPLY_ID=$(echo "$REPLY" | jq -r '.event_id')
 # messages send with mentions — @name in content is auto-resolved, no flag needed
 buzz messages send --channel "$CHANNEL_ID" --content "Hey @someone" | jq .
 
+# messages send with @all — one p-tag per channel member except you (people
+# AND agents: `bot`-role members and NIP-OA-attested profiles are included)
+# plus a ["buzz:mention-group","all"] marker tag. @all is reserved (a member named
+# "all" needs --mention <pubkey>) and ignored inside code.
+buzz messages send --channel "$CHANNEL_ID" --content "@all standup in 5" | jq .
+# Expected: mention_pubkeys = every member but you, agents included; verify
+# the marker:
+#   buzz messages get --channel "$CHANNEL_ID" --limit 1 | jq '.[0].tags'
+# --mention-all does the same; content lacking an @all token (outside code)
+# gets "@all " prepended — the marker is never emitted without the literal text
+buzz messages send --channel "$CHANNEL_ID" --content "standup in 5" --mention-all | jq .
+# Expected: published content is "@all standup in 5"; with --content "@all hi"
+# plus --mention-all the content is unchanged (no duplicate token)
+# Expected failures (exit 1, nothing published):
+#   - in a DM channel: "@all is not supported in DMs ..."
+#   - more than 50 other members: "@all would mention N members,
+#     exceeding the limit of 50 ..."
+# `messages edit` does not re-resolve mentions: @all in edited text is plain
+# text (no new p-tags, no marker), like every other @Name on edit.
+
 # messages send with NIP-27 nostr:npub1… inline mention — auto-resolved to p-tag
 buzz messages send --channel "$CHANNEL_ID" \
   --content "Check with nostr:npub10elfcs4fr0l0r8af98jlmgdh9c8tcxjvz9qkw038js35mp4dma8qzvjptg on this" | jq .

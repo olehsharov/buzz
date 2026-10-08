@@ -36,12 +36,13 @@ pub(crate) fn reconcile_agents_to_events(
     app: &tauri::AppHandle,
     keys: &nostr::Keys,
     db_path: &Path,
+    relay_url: &str,
 ) {
     let Ok(base_dir) = super::managed_agents_base_dir(app) else {
         return;
     };
 
-    match reconcile_agents_in_dir_at(&base_dir, keys, db_path) {
+    match reconcile_agents_in_dir_at(&base_dir, keys, db_path, Some(relay_url)) {
         Ok(0) => {}
         Ok(reconciled) => {
             eprintln!(
@@ -67,13 +68,17 @@ pub(crate) fn reconcile_agents_to_events(
 /// Returns the number of agents (re)written to the retention store.
 #[cfg(test)]
 pub(crate) fn reconcile_agents_in_dir(base_dir: &Path, keys: &nostr::Keys) -> Result<u32, String> {
-    reconcile_agents_in_dir_at(base_dir, keys, &base_dir.join("retention.db"))
+    reconcile_agents_in_dir_at(base_dir, keys, &base_dir.join("retention.db"), None)
 }
 
-fn reconcile_agents_in_dir_at(
+/// `community`: the relay this retention scope publishes to. An agent's
+/// record is reconciled only into its own community's scope (`None` = every
+/// agent, for the legacy unit-test helper).
+pub(crate) fn reconcile_agents_in_dir_at(
     base_dir: &Path,
     keys: &nostr::Keys,
     db_path: &Path,
+    community: Option<&str>,
 ) -> Result<u32, String> {
     let store_path = base_dir.join("managed-agents.json");
     if !store_path.exists() {
@@ -101,6 +106,11 @@ fn reconcile_agents_in_dir_at(
         // A record without a pubkey has no event coordinate yet (key-less
         // agents mint keys on first start) — nothing to reconcile.
         if record.pubkey.is_empty() {
+            continue;
+        }
+        if community.is_some_and(|community| {
+            !crate::relay::agent_belongs_to_relay(&record.relay_url, community, community)
+        }) {
             continue;
         }
 

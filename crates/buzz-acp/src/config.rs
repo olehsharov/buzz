@@ -405,6 +405,15 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_NO_TYPING")]
     pub no_typing: bool,
 
+    /// Live reply streaming (NIP-SD kind:20003 ghost drafts).
+    /// off (default): no drafts.
+    /// draft: stream the agent's response text, thinking and tool status as
+    /// ephemeral drafts into the trigger's reply destination.
+    /// draft+autopost: draft, and post the response text as the reply at end
+    /// of turn unless the agent already replied there via the CLI.
+    #[arg(long, env = "BUZZ_ACP_STREAM", default_value = "off", value_enum)]
+    pub stream: crate::stream_draft::StreamMode,
+
     /// Enable NIP-AE agent core memory injection.
     ///
     /// Memory injection is on by default. When enabled, the harness
@@ -460,6 +469,18 @@ pub struct CliArgs {
     /// others ignore it. Never enters the prompt.
     #[arg(long, env = "BUZZ_ACP_SESSION_TITLE")]
     pub session_title: Option<String>,
+
+    /// Provider session to continue from. The first channel or DM session
+    /// this harness creates forks this session (`session/fork`) and resumes
+    /// the fork (`session/resume`) instead of starting fresh; the source
+    /// session is never modified. Requires an adapter that advertises
+    /// `sessionCapabilities.fork` and `.resume` (e.g. `claude-agent-acp`), and
+    /// the harness cwd must be the directory the source session ran in.
+    /// Must be a hyphenated UUID. Once a fork is resumed, it is recorded under
+    /// `$XDG_STATE_HOME/buzz-acp` (else `~/.local/state/buzz-acp`) so later
+    /// harness processes resume that fork instead of forking the source again.
+    #[arg(long, env = "BUZZ_ACP_RESUME_SESSION")]
+    pub resume_session: Option<String>,
 
     /// Permission mode for agents that support `session/set_config_option`
     /// with `configId: "mode"` (e.g. `claude-agent-acp`).
@@ -576,6 +597,8 @@ pub struct Config {
     pub max_turns_per_session: u32,
     pub presence_enabled: bool,
     pub typing_enabled: bool,
+    /// Live reply streaming mode (`--stream` / `BUZZ_ACP_STREAM`).
+    pub stream_mode: crate::stream_draft::StreamMode,
     /// Whether NIP-AE agent core memory injection is enabled. When false,
     /// the harness skips the per-session core engram fetch and renders no
     /// `<core-memory>` section. On by default; disabled via the
@@ -592,6 +615,9 @@ pub struct Config {
     /// Sanitized session title, sent as `_meta.sessionTitle` on `session/new`.
     /// `None` when unset or when the configured value sanitized to empty.
     pub session_title: Option<String>,
+    /// Provider session ID the first channel/DM session continues, as a
+    /// canonical hyphenated lowercase UUID. `None` when unset or blank.
+    pub resume_session: Option<String>,
     /// Permission mode to apply after session creation. `Default` = skip.
     pub permission_mode: PermissionMode,
     /// Inbound author gate mode.
@@ -922,6 +948,25 @@ pub fn propagate_legacy_env_vars() {
     }
 }
 
+/// Validate `BUZZ_ACP_RESUME_SESSION`: blank means unset; anything else must
+/// be a provider session UUID. A typo (e.g. a trailing `.`) is a startup
+/// error naming the value rather than a fork request the adapter rejects
+/// later with an opaque error. Returns the canonical hyphenated lowercase form,
+/// which is also safe to use as a file-name component.
+fn parse_resume_session(raw: Option<&str>) -> Result<Option<String>, ConfigError> {
+    let Some(trimmed) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let is_hyphenated = trimmed.len() == 36;
+    match Uuid::parse_str(trimmed) {
+        Ok(id) if is_hyphenated => Ok(Some(id.hyphenated().to_string())),
+        _ => Err(ConfigError::ConfigFile(format!(
+            "BUZZ_ACP_RESUME_SESSION must be a session UUID \
+             (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx), got {trimmed:?}"
+        ))),
+    }
+}
+
 impl Config {
     pub fn from_cli() -> Result<Self, ConfigError> {
         // Legacy env-var propagation is intentionally NOT done here.
@@ -1188,6 +1233,7 @@ impl Config {
             max_turns_per_session: args.max_turns_per_session,
             presence_enabled: !args.no_presence,
             typing_enabled: !args.no_typing,
+            stream_mode: args.stream,
             memory_enabled: args.memory && !args.no_memory,
             model,
             effort_level: args.effort_level,
@@ -1195,6 +1241,7 @@ impl Config {
                 .session_title
                 .as_deref()
                 .and_then(sanitize_session_title),
+            resume_session: parse_resume_session(args.resume_session.as_deref())?,
             permission_mode: args.permission_mode,
             respond_to: args.respond_to,
             respond_to_allowlist,
@@ -1230,7 +1277,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} stream={} memory={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1249,6 +1296,7 @@ impl Config {
             self.max_turns_per_session,
             self.presence_enabled,
             self.typing_enabled,
+            self.stream_mode,
             self.memory_enabled,
             self.model.as_deref().unwrap_or("(agent default)"),
             self.permission_mode,
@@ -1569,10 +1617,12 @@ mod tests {
             max_turns_per_session: 0,
             presence_enabled: true,
             typing_enabled: true,
+            stream_mode: crate::stream_draft::StreamMode::Off,
             memory_enabled: true,
             model: None,
             effort_level: None,
             session_title: None,
+            resume_session: None,
             permission_mode: PermissionMode::BypassPermissions,
             respond_to: RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
@@ -2359,6 +2409,23 @@ channels = "ALL"
         );
     }
 
+    /// The startup log line must name the stream mode so a stale or
+    /// non-streaming harness is obvious from logs alone.
+    #[test]
+    fn test_summary_reports_stream_mode() {
+        use crate::stream_draft::StreamMode;
+        for (mode, expected) in [
+            (StreamMode::Off, " stream=off "),
+            (StreamMode::Draft, " stream=draft "),
+            (StreamMode::DraftAutopost, " stream=draft+autopost "),
+        ] {
+            let mut config = test_config(SubscribeMode::Mentions);
+            config.stream_mode = mode;
+            let s = config.summary();
+            assert!(s.contains(expected), "expected `{expected}` in: {s}");
+        }
+    }
+
     #[test]
     fn test_summary_reflects_custom_agents_and_heartbeat() {
         let mut config = test_config(SubscribeMode::Mentions);
@@ -3040,6 +3107,49 @@ channels = "ALL"
             result.is_ok(),
             "from_args should accept any mode when allowed list is unset: {result:?}"
         );
+    }
+
+    // --- BUZZ_ACP_RESUME_SESSION validation ---
+
+    fn resume_session_config(value: &str) -> Result<Config, ConfigError> {
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--resume-session",
+            value,
+        ])
+        .expect("clap should parse args");
+        Config::from_args(args)
+    }
+
+    #[test]
+    fn resume_session_is_trimmed_and_canonicalized() {
+        let id = "0f7c1a52-3b9e-4d6a-9c1e-2a8b7d4e5f60";
+        for raw in [id, &format!("  {id}\n"), &id.to_ascii_uppercase()] {
+            let config = resume_session_config(raw).expect("valid session id");
+            assert_eq!(config.resume_session.as_deref(), Some(id), "raw {raw:?}");
+        }
+        let blank = resume_session_config("   ").expect("blank is unset");
+        assert_eq!(blank.resume_session, None);
+    }
+
+    #[test]
+    fn resume_session_rejects_non_uuid_naming_the_value() {
+        for bad in [
+            // The real outage: a trailing '.' pasted with the ID.
+            "0f7c1a52-3b9e-4d6a-9c1e-2a8b7d4e5f60.",
+            "0f7c1a523b9e4d6a9c1e2a8b7d4e5f60",
+            "{0f7c1a52-3b9e-4d6a-9c1e-2a8b7d4e5f60}",
+            "src-1",
+        ] {
+            let err = resume_session_config(bad).expect_err("non-UUID must fail at startup");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("BUZZ_ACP_RESUME_SESSION") && msg.contains(&format!("{bad:?}")),
+                "error should name the variable and value: {msg}"
+            );
+        }
     }
 
     // --- max_turn_duration ceiling gate ---

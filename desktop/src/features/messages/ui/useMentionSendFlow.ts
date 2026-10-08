@@ -39,6 +39,7 @@ import {
   withoutInvitingRecipients,
   mergeMentionRecipients,
   type PendingNonMemberMentionSend,
+  planMentionAllSend,
   type QueuedAgentWake,
   type SendMessageWithMentionFlowInput,
   resolvePreviewTags,
@@ -786,6 +787,31 @@ export function useMentionSendFlow({
           toast.error(dmThreadAgentMentionErrorMessage);
           return;
         }
+        // `@all` is re-resolved against a fresh roster before any side effect
+        // (channel preparation, persona creation, composer clear), so a
+        // blocked group mention leaves nothing behind but the visible error.
+        const mentionAllResolution =
+          await mentions.resolveMentionAllForSend(trimmed);
+        if (
+          isSendCancelled() ||
+          !isMountedRef.current ||
+          sourceOwnerRef.current !== sourceOwner ||
+          getComposerRevision() !== composerRevision
+        )
+          return;
+        const mentionAllPlan = planMentionAllSend({
+          otherRecipientPubkeys: mergeMentionRecipients(
+            selectedMentionPubkeys,
+            addressedAgentPubkeys,
+          ),
+          pendingPersonaCount: selectedPersonas.length,
+          resolution: mentionAllResolution,
+        });
+        if ("error" in mentionAllPlan) {
+          setNonMemberPromptError(mentionAllPlan.error);
+          toast.error(mentionAllPlan.error);
+          return;
+        }
         let effectiveChannelId = capturedChannelId;
         if (!effectiveChannelId && onPrepareSendChannel) {
           effectiveChannelId = await onPrepareSendChannel();
@@ -828,6 +854,7 @@ export function useMentionSendFlow({
         const explicitMentionPubkeys = uniqueNormalizedPubkeys([
           ...selectedMentionPubkeys,
           ...createdPersonaAgentPubkeys,
+          ...mentionAllPlan.recipients,
         ]);
         const pubkeys = mergeMentionRecipients(
           explicitMentionPubkeys,
@@ -836,6 +863,7 @@ export function useMentionSendFlow({
         const outgoingTags = [
           ...buildCustomEmojiTags(trimmed, customEmoji),
           ...linkPreviewTags,
+          ...mentionAllPlan.tags,
         ];
         const nonMemberPubkeys =
           channelType === null ||
@@ -845,10 +873,14 @@ export function useMentionSendFlow({
             : uniqueNormalizedPubkeys(pubkeys).filter(
                 (pubkey) => !mentions.memberPubkeys.has(pubkey),
               );
+        // `@all` recipients come from the freshly fetched roster itself, which
+        // can be newer than this render's member set.
+        const mentionAllRecipientSet = new Set(mentionAllPlan.recipients);
         let promptNonMemberPubkeys = nonMemberPubkeys.filter(
           (pubkey) =>
             !mentions.isManagedAgentPubkey(pubkey) &&
-            !createdPersonaAgentPubkeySet.has(normalizePubkey(pubkey)),
+            !createdPersonaAgentPubkeySet.has(normalizePubkey(pubkey)) &&
+            !mentionAllRecipientSet.has(normalizePubkey(pubkey)),
         );
         if (promptNonMemberPubkeys.length > 0) {
           try {
@@ -930,6 +962,7 @@ export function useMentionSendFlow({
       mentions.getDraftMentionRefs,
       mentions.settlePendingMentionBindings,
       mentions.registerMentionPubkey,
+      mentions.resolveMentionAllForSend,
       onPrepareSendChannel,
       activePreparedLinkPreviews,
     ],

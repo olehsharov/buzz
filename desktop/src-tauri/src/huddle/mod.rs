@@ -585,17 +585,45 @@ async fn remove_huddle_agents(ephemeral_channel_id: &str, state: &AppState) {
     }
 }
 
+/// What `leave_huddle` publishes on the relay before tearing down locally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaveDisposition {
+    /// Emit HUDDLE_ENDED and archive the ephemeral channel.
+    EndAndArchive,
+    /// Remove only ourselves from the ephemeral channel membership.
+    LeaveOnly,
+}
+
+/// Decide how a leave is published.
+///
+/// Only the creator may end a huddle: the relay rejects kind:48103 and the
+/// kind:9002 archive from anyone else ("only the Huddle creator or relay may
+/// end it"). So a non-creator always just leaves, even as the last human;
+/// the relay owns ending a huddle its creator has abandoned.
+///
+/// `humans_remaining` counts human members *including us* (we stay a member
+/// until we leave). `None` means the count is unknown (not fetched, or the
+/// fetch failed); an unknown count never ends the huddle, so a transient REST
+/// failure cannot end it for everyone.
+fn leave_disposition(is_creator: bool, humans_remaining: Option<usize>) -> LeaveDisposition {
+    match humans_remaining {
+        Some(humans) if is_creator && humans <= 1 => LeaveDisposition::EndAndArchive,
+        _ => LeaveDisposition::LeaveOnly,
+    }
+}
+
 /// Leave the current huddle.
 ///
 /// Steps:
 /// 1. Transition to Leaving.
-/// 2. Auto-end check: if last human, emit HUDDLE_ENDED + archive.
+/// 2. Auto-end check: if we created the huddle and are its last human, emit
+///    HUDDLE_ENDED + archive. Otherwise just leave the ephemeral channel.
 /// 3. Shut down pipelines and audio relay.
 ///
 /// The relay emits kind:48102 (participant left) when the audio WS disconnects.
 #[tauri::command]
 pub async fn leave_huddle(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    let (parent_channel_id, ephemeral_channel_id) = {
+    let (parent_channel_id, ephemeral_channel_id, is_creator) = {
         let mut hs = state.huddle()?;
         if hs.phase == HuddlePhase::Idle {
             return Ok(()); // Nothing to leave.
@@ -604,38 +632,38 @@ pub async fn leave_huddle(app: tauri::AppHandle, state: State<'_, AppState>) -> 
         (
             hs.parent_channel_id.clone().unwrap_or_default(),
             hs.ephemeral_channel_id.clone().unwrap_or_default(),
+            hs.is_creator,
         )
     };
 
-    // Auto-end: check if any human participants remain. If not, end the huddle
-    // (emit HUDDLE_ENDED + archive). If others remain, just remove self from
-    // membership so the participant roster stays accurate.
-    //
-    // We check BEFORE removing self — the relay counts us as a member until
-    // we leave. So "1 human remaining" means WE are the last one.
     if !parent_channel_id.is_empty() && !ephemeral_channel_id.is_empty() {
-        let humans_remaining = count_human_members(&ephemeral_channel_id, &state)
-            .await
-            // On fetch failure, assume 2 humans remain (safe default).
-            // unwrap_or(1) would mean "I'm the last human" → triggers auto-archive,
-            // ending the huddle for everyone on a transient REST failure. Using 2
-            // means we skip the auto-end path and just remove ourselves — the huddle
-            // stays alive and the next real leave will clean up correctly.
-            .unwrap_or(2);
-
-        if humans_remaining <= 1 {
-            // We're the last human — end the huddle entirely.
-            // Archive subsumes leave (the channel is gone, membership is moot).
-            // This avoids the "cannot remove the last owner" relay error that
-            // build_leave hits when the creator is the sole remaining member.
-            eprintln!("buzz-desktop: last human left huddle — auto-ending");
-            emit_end_and_archive(&parent_channel_id, &ephemeral_channel_id, &state).await;
+        // Only the creator may end the huddle, so only the creator needs the
+        // member count. We count BEFORE removing self — the relay counts us as
+        // a member until we leave, so "1 human remaining" means we are last.
+        let humans_remaining = if is_creator {
+            count_human_members(&ephemeral_channel_id, &state)
+                .await
+                .inspect_err(|e| eprintln!("buzz-desktop: count huddle humans failed: {e}"))
+                .ok()
         } else {
-            // Other humans still in the huddle — just remove self from membership.
-            if let Ok(eph_uuid) = parse_channel_uuid(&ephemeral_channel_id) {
-                if let Ok(leave_builder) = events::build_leave(eph_uuid) {
-                    if let Err(e) = submit_event(leave_builder, &state).await {
-                        eprintln!("buzz-desktop: huddle leave ephemeral channel failed: {e}");
+            None
+        };
+
+        match leave_disposition(is_creator, humans_remaining) {
+            LeaveDisposition::EndAndArchive => {
+                // Archive subsumes leave (the channel is gone, membership is
+                // moot). This avoids the "cannot remove the last owner" relay
+                // error that build_leave hits when the creator is the sole
+                // remaining member.
+                eprintln!("buzz-desktop: last human left huddle — auto-ending");
+                emit_end_and_archive(&parent_channel_id, &ephemeral_channel_id, &state).await;
+            }
+            LeaveDisposition::LeaveOnly => {
+                if let Ok(eph_uuid) = parse_channel_uuid(&ephemeral_channel_id) {
+                    if let Ok(leave_builder) = events::build_leave(eph_uuid) {
+                        if let Err(e) = submit_event(leave_builder, &state).await {
+                            eprintln!("buzz-desktop: huddle leave ephemeral channel failed: {e}");
+                        }
                     }
                 }
             }
@@ -929,4 +957,47 @@ pub async fn speak_agent_message(
     .inspect_err(|_| {
         eprintln!("buzz-desktop: tts stage=queue status=failed reason=closed route_id={route_id}")
     })
+}
+
+#[cfg(test)]
+mod leave_disposition_tests {
+    use super::{leave_disposition, LeaveDisposition};
+
+    #[test]
+    fn last_human_creator_ends_and_archives() {
+        assert_eq!(
+            leave_disposition(true, Some(1)),
+            LeaveDisposition::EndAndArchive
+        );
+        assert_eq!(
+            leave_disposition(true, Some(0)),
+            LeaveDisposition::EndAndArchive
+        );
+    }
+
+    #[test]
+    fn creator_with_others_remaining_only_leaves() {
+        assert_eq!(
+            leave_disposition(true, Some(2)),
+            LeaveDisposition::LeaveOnly
+        );
+    }
+
+    #[test]
+    fn non_creator_never_ends_even_as_last_human() {
+        // The relay rejects kind:48103 and the kind:9002 archive from anyone
+        // but the creator, so a joiner's leave must never attempt them.
+        for humans in [None, Some(0), Some(1), Some(2)] {
+            assert_eq!(
+                leave_disposition(false, humans),
+                LeaveDisposition::LeaveOnly,
+                "humans_remaining = {humans:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_member_count_never_ends() {
+        assert_eq!(leave_disposition(true, None), LeaveDisposition::LeaveOnly);
+    }
 }

@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/widgets.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
@@ -8,11 +9,16 @@ import '../theme/theme_provider.dart';
 import '../community/community_provider.dart';
 import 'read_state_manager.dart';
 
+/// Read markers exposed to the UI.
+///
+/// Value-equal so a manager emission that changes nothing (a reconnect
+/// refresh, a publishable-flag promotion, a repeated force) does not notify
+/// every channel tile, badge, and open conversation.
+@immutable
 class ReadStateState {
   final bool isReady;
   final String? pubkey;
   final Map<String, int> contexts;
-  final int version;
 
   /// Session-local forced-unread flags, keyed by the forced context id
   /// (a channel id from the channel tile, or a `msg:` key from the message
@@ -24,7 +30,6 @@ class ReadStateState {
     required this.isReady,
     required this.pubkey,
     required this.contexts,
-    required this.version,
     this.forcedUnreadContexts = const {},
   });
 
@@ -32,8 +37,32 @@ class ReadStateState {
     : isReady = false,
       pubkey = null,
       contexts = const {},
-      version = 0,
       forcedUnreadContexts = const {};
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ReadStateState &&
+          other.isReady == isReady &&
+          other.pubkey == pubkey &&
+          mapEquals(other.contexts, contexts) &&
+          mapEquals(other.forcedUnreadContexts, forcedUnreadContexts);
+
+  // Order-independent so equal maps hash equally whatever their insertion
+  // order.
+  @override
+  int get hashCode => Object.hash(
+    isReady,
+    pubkey,
+    Object.hashAllUnordered(
+      contexts.entries.map((entry) => Object.hash(entry.key, entry.value)),
+    ),
+    Object.hashAllUnordered(
+      forcedUnreadContexts.entries.map(
+        (entry) => Object.hash(entry.key, entry.value),
+      ),
+    ),
+  );
 
   /// Channels that should surface as unread because of a forced-unread flag —
   /// either forced directly, or containing a forced message.
@@ -56,7 +85,6 @@ class ReadStateState {
       isReady: isReady,
       pubkey: pubkey,
       contexts: Map.unmodifiable({...contexts, contextId: timestamp}),
-      version: version + 1,
       forcedUnreadContexts: forcedUnreadContexts,
     );
   }
@@ -74,22 +102,28 @@ class ReadStateNotifier extends Notifier<ReadStateState> {
     _isInitialized = false;
     _forcedUnreadContexts.clear();
 
-    final relayConfig = ref.watch(relayConfigProvider);
-    ref.watch(relaySessionProvider);
-    final activeCommunity = ref.watch(activeCommunityProvider).value;
+    // Depend only on the manager's identity inputs. Session *status* changes
+    // are handled by the reconnect listener below; rebuilding on them would
+    // recreate the manager, drop session-local forced-unread flags, and flip
+    // isReady back to false on every connecting/connected/reconnecting
+    // transition. The session notifier instance itself lives as long as its
+    // provider element, so reading it once is enough.
+    final nsec = ref.watch(
+      relayConfigProvider.select((config) => config.nsec?.trim()),
+    );
+    final session = ref.read(relaySessionProvider.notifier);
+    final communityPubkey = ref.watch(
+      activeCommunityProvider.select(
+        (community) => _normalizePubkey(community.value?.pubkey),
+      ),
+    );
 
-    final nsec = relayConfig.nsec?.trim();
     if (nsec == null || nsec.isEmpty) {
       return const ReadStateState.inert();
     }
 
-    final signedRelay = SignedEventRelay(
-      session: ref.read(relaySessionProvider.notifier),
-      nsec: nsec,
-    );
-    final pubkey =
-        _normalizePubkey(activeCommunity?.pubkey) ??
-        _safeDerivedPubkey(signedRelay);
+    final signedRelay = SignedEventRelay(session: session, nsec: nsec);
+    final pubkey = communityPubkey ?? _safeDerivedPubkey(signedRelay);
     if (pubkey == null) {
       return const ReadStateState.inert();
     }
@@ -105,7 +139,7 @@ class ReadStateNotifier extends Notifier<ReadStateState> {
       pubkey: pubkey,
       prefs: prefs,
       crypto: crypto,
-      relaySession: ref.read(relaySessionProvider.notifier),
+      relaySession: session,
       signedEventRelay: signedRelay,
       remoteEnabled: true,
       onChanged: () => _emitManagerState(manager),
@@ -127,10 +161,12 @@ class ReadStateNotifier extends Notifier<ReadStateState> {
       }
     });
 
-    ref.listen(relaySessionProvider, (prev, next) {
-      if (prev?.status != SessionStatus.connected &&
-          next.status == SessionStatus.connected) {
-        unawaited(manager.reinitializeRemote());
+    ref.listen(relaySessionProvider.select((session) => session.status), (
+      prev,
+      next,
+    ) {
+      if (prev != SessionStatus.connected && next == SessionStatus.connected) {
+        unawaited(_refreshAfterReconnect(manager));
       }
     });
 
@@ -142,6 +178,16 @@ class ReadStateNotifier extends Notifier<ReadStateState> {
     });
 
     return _stateFromManager(manager, isReady: false);
+  }
+
+  /// A refresh that completes while connected is as authoritative as the
+  /// first initialize() pass, which may have been issued before the relay
+  /// was reachable and still be waiting out its timeouts.
+  Future<void> _refreshAfterReconnect(ReadStateManager manager) async {
+    final refreshed = await manager.reinitializeRemote();
+    if (!refreshed || _manager != manager) return;
+    _isInitialized = true;
+    _emitManagerState(manager);
   }
 
   /// Advance a context's read marker. Clears the forced-unread flag for
@@ -183,11 +229,7 @@ class ReadStateNotifier extends Notifier<ReadStateState> {
   void _refreshForcedState() {
     final manager = _manager;
     if (manager == null) return;
-    state = _stateFromManager(
-      manager,
-      isReady: _isInitialized,
-      previousVersion: state.version,
-    );
+    state = _stateFromManager(manager, isReady: _isInitialized);
   }
 
   void seedContextRead(String contextId, int unixTimestamp) {
@@ -200,23 +242,17 @@ class ReadStateNotifier extends Notifier<ReadStateState> {
     for (final contextId in advances) {
       _forcedUnreadContexts.remove(contextId);
     }
-    state = _stateFromManager(
-      manager,
-      isReady: _isInitialized,
-      previousVersion: state.version,
-    );
+    state = _stateFromManager(manager, isReady: _isInitialized);
   }
 
   ReadStateState _stateFromManager(
     ReadStateManager manager, {
     required bool isReady,
-    int? previousVersion,
   }) {
     return ReadStateState(
       isReady: isReady,
       pubkey: manager.pubkey,
       contexts: manager.effectiveContexts,
-      version: (previousVersion ?? 0) + 1,
       forcedUnreadContexts: Map.unmodifiable(
         Map<String, String>.from(_forcedUnreadContexts),
       ),

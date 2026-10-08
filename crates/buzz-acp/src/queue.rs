@@ -167,6 +167,10 @@ pub enum CancelReason {
     /// and incorporate the message if relevant
     /// (`MultipleEventHandling::Steer`, the default mid-turn path).
     Steer,
+    /// The harness shut down (or crashed) mid-turn and restored the turn
+    /// from its journal on start: the agent resumes the same provider session
+    /// and should continue that turn, not start it over.
+    Restart,
 }
 
 /// A batch of events to prompt the agent with.
@@ -1587,6 +1591,37 @@ fn append_new_thread_reply_instruction(s: &mut String, event_id: &str) {
     ));
 }
 
+/// Append the reply instruction for a turn whose response text the harness
+/// autoposts (`--stream draft+autopost`). `parent` is the event the autopost
+/// replies to ([`turn_reply_thread`]); `None` is a top-level DM reply. No CLI
+/// reply is named: a `buzz messages send` to the same destination replaces
+/// the autoposted reply, so the CLI is reserved for posts elsewhere.
+fn append_autopost_reply_instruction(s: &mut String, parent: Option<&str>) {
+    let destination = match parent {
+        Some(parent) => format!("as your reply to `{parent}`"),
+        None => "as your reply in this DM".to_string(),
+    };
+    s.push_str(&format!(
+        "\nIMPORTANT: Your response text is delivered automatically {destination}. \
+         Do not send that reply with `buzz messages send`; a message you send to \
+         the same destination during the turn replaces it. Use `--reply-to` only \
+         for additional messages to another thread. If the human explicitly asks \
+         for a channel-root, top-level, or broadcast post, send that message \
+         without `--reply-to`."
+    ));
+}
+
+/// How the `<context>` block tells the agent to deliver its ordinary reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplyDelivery<'a> {
+    /// The agent replies with `buzz messages send`, threaded under the
+    /// human-aware anchor when there is one ([`resolve_reply_anchor`]).
+    Cli { anchor: Option<&'a str> },
+    /// The harness autoposts the response text under `parent`
+    /// ([`turn_reply_thread`]; `None` is a top-level DM reply).
+    Autopost { parent: Option<&'a str> },
+}
+
 /// Decide whether a turn is human-facing for reply-anchor purposes.
 ///
 /// A turn is human-facing when the triggering sender is a human, OR a human
@@ -1637,6 +1672,68 @@ fn resolve_reply_anchor(
             .clone()
             .unwrap_or_else(|| triggering_event_id.to_string()),
     )
+}
+
+/// The `--reply-to` anchor the prompt names for a turn routed by `last_event`.
+///
+/// Human-facing turns are anchored so replies stay readable at layer 1:
+///   - in a thread  → anchor to the thread ROOT (no depth-2 nesting)
+///   - top-level     → anchor to the triggering event (it becomes the root)
+///
+/// Agent↔agent turns get no forced anchor — deep nesting is intentional
+/// there. DMs are always 1:1 with a human, so a DM thread reply anchors to
+/// the triggering event and a top-level DM message gets no anchor.
+fn turn_reply_anchor(
+    last_event: &BatchEvent,
+    is_dm: bool,
+    profile_lookup: Option<&PromptProfileLookup>,
+) -> Option<String> {
+    let thread_tags = last_event.routing_thread_tags();
+    let routing_event_id = last_event.routing_event_id();
+    if is_dm {
+        thread_tags
+            .root_event_id
+            .is_some()
+            .then_some(routing_event_id)
+    } else {
+        resolve_reply_anchor(
+            &last_event.event.pubkey.to_hex(),
+            &thread_tags,
+            &routing_event_id,
+            profile_lookup,
+        )
+    }
+}
+
+/// Where the turn's ordinary reply lands, as `(root, parent)` NIP-10 ids, or
+/// `None` for a top-level post. This is the destination the prompt's reply
+/// instruction names (`--reply-to` resolved the way the CLI resolves it), so
+/// live drafts and autoposted replies land exactly where a CLI reply would.
+///
+/// Without an anchor (agent↔agent), a channel reply targets the triggering
+/// event itself; a top-level DM message is answered top-level.
+pub(crate) fn turn_reply_thread(
+    batch: &FlushBatch,
+    is_dm: bool,
+    profile_lookup: Option<&PromptProfileLookup>,
+) -> Option<(String, String)> {
+    let last_event = batch.events.last()?;
+    let thread_tags = last_event.routing_thread_tags();
+    let routing_event_id = last_event.routing_event_id();
+    let parent = match turn_reply_anchor(last_event, is_dm, profile_lookup) {
+        Some(anchor) => anchor,
+        None if is_dm => return None,
+        None => routing_event_id.clone(),
+    };
+    // `--reply-to <parent>` derives the root from the parent's own tags: the
+    // trigger's thread root when the parent is the trigger, else the parent
+    // (the anchor is the thread root itself).
+    let root = if parent == routing_event_id {
+        thread_tags.root_event_id.unwrap_or_else(|| parent.clone())
+    } else {
+        parent.clone()
+    };
+    Some((root, parent))
 }
 
 /// Maximum length (in characters) of a channel description rendered into `<context>`.
@@ -1791,7 +1888,7 @@ fn format_context_hints(
     thread_tags: &ThreadTags,
     is_dm: bool,
     conversation_context_status: ConversationContextStatus,
-    reply_anchor: Option<&str>,
+    reply: ReplyDelivery<'_>,
 ) -> String {
     let channel_id = scope.channel_id();
     let channel_display = match channel_info {
@@ -1844,9 +1941,15 @@ fn format_context_hints(
                     s.push_str(&format!("\nParent: {parent}"));
                 }
             }
-            if let Some(event_id) = reply_anchor {
+            if let ReplyDelivery::Cli {
+                anchor: Some(event_id),
+            } = reply
+            {
                 append_reply_instruction(&mut s, event_id);
             }
+        }
+        if let ReplyDelivery::Autopost { parent } = reply {
+            append_autopost_reply_instruction(&mut s, parent);
         }
         crate::prompt_framing::semantic_section("context", &s)
     } else if let Some(root) = scope
@@ -1881,12 +1984,17 @@ fn format_context_hints(
             }
         }
         s.push_str(&format!("\n{ctx_hint}"));
-        if let Some(event_id) = reply_anchor {
-            if thread_tags.root_event_id.is_some() {
+        match reply {
+            ReplyDelivery::Cli {
+                anchor: Some(event_id),
+            } if thread_tags.root_event_id.is_some() => {
                 append_reply_instruction(&mut s, event_id);
-            } else {
-                append_new_thread_reply_instruction(&mut s, event_id);
             }
+            ReplyDelivery::Cli {
+                anchor: Some(event_id),
+            } => append_new_thread_reply_instruction(&mut s, event_id),
+            ReplyDelivery::Cli { anchor: None } => {}
+            ReplyDelivery::Autopost { parent } => append_autopost_reply_instruction(&mut s, parent),
         }
         crate::prompt_framing::semantic_section("context", &s)
     } else {
@@ -1900,8 +2008,12 @@ fn format_context_hints(
         s.push_str(
             "\nHint: Use `buzz messages get --channel <UUID>` for recent messages if needed.",
         );
-        if let Some(event_id) = reply_anchor {
-            append_new_thread_reply_instruction(&mut s, event_id);
+        match reply {
+            ReplyDelivery::Cli {
+                anchor: Some(event_id),
+            } => append_new_thread_reply_instruction(&mut s, event_id),
+            ReplyDelivery::Cli { anchor: None } => {}
+            ReplyDelivery::Autopost { parent } => append_autopost_reply_instruction(&mut s, parent),
         }
         crate::prompt_framing::semantic_section("context", &s)
     }
@@ -2068,6 +2180,21 @@ pub struct FormatPromptArgs<'a> {
     /// Defaults to `false` so a caller that never sets it behaves as if this
     /// were the session's first message.
     pub standing_context_sent: bool,
+    /// The batch's cancelled events were already delivered to this live
+    /// session: the interrupted turn ran in it and the session was kept. The
+    /// merged prompt then says that turn was interrupted rather than
+    /// restating the original request as if it were new. Defaults to `false`
+    /// (a fresh session, which needs the full restatement).
+    pub cancelled_turn_in_session: bool,
+    /// A turn in this live session was cancelled since the agent last heard
+    /// so, which also stopped every background subagent and task it started.
+    /// Renders a `<background-work-cancelled>` notice. Defaults to `false`.
+    pub background_work_cancelled: bool,
+    /// The harness autoposts this turn's response text as the reply
+    /// (`--stream draft+autopost`), so `<context>` names that delivery instead
+    /// of a `buzz messages send --reply-to` instruction. Defaults to `false`
+    /// (the agent replies with the CLI).
+    pub reply_autopost: bool,
 }
 
 /// The prompt sections that do not change for the life of a session: base
@@ -2186,7 +2313,6 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     // An edit routes through its original message: the edit's own bare `e`
     // tag is not a thread link, and the edit event is not a visible row.
     let thread_tags = last_event.routing_thread_tags();
-    let routing_event_id = last_event.routing_event_id();
     let is_dm = args
         .channel_info
         .map(|ci| ci.channel_type == "dm")
@@ -2213,26 +2339,21 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
         );
     }
 
-    // 2. Context hints (with a human-aware reply anchor).
-    //
-    // Human-facing turns are anchored so replies stay readable at layer 1:
-    //   - in a thread  → anchor to the thread ROOT (no depth-2 nesting)
-    //   - top-level     → anchor to the triggering event (it becomes the root)
-    // Agent↔agent turns get no forced anchor — deep nesting is intentional
-    // there. DMs are always 1:1 with a human, so they always anchor.
-    let sender_pubkey = last_event.event.pubkey.to_hex();
-    let reply_anchor = if is_dm {
-        thread_tags
-            .root_event_id
-            .is_some()
-            .then(|| routing_event_id.clone())
-    } else {
-        resolve_reply_anchor(
-            &sender_pubkey,
-            &thread_tags,
-            &routing_event_id,
-            args.profile_lookup,
-        )
+    // 2. Context hints (with a human-aware reply anchor; see
+    //    [`turn_reply_anchor`]).
+    let reply_anchor = turn_reply_anchor(last_event, is_dm, args.profile_lookup);
+    // An autoposted reply lands where the live reply stream targets: the same
+    // `turn_reply_thread` the pool hands `ReplyStream::start`.
+    let autopost_thread = args
+        .reply_autopost
+        .then(|| turn_reply_thread(batch, is_dm, args.profile_lookup));
+    let reply = match &autopost_thread {
+        Some(thread) => ReplyDelivery::Autopost {
+            parent: thread.as_ref().map(|(_, parent)| parent.as_str()),
+        },
+        None => ReplyDelivery::Cli {
+            anchor: reply_anchor.as_deref(),
+        },
     };
     sections.push(format_context_hints(
         &batch.scope,
@@ -2244,7 +2365,7 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
             args.conversation_context,
             args.conversation_context_had_session_events,
         ),
-        reply_anchor.as_deref(),
+        reply,
     ));
 
     // 3. Conversation context (thread or DM).
@@ -2259,7 +2380,10 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     //    - `Steer` (default): a message arrived while the agent was working; it
     //      should *continue* its work and weave the message in if relevant.
     let has_cancelled = !batch.cancelled_events.is_empty();
-    let framing = MergeFraming::for_reason(batch.cancel_reason);
+    let framing = MergeFraming::for_reason(batch.cancel_reason, args.cancelled_turn_in_session);
+    // A restored turn with nothing new merged in: its events are the
+    // interrupted turn itself.
+    let restart_only = !has_cancelled && batch.cancel_reason == Some(CancelReason::Restart);
 
     // 4a. Cancelled events section.
     if has_cancelled {
@@ -2281,12 +2405,18 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
         ));
     }
 
-    // 4b. Event block(s).
+    // 4b. Event block(s). A restart-only batch is the interrupted turn
+    // itself, so it carries the prior (interrupted) tag.
+    let framed_tag = if restart_only {
+        framing.prior_tag
+    } else {
+        framing.new_tag
+    };
     let event_section = if batch.events.len() == 1 {
         let be = &batch.events[0];
-        if has_cancelled {
+        if has_cancelled || restart_only {
             crate::prompt_framing::semantic_section(
-                framing.new_tag,
+                framed_tag,
                 &format!(
                     "--- Event 1 ({}) ---\n{}",
                     be.prompt_tag,
@@ -2320,8 +2450,8 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
         }
         let count = batch.events.len().to_string();
         crate::prompt_framing::semantic_section_with_attributes(
-            if has_cancelled {
-                framing.new_tag
+            if has_cancelled || restart_only {
+                framed_tag
             } else {
                 "buzz-events"
             },
@@ -2332,8 +2462,18 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     sections.push(event_section);
 
     // 4c. Closing note for cancel + re-prompt.
-    if has_cancelled {
+    if has_cancelled || restart_only {
         sections.push(framing.closing_note.to_string());
+    }
+
+    // 4d. A cancel in this session also stopped its background work. The
+    // session's history still shows those subagents being launched, so say
+    // plainly that they are gone.
+    if args.background_work_cancelled {
+        sections.push(crate::prompt_framing::semantic_section(
+            "background-work-cancelled",
+            BACKGROUND_WORK_CANCELLED_NOTE,
+        ));
     }
 
     sections
@@ -2354,22 +2494,55 @@ struct MergeFraming {
 }
 
 impl MergeFraming {
-    fn for_reason(reason: Option<CancelReason>) -> Self {
-        match reason {
+    /// `in_session`: the interrupted turn ran in the session receiving this
+    /// prompt, which kept it, so the agent still has that turn's context and
+    /// work. Otherwise the prompt goes to a fresh session that knows nothing
+    /// of the interrupted turn.
+    fn for_reason(reason: Option<CancelReason>, in_session: bool) -> Self {
+        match (reason, in_session) {
+            // The session holds the interrupted turn: name it as interrupted
+            // and point at the work already in context, rather than restating
+            // the request as a new task.
+            (None | Some(CancelReason::Steer), true) => MergeFraming {
+                prior_tag: "your-interrupted-turn-was-handling",
+                new_tag: "new-message-arrived-while-you-were-working",
+                closing_note: "Note: Your previous turn was interrupted because a new message \
+                     arrived. Your session still holds that turn and the work you did in it, so \
+                     continue from where you stopped instead of starting over. Incorporate the new \
+                     message if it's relevant; if it's unrelated, you may briefly acknowledge it \
+                     and carry on.",
+            },
+            (Some(CancelReason::Interrupt), true) => MergeFraming {
+                prior_tag: "your-interrupted-turn-was-handling",
+                new_tag: "new-request-supersedes-previous",
+                closing_note:
+                    "Note: Your previous turn was interrupted by a new request before it \
+                     finished; your session still holds that turn. Please address the new \
+                     request.\nIf the new request is unrelated to the previous one, you may \
+                     briefly acknowledge the interruption.",
+            },
             // Default to steer framing if a merge somehow lacks a reason: the
             // gentler "continue your work" wording is the safer fallback.
-            None | Some(CancelReason::Steer) => MergeFraming {
-                // We never capture the agent's partial work — session/cancel is
-                // terminal and returns nothing — so this section holds the
-                // *original request*, not a transcript. The header must not
-                // overclaim preserved state (per Dawn's framing review).
+            (None | Some(CancelReason::Steer), false) => MergeFraming {
+                // A fresh session never saw the interrupted turn, and the
+                // harness captures none of its partial work, so this section
+                // holds the *original request*, not a transcript. The header
+                // must not overclaim preserved state (per Dawn's framing
+                // review).
                 prior_tag: "what-you-were-working-on",
                 new_tag: "new-message-arrived-while-you-were-working",
                 closing_note: "Note: A new message arrived while you were working. Continue your \
                      in-progress work and incorporate the new message if it's relevant; if it's \
                      unrelated, you may briefly acknowledge it and carry on.",
             },
-            Some(CancelReason::Interrupt) => MergeFraming {
+            // A restored turn always runs in its resumed session, so
+            // `in_session` does not change the wording.
+            (Some(CancelReason::Restart), _) => MergeFraming {
+                prior_tag: "your-interrupted-turn-was-handling",
+                new_tag: "new-message-arrived-while-you-were-working",
+                closing_note: RESTART_CLOSING_NOTE,
+            },
+            (Some(CancelReason::Interrupt), false) => MergeFraming {
                 prior_tag: "previous-request-interrupted-before-completion",
                 new_tag: "new-request-supersedes-previous",
                 closing_note: "Note: The previous request was interrupted. Please address the new \
@@ -2380,9 +2553,23 @@ impl MergeFraming {
     }
 }
 
+/// Notice that a cancelled turn's background subagents and tasks are gone.
+pub(crate) const BACKGROUND_WORK_CANCELLED_NOTE: &str = "Your earlier turn in this session was \
+     cancelled, and the cancel also stopped every background subagent and background task that \
+     turn had started. None of them is still running, whatever your earlier tool output says. \
+     Do not tell anyone they are still running; if you still need their work, start them again.";
+
+/// Closing instruction for a turn restored after a harness restart.
+const RESTART_CLOSING_NOTE: &str = "Note: Your previous turn on this was interrupted because \
+     the harness restarted. This is the same session, so it should still hold that turn and the \
+     work you did in it: continue from where you stopped instead of starting over. The restart \
+     stopped every background subagent and background task you had started — none of them is \
+     still running; start them again if you still need their work. If a new message is \
+     included, incorporate it if it's relevant.";
+
 /// Framing strings for the goose-native steer path (lib.rs mode-gate),
 /// pulled from the same source-of-truth as the cancel+merge fallback
-/// (`MergeFraming::for_reason(Some(CancelReason::Steer))`).
+/// (`MergeFraming::for_reason(Some(CancelReason::Steer), false)`).
 ///
 /// Returns `(new_tag, closing_note)`. Native-steer renders only
 /// the new-message header + the single event block + the closing note —
@@ -2392,7 +2579,8 @@ impl MergeFraming {
 /// "weave it in, don't abandon your work" orientation (Eva's drift-proof
 /// requirement: native and fallback must not diverge in UX).
 pub(crate) fn native_steer_framing() -> (&'static str, &'static str) {
-    let framing = MergeFraming::for_reason(Some(CancelReason::Steer));
+    // The in-flight turn is still running, so there is no interrupted turn.
+    let framing = MergeFraming::for_reason(Some(CancelReason::Steer), false);
     (framing.new_tag, framing.closing_note)
 }
 
@@ -2958,7 +3146,7 @@ mod tests {
     fn test_format_prompt_interrupt_framing() {
         let batch = make_merged_batch(Some(CancelReason::Interrupt));
         let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
-        let framing = MergeFraming::for_reason(Some(CancelReason::Interrupt));
+        let framing = MergeFraming::for_reason(Some(CancelReason::Interrupt), false);
         let new_section_tag = format!("<{}>", framing.new_tag);
 
         // Interrupt framing: the new request supersedes the previous one.
@@ -2977,6 +3165,105 @@ mod tests {
         assert!(
             !prompt.contains("arrived while you were working"),
             "interrupt prompt must NOT use steer framing: {prompt}"
+        );
+    }
+
+    #[test]
+    fn test_format_prompt_kept_session_says_turn_was_interrupted() {
+        for reason in [
+            Some(CancelReason::Steer),
+            Some(CancelReason::Interrupt),
+            None,
+        ] {
+            let batch = make_merged_batch(reason);
+            let render = |in_session| {
+                format_prompt(
+                    &batch,
+                    &FormatPromptArgs {
+                        cancelled_turn_in_session: in_session,
+                        ..Default::default()
+                    },
+                )
+                .join("\n\n")
+            };
+
+            let kept = render(true);
+            assert!(
+                kept.contains("<your-interrupted-turn-was-handling>"),
+                "{reason:?}: kept session labels the prior section as its interrupted turn: {kept}"
+            );
+            assert!(
+                kept.contains("Your previous turn was interrupted")
+                    && kept
+                        .to_lowercase()
+                        .contains("your session still holds that turn"),
+                "{reason:?}: kept session says the turn was interrupted and is still held: {kept}"
+            );
+            assert!(
+                !kept.contains("<what-you-were-working-on>")
+                    && !kept.contains("<previous-request-interrupted-before-completion>"),
+                "{reason:?}: kept session must not restate the request as fresh: {kept}"
+            );
+            assert!(kept.contains("the new message"), "{reason:?}: {kept}");
+
+            let fresh = render(false);
+            assert!(
+                !fresh.contains("<your-interrupted-turn-was-handling>")
+                    && !fresh.contains("Your previous turn was interrupted"),
+                "{reason:?}: a fresh session keeps the restating framing: {fresh}"
+            );
+        }
+    }
+
+    /// The background-work notice renders only when a cancel stopped it.
+    #[test]
+    fn test_format_prompt_background_work_cancelled_notice() {
+        let batch = make_merged_batch(Some(CancelReason::Steer));
+        let render = |cancelled| {
+            format_prompt(
+                &batch,
+                &FormatPromptArgs {
+                    background_work_cancelled: cancelled,
+                    ..Default::default()
+                },
+            )
+            .join("\n\n")
+        };
+        let with = render(true);
+        assert!(
+            with.contains("<background-work-cancelled>")
+                && with.contains("stopped every background subagent")
+                && with.contains("start them again"),
+            "{with}"
+        );
+        assert!(!render(false).contains("<background-work-cancelled>"));
+    }
+
+    /// A turn restored after a restart says it was interrupted by the restart
+    /// and to continue, whether it is re-run alone or merged with a message
+    /// that arrived meanwhile.
+    #[test]
+    fn test_format_prompt_restart_framing() {
+        let mut alone = make_merged_batch(Some(CancelReason::Restart));
+        alone.events = std::mem::take(&mut alone.cancelled_events);
+        let alone = format_prompt(&alone, &FormatPromptArgs::default()).join("\n\n");
+        assert!(
+            alone.contains("<your-interrupted-turn-was-handling>")
+                && alone.contains("the original task")
+                && alone.contains("the harness restarted")
+                && alone.contains("continue from where you stopped"),
+            "a restored turn re-run alone: {alone}"
+        );
+        assert!(!alone.contains("<buzz-event"), "{alone}");
+
+        let merged = make_merged_batch(Some(CancelReason::Restart));
+        let merged = format_prompt(&merged, &FormatPromptArgs::default()).join("\n\n");
+        assert!(
+            merged.contains("<your-interrupted-turn-was-handling>")
+                && merged.contains("<new-message-arrived-while-you-were-working>")
+                && merged.contains("the harness restarted")
+                && merged.contains("the new message"),
+            "a restored turn merged with a new message: {merged}"
         );
     }
 
@@ -6622,7 +6909,7 @@ mod tests {
         assert_eq!(merged.cancelled_events[0].edit, Some(resolved));
 
         let prompt = format_prompt(&merged, &FormatPromptArgs::default()).join("\n");
-        let framing = MergeFraming::for_reason(Some(CancelReason::Interrupt));
+        let framing = MergeFraming::for_reason(Some(CancelReason::Interrupt), false);
         let prior = prompt
             .find(&format!("<{}>", framing.prior_tag))
             .expect("interrupted edit is labelled as prior work");
@@ -7133,5 +7420,180 @@ mod tests {
             !prompt.contains("Description:"),
             "unresolved metadata must not render a Description field; got: {prompt}"
         );
+    }
+
+    #[test]
+    fn turn_reply_thread_matches_the_reply_instruction_destination() {
+        let root = "a".repeat(64);
+        let parent = "b".repeat(64);
+        let ch = Uuid::new_v4();
+        let batch_of = |event: Event| FlushBatch {
+            channel_id: ch,
+            scope: conv(ch),
+            events: vec![BatchEvent {
+                edit: None,
+                event,
+                prompt_tag: "@mention".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let nested = || {
+            make_event_with_tags(
+                "nested",
+                vec![
+                    vec!["e".into(), root.clone(), "".into(), "root".into()],
+                    vec!["e".into(), parent.clone(), "".into(), "reply".into()],
+                ],
+            )
+        };
+        let top = || make_event_with_tags("top", vec![]);
+        let agent_lookup = |event: &Event| -> PromptProfileLookup {
+            HashMap::from([(
+                event.pubkey.to_hex(),
+                PromptProfile {
+                    display_name: Some("Peer Agent".into()),
+                    nip05_handle: None,
+                    is_agent: true,
+                },
+            )])
+        };
+
+        // Human in a thread → flat reply to the thread root (`--reply-to root`).
+        let b = batch_of(nested());
+        assert_eq!(
+            turn_reply_thread(&b, false, None),
+            Some((root.clone(), root.clone()))
+        );
+        let prompt = format_prompt(&b, &FormatPromptArgs::default()).join("\n");
+        assert!(prompt.contains(&format!("--reply-to {root}")));
+
+        // Human top-level mention → new thread rooted at the trigger.
+        let event = top();
+        let trigger = event.id.to_hex();
+        let b = batch_of(event);
+        assert_eq!(
+            turn_reply_thread(&b, false, None),
+            Some((trigger.clone(), trigger.clone()))
+        );
+
+        // Agent↔agent in a thread → nested reply to the trigger itself.
+        let event = nested();
+        let trigger = event.id.to_hex();
+        let lookup = agent_lookup(&event);
+        let b = batch_of(event);
+        assert_eq!(
+            turn_reply_thread(&b, false, Some(&lookup)),
+            Some((root.clone(), trigger))
+        );
+
+        // Agent↔agent top-level → thread on the trigger.
+        let event = top();
+        let trigger = event.id.to_hex();
+        let lookup = agent_lookup(&event);
+        let b = batch_of(event);
+        assert_eq!(
+            turn_reply_thread(&b, false, Some(&lookup)),
+            Some((trigger.clone(), trigger))
+        );
+
+        // DM top-level → top-level DM reply; DM thread → reply to the trigger.
+        assert_eq!(turn_reply_thread(&batch_of(top()), true, None), None);
+        let event = nested();
+        let trigger = event.id.to_hex();
+        assert_eq!(
+            turn_reply_thread(&batch_of(event), true, None),
+            Some((root.clone(), trigger))
+        );
+    }
+
+    #[test]
+    fn autopost_context_names_automatic_delivery_instead_of_a_cli_reply() {
+        let root = "a".repeat(64);
+        let ch = Uuid::new_v4();
+        let batch_of = |event: Event| FlushBatch {
+            channel_id: ch,
+            scope: conv(ch),
+            events: vec![BatchEvent {
+                edit: None,
+                event,
+                prompt_tag: "@mention".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let in_thread = || {
+            make_event_with_tags(
+                "in thread",
+                vec![
+                    vec!["e".into(), root.clone(), "".into(), "root".into()],
+                    vec!["e".into(), "b".repeat(64), "".into(), "reply".into()],
+                ],
+            )
+        };
+        let dm = PromptChannelInfo {
+            name: "dm".into(),
+            channel_type: "dm".into(),
+            description: None,
+            project: None,
+        };
+        let render = |batch: &FlushBatch, channel_info, reply_autopost| {
+            format_prompt(
+                batch,
+                &FormatPromptArgs {
+                    channel_info,
+                    reply_autopost,
+                    ..Default::default()
+                },
+            )
+            .join("\n")
+        };
+        let autopost_line = |destination: &str| {
+            format!(
+                "IMPORTANT: Your response text is delivered automatically {destination}. \
+                 Do not send that reply with `buzz messages send`; a message you send to \
+                 the same destination during the turn replaces it. Use `--reply-to` only \
+                 for additional messages to another thread. If the human explicitly asks \
+                 for a channel-root, top-level, or broadcast post, send that message \
+                 without `--reply-to`."
+            )
+        };
+        const CLI_REPLY: &str = "on `buzz messages send`";
+
+        // Human in a thread: the CLI anchor and the autopost target agree.
+        let b = batch_of(in_thread());
+        let cli = render(&b, None, false);
+        assert!(
+            cli.contains(&format!("use `--reply-to {root}` {CLI_REPLY}")),
+            "{cli}"
+        );
+        let autopost = render(&b, None, true);
+        assert!(!autopost.contains(CLI_REPLY), "{autopost}");
+        assert!(autopost.contains(&autopost_line(&format!("as your reply to `{root}`"))));
+
+        // Human top-level channel mention: the reply opens a thread on the trigger.
+        let event = make_event_with_tags("top", vec![]);
+        let trigger = event.id.to_hex();
+        let b = batch_of(event);
+        assert!(render(&b, None, false).contains(&format!("`--reply-to {trigger}` {CLI_REPLY}")));
+        let autopost = render(&b, None, true);
+        assert!(!autopost.contains(CLI_REPLY), "{autopost}");
+        assert!(autopost.contains(&autopost_line(&format!("as your reply to `{trigger}`"))));
+
+        // Top-level DM: no CLI anchor, but the autopost still has a destination.
+        let b = batch_of(make_event_with_tags("dm", vec![]));
+        assert!(!render(&b, Some(&dm), false).contains("IMPORTANT:"));
+        assert!(render(&b, Some(&dm), true).contains(&autopost_line("as your reply in this DM")));
+
+        // DM thread reply: the trigger itself is the parent.
+        let event = in_thread();
+        let trigger = event.id.to_hex();
+        let b = batch_of(event);
+        assert!(render(&b, Some(&dm), false).contains(&format!("--reply-to {trigger}")));
+        let autopost = render(&b, Some(&dm), true);
+        assert!(!autopost.contains(CLI_REPLY), "{autopost}");
+        assert!(autopost.contains(&autopost_line(&format!("as your reply to `{trigger}`"))));
     }
 }

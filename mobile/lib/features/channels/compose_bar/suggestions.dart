@@ -1,11 +1,12 @@
 part of '../compose_bar.dart';
 
 class _MentionSuggestions extends StatelessWidget {
-  final List<MentionCandidate> suggestions;
+  final List<MentionSuggestionEntry> suggestions;
   final Map<String, UserProfile> userCache;
   final String? currentPubkey;
   final bool isDmChannel;
   final void Function(MentionCandidate) onSelect;
+  final VoidCallback onSelectGroup;
 
   const _MentionSuggestions({
     required this.suggestions,
@@ -13,6 +14,7 @@ class _MentionSuggestions extends StatelessWidget {
     required this.currentPubkey,
     required this.isDmChannel,
     required this.onSelect,
+    required this.onSelectGroup,
   });
 
   @override
@@ -34,7 +36,16 @@ class _MentionSuggestions extends StatelessWidget {
           itemCount: suggestions.length,
           separatorBuilder: (_, _) => const SizedBox.shrink(),
           itemBuilder: (context, index) {
-            final candidate = suggestions[index];
+            final MentionCandidate candidate;
+            switch (suggestions[index]) {
+              case final GroupMentionSuggestion group:
+                return _GroupMentionSuggestionTile(
+                  entry: group,
+                  onSelect: onSelectGroup,
+                );
+              case IdentityMentionSuggestion(candidate: final identity):
+                candidate = identity;
+            }
             final name = candidate.pickerLabel;
             final avatarUrl =
                 candidate.avatarUrl ?? userCache[candidate.pubkey]?.avatarUrl;

@@ -1,3 +1,8 @@
+import {
+  containsMentionAllToken,
+  hasMentionAllMarker,
+  MENTION_GROUP_ALL,
+} from "./mentionGroup";
 import { mentionOccurrences } from "./mentionOccurrences";
 import type { UserProfileSummary } from "@/shared/api/types";
 
@@ -68,6 +73,11 @@ export type ResolvedMentionProps = {
   /** All literal competitors, including ambiguous aliases without a binding. */
   mentionNames: string[] | undefined;
   mentionPubkeysByName: Record<string, string> | undefined;
+  /**
+   * The event carries the `@all` marker and its body owns an `@all` token, so
+   * renderers show that token as one group pill instead of plain text.
+   */
+  mentionAll: boolean;
 };
 
 /**
@@ -160,9 +170,23 @@ export function resolveMentionProps(
     if (keys.length === 1) pubkeysByName[label] = keys[0];
   }
 
+  // The marker records that the sender resolved `@all` as the group, so it
+  // outranks a member alias that happens to be "all". Without the marker the
+  // text is never promoted, whatever other clients put in the body.
+  const mentionAll =
+    hasMentionAllMarker(tags) && containsMentionAllToken(content, [...names]);
+  if (mentionAll) {
+    for (const name of [...names]) {
+      if (name.toLowerCase() === MENTION_GROUP_ALL) names.delete(name);
+    }
+    delete pubkeysByName[MENTION_GROUP_ALL];
+    names.add(MENTION_GROUP_ALL);
+  }
+
   return {
     mentionNames: names.size > 0 ? [...names] : undefined,
     mentionPubkeysByName: names.size > 0 ? pubkeysByName : undefined,
+    mentionAll,
   };
 }
 

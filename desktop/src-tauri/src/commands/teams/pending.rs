@@ -72,9 +72,10 @@ fn retained_team_is_shared(row: Option<&RetainedEvent>) -> bool {
 pub(super) fn project_active_team_sharing(
     app: &AppHandle,
     state: &AppState,
+    community_relay: &str,
     teams: &mut [TeamRecord],
 ) {
-    let scope = crate::managed_agents::retention::active_retention_scope(app, state);
+    let scope = crate::managed_agents::retention::retention_scope_for(app, state, community_relay);
     project_scoped_team_sharing(scope, teams);
 }
 
@@ -126,11 +127,12 @@ fn project_team_sharing_at(
 pub(super) fn prepare_team_publication(
     app: &AppHandle,
     state: &AppState,
+    community_relay: &str,
     team: &TeamRecord,
     members: &[AgentDefinition],
     shared_override: Option<bool>,
 ) -> Result<PreparedTeamPublication, String> {
-    let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+    let scope = crate::managed_agents::retention::retention_scope_for(app, state, community_relay)?;
     let (_event, retained, team) = prepare_team_publication_at(
         &scope.db_path,
         &scope.owner_keys,
@@ -200,10 +202,12 @@ pub(super) fn prepare_team_publication_at(
 pub(super) fn tombstone_team_catalog_pending<R: tauri::Runtime>(
     app: &AppHandle<R>,
     state: &AppState,
+    community_relay: &str,
     d_tag: &str,
 ) {
     let result = (|| -> Result<(), String> {
-        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+        let scope =
+            crate::managed_agents::retention::retention_scope_for(app, state, community_relay)?;
         tombstone_team_catalog_at(&scope.db_path, &scope.owner_keys, d_tag)
     })();
     if let Err(e) = result {
@@ -231,11 +235,13 @@ pub(super) fn tombstone_team_catalog_at(
 pub(super) fn refresh_shared_team_catalog_head_resolving<R: tauri::Runtime>(
     app: &AppHandle<R>,
     state: &AppState,
+    community_relay: &str,
     team: &TeamRecord,
     personas: &[AgentDefinition],
 ) {
     let result = (|| -> Result<RefreshOrRetractOutcome, String> {
-        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+        let scope =
+            crate::managed_agents::retention::retention_scope_for(app, state, community_relay)?;
         resolve_and_refresh_or_retract_at(&scope.db_path, &scope.owner_keys, team, personas)
     })();
     match result {
@@ -392,6 +398,7 @@ pub(super) fn refresh_or_retract_shared_head_at(
 pub(super) fn refresh_shared_team_catalog_heads_for_persona<R: tauri::Runtime>(
     app: &AppHandle<R>,
     state: &AppState,
+    community_relay: &str,
     persona_id: &str,
 ) {
     let result = (|| -> Result<(), String> {
@@ -399,7 +406,8 @@ pub(super) fn refresh_shared_team_catalog_heads_for_persona<R: tauri::Runtime>(
 
         let teams = load_teams(app)?;
         let personas = load_personas(app)?;
-        let scope = crate::managed_agents::retention::active_retention_scope(app, state)?;
+        let scope =
+            crate::managed_agents::retention::retention_scope_for(app, state, community_relay)?;
 
         for team in &teams {
             if team.is_builtin || !team.persona_ids.iter().any(|id| id == persona_id) {
@@ -488,7 +496,8 @@ fn emit_team_catalog_auto_retracted<R: tauri::Runtime>(
         reason: &'a str,
     }
 
-    if let Err(e) = app.emit(
+    if let Err(e) = app.emit_to(
+        crate::popout::MAIN_WINDOW_LABEL,
         "team-catalog-auto-retracted",
         TeamCatalogAutoRetractedPayload { team_name, reason },
     ) {

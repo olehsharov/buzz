@@ -152,6 +152,9 @@ pub struct CreateManagedAgentRequest {
     /// Optional deployment-time team binding for runtime instruction layering.
     #[serde(default)]
     pub team_id: Option<String>,
+    /// The caller's captured active community relay. The agent always
+    /// belongs to the active community; a mismatch (a community switch
+    /// mid-create) refuses the create. `None` skips the check.
     pub relay_url: Option<String>,
     pub acp_command: Option<String>,
     pub agent_command: Option<String>,
@@ -212,7 +215,7 @@ pub struct CreateManagedAgentRequest {
 /// - Field absent in JSON → `None` (don't touch)
 /// - `"field": null` → `Some(None)` (clear to default)
 /// - `"field": "value"` → `Some(Some("value"))` (set)
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateManagedAgentRequest {
     pub pubkey: String,
@@ -236,6 +239,9 @@ pub struct UpdateManagedAgentRequest {
     #[allow(dead_code)]
     #[serde(default)]
     pub turn_timeout_seconds: Option<u64>,
+    /// Accepted for wire compatibility; not applied. An agent's community is
+    /// fixed when it is created (see `community_scope`).
+    #[allow(dead_code)]
     #[serde(default)]
     pub relay_url: Option<String>,
     #[serde(default)]

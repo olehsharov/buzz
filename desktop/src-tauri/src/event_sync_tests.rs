@@ -497,3 +497,39 @@ fn deletion_reconcile_leaves_managed_agent_head_untouched() {
         "no kind:9035 archive may be enqueued for a device-local-absent agent"
     );
 }
+
+#[test]
+fn migrate_personas_retains_only_the_scopes_own_community_definitions() {
+    use crate::managed_agents::retention::{get_retained_personas, open_retention_db};
+
+    // Definitions live in the unified store and carry their community.
+    let base = tempfile::tempdir().unwrap();
+    let definition = |slug: &str, relay: &str| {
+        serde_json::json!({
+            "pubkey": "", "name": slug, "slug": slug, "display_name": slug,
+            "relay_url": relay, "acp_command": "buzz-acp", "agent_command": "",
+            "agent_args": [], "mcp_command": "", "turn_timeout_seconds": 320,
+            "system_prompt": "prompt", "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:00:00Z"
+        })
+    };
+    std::fs::write(
+        base.path().join("managed-agents.json"),
+        serde_json::to_vec_pretty(&serde_json::json!([
+            definition("own", "wss://one.example"),
+            definition("foreign", "wss://two.example"),
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    let keys = nostr::Keys::generate();
+    let db = base.path().join("scope-one.db");
+
+    let migrated =
+        migrate_personas_in_dir_at(base.path(), &keys, &db, Some("wss://one.example")).unwrap();
+    assert_eq!(migrated, 1);
+    let conn = open_retention_db(&db).unwrap();
+    let rows = get_retained_personas(&conn, &keys.public_key().to_hex()).unwrap();
+    let tags: Vec<_> = rows.iter().map(|row| row.d_tag.as_str()).collect();
+    assert_eq!(tags, ["own"]);
+}

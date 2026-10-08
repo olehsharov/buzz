@@ -63,7 +63,11 @@ fn arm_cap_timer(
     let timer_task = tauri::async_runtime::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(INACTIVITY_CAP_SECONDS)).await;
         if expire_if_current(&timer_state, generation) {
-            let _ = handle.emit("prevent-sleep-expired", ());
+            let _ = handle.emit_to(
+                crate::popout::MAIN_WINDOW_LABEL,
+                "prevent-sleep-expired",
+                (),
+            );
         }
     });
     guard.timer_handle = Some(timer_task);

@@ -200,7 +200,7 @@ export function useMembersSidebarActions({
           clearActiveTurnsForAgentOnStop(agent.pubkey);
         }
         setActionNoticeMessage(
-          agent.backend.type === "provider"
+          agent.backend.type !== "local"
             ? `Shutdown command sent to ${agent.name}.`
             : `Stopped ${agent.name}.`,
         );
@@ -343,7 +343,7 @@ export function useMembersSidebarActions({
 }
 
 function getLifecycleSuccessMessage(agent: ManagedAgent) {
-  if (agent.backend.type === "provider") {
+  if (agent.backend.type !== "local") {
     return `Deployed ${agent.name}.`;
   }
 

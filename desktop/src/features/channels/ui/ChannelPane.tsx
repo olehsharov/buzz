@@ -71,6 +71,7 @@ import { isWelcomeExperienceChannel as isWelcomeExperience } from "@/features/on
 import { useIsThreadPanelOverlay } from "@/shared/hooks/use-mobile";
 import { channelChrome } from "@/shared/layout/chromeLayout";
 import { cn } from "@/shared/lib/cn";
+import { selectStreamDraftsForScope } from "@/features/messages/lib/streamDrafts";
 const HUDDLE_TRANSCRIPT_ROOT_STYLE = {
   "--buzz-channel-content-top-padding": "0rem",
   "--channel-top-chrome-height": "0.25rem",
@@ -185,7 +186,19 @@ export const ChannelPane = React.memo(function ChannelPane({
   threadReplyUnreadCounts,
   threadFirstUnreadReplyId,
   typingPubkeys,
+  streamDrafts,
 }: ChannelPaneProps) {
+  const threadHeadId = threadHeadMessage?.id ?? null;
+  const { root: rootStreamDrafts, thread: threadStreamDrafts } = React.useMemo(
+    () => ({
+      root: streamDrafts && selectStreamDraftsForScope(streamDrafts, null),
+      thread:
+        streamDrafts && threadHeadId
+          ? selectStreamDraftsForScope(streamDrafts, threadHeadId)
+          : undefined,
+    }),
+    [streamDrafts, threadHeadId],
+  );
   const timelineScrollRef = React.useRef<HTMLDivElement>(null);
   const messageTimelineRef = React.useRef<MessageTimelineHandle>(null);
   const composerWrapperRef = React.useRef<HTMLDivElement>(null);
@@ -693,6 +706,7 @@ export const ChannelPane = React.memo(function ChannelPane({
                 Boolean(openThreadHeadId)
               }
               threadUnreadCounts={threadUnreadCounts}
+              streamDrafts={rootStreamDrafts}
             />
             {isNonMemberView ? (
               <div
@@ -889,6 +903,7 @@ export const ChannelPane = React.memo(function ChannelPane({
                 )}
                 threadReplyUnreadCounts={threadReplyUnreadCounts}
                 threadTypingPubkeys={threadTypingPubkeys}
+                streamDrafts={threadStreamDrafts}
                 activityAccessoryVisible={hasThreadComposerBotActivity}
                 activityAccessoryContent={
                   hasThreadComposerBotActivity ? (

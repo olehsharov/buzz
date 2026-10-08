@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { validateLinkedAgentRuntimeEdit } from "./UserProfilePanelPersonaSubmit.ts";
+import {
+  submitProfilePersonaDialog,
+  validateLinkedAgentRuntimeEdit,
+} from "./UserProfilePanelPersonaSubmit.ts";
 
 function agent(overrides = {}) {
   return {
@@ -134,4 +137,38 @@ test("validateLinkedAgentRuntimeEdit allows unchanged or unlinked runtime prefer
     }),
     null,
   );
+});
+
+test("submitProfilePersonaDialog starts a duplicated definition where the dialog chose", async () => {
+  const backendIntent = {
+    type: "provider",
+    id: "ssh-host",
+    config: { host: "ssh-host" },
+  };
+  const persona = { id: "persona-2", displayName: "Fizz copy" };
+  const calls = [];
+  let done = false;
+
+  await submitProfilePersonaDialog({
+    backendIntent,
+    createManagedAgentForPersona: async (...args) => {
+      calls.push(args);
+      return { agent: agent(), spawnError: null, profileSyncError: null };
+    },
+    createPersona: async () => persona,
+    input: { displayName: "Fizz copy" },
+    managedAgent: undefined,
+    onDone: () => {
+      done = true;
+    },
+    updateManagedAgent: async () => {
+      throw new Error("create must not update an instance");
+    },
+    updatePersona: async () => {
+      throw new Error("create must not update a definition");
+    },
+  });
+
+  assert.deepEqual(calls, [[persona, backendIntent]]);
+  assert.equal(done, true);
 });

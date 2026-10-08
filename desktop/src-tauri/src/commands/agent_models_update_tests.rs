@@ -22,17 +22,42 @@ fn provider_record(deployed: bool) -> ManagedAgentRecord {
     record
 }
 
+// The access edit's runtime plan (`plan_access_runtime_transition`) and the
+// redeploy it triggers are covered in `agents/access_transition_tests.rs`.
 #[test]
-fn deployed_provider_rejects_access_edits_that_cannot_be_revoked() {
-    let error = ensure_access_policy_change_supported(&provider_record(true), true)
-        .expect_err("deployed provider access edit must fail closed");
-    assert!(error.contains("no explicit stop or revocation acknowledgement"));
+fn deployed_provider_access_edit_is_saved_pending_and_redeployed() {
+    let mut record = provider_record(true);
+    let transition = plan_access_runtime_transition(
+        &mut record,
+        true,
+        &std::collections::HashMap::<crate::managed_agents::ManagedAgentRuntimeKey, ()>::new(),
+        "wss://window.example",
+    );
+    assert!(matches!(transition, AccessRuntimeTransition::Redeploy(_)));
+    assert!(record.provider_policy_pending);
 }
 
 #[test]
-fn undeployed_provider_accepts_access_edits() {
-    ensure_access_policy_change_supported(&provider_record(false), true)
-        .expect("no running provider deployment can retain stale access");
+fn access_precondition_matches_only_the_stored_policy() {
+    use crate::managed_agents::RespondTo;
+    let mut record = provider_record(false);
+    assert!(record_has_access_policy(&record, RespondTo::OwnerOnly, &[]));
+    assert!(!record_has_access_policy(&record, RespondTo::Anyone, &[]));
+
+    // The stored allowlist is ignored outside allowlist mode, as the gate does.
+    record.respond_to_allowlist = vec!["a".repeat(64)];
+    assert!(record_has_access_policy(&record, RespondTo::OwnerOnly, &[]));
+    record.respond_to = RespondTo::Allowlist;
+    assert!(record_has_access_policy(
+        &record,
+        RespondTo::Allowlist,
+        &["a".repeat(64)]
+    ));
+    assert!(!record_has_access_policy(
+        &record,
+        RespondTo::Allowlist,
+        &["b".repeat(64)]
+    ));
 }
 
 fn local_record() -> ManagedAgentRecord {

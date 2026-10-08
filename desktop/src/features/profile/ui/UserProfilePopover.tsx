@@ -1,4 +1,7 @@
 import * as React from "react";
+import type { PopoutDestination } from "@/features/popout/popoutRoute";
+import { NewWindowContextMenu } from "@/features/popout/ui/NewWindowContextMenu";
+import { useNewWindowGestures } from "@/features/popout/useOpenInNewWindow";
 import { Activity, Headphones, MessageSquare } from "lucide-react";
 
 import { AgentManagementMarker } from "@/features/agents/ui/OtherSetupAgentMarker";
@@ -151,6 +154,10 @@ export function UserProfilePopover({
   );
   const { openProfilePanel } = useProfilePanel();
   const canOpenProfilePanel = enableProfilePanel && Boolean(openProfilePanel);
+  const newWindowDestination: PopoutDestination | null = canOpenProfilePanel
+    ? { kind: "profile", pubkey }
+    : null;
+  const newWindow = useNewWindowGestures(newWindowDestination);
 
   const clearHoverTimer = React.useCallback(() => {
     if (hoverTimerRef.current !== null) {
@@ -183,6 +190,10 @@ export function UserProfilePopover({
   const handleTriggerClick = React.useCallback(
     (event: React.MouseEvent) => {
       clearHoverTimer();
+      if (newWindow.handleClick(event)) {
+        setOpen(false);
+        return;
+      }
       if (canOpenProfilePanel && openProfilePanel) {
         event.preventDefault();
         event.stopPropagation();
@@ -190,7 +201,7 @@ export function UserProfilePopover({
         openProfilePanel(pubkey);
       }
     },
-    [canOpenProfilePanel, clearHoverTimer, openProfilePanel, pubkey],
+    [canOpenProfilePanel, clearHoverTimer, newWindow, openProfilePanel, pubkey],
   );
 
   React.useEffect(() => {
@@ -200,37 +211,45 @@ export function UserProfilePopover({
   const TriggerElement = triggerElement;
   return (
     <Popover onOpenChange={setOpen} open={open}>
-      <PopoverAnchor asChild>
-        <TriggerElement
-          aria-label={triggerAriaLabel}
-          data-testid={triggerTestId}
-          role={canOpenProfilePanel ? "button" : undefined}
-          tabIndex={canOpenProfilePanel ? 0 : undefined}
-          onClick={handleTriggerClick}
-          onKeyDown={(e) => {
-            if (
-              (e.key === "Enter" || e.key === " ") &&
-              canOpenProfilePanel &&
-              openProfilePanel
-            ) {
-              e.preventDefault();
-              e.stopPropagation();
-              clearHoverTimer();
-              setOpen(false);
-              openProfilePanel(pubkey);
-            }
-          }}
-          onMouseEnter={handleTriggerMouseEnter}
-          onMouseLeave={handleMouseLeave}
-          className={cn(
-            "inline-flex",
-            triggerClassName,
-            canOpenProfilePanel && "cursor-pointer [&_*]:cursor-pointer",
-          )}
-        >
-          {children}
-        </TriggerElement>
-      </PopoverAnchor>
+      <NewWindowContextMenu destination={newWindowDestination}>
+        <PopoverAnchor asChild>
+          <TriggerElement
+            aria-label={triggerAriaLabel}
+            data-testid={triggerTestId}
+            role={canOpenProfilePanel ? "button" : undefined}
+            tabIndex={canOpenProfilePanel ? 0 : undefined}
+            onClick={handleTriggerClick}
+            {...newWindow.pointerProps}
+            onKeyDown={(e) => {
+              if (newWindow.handleKeyDown(e)) {
+                clearHoverTimer();
+                setOpen(false);
+                return;
+              }
+              if (
+                (e.key === "Enter" || e.key === " ") &&
+                canOpenProfilePanel &&
+                openProfilePanel
+              ) {
+                e.preventDefault();
+                e.stopPropagation();
+                clearHoverTimer();
+                setOpen(false);
+                openProfilePanel(pubkey);
+              }
+            }}
+            onMouseEnter={handleTriggerMouseEnter}
+            onMouseLeave={handleMouseLeave}
+            className={cn(
+              "inline-flex",
+              triggerClassName,
+              canOpenProfilePanel && "cursor-pointer [&_*]:cursor-pointer",
+            )}
+          >
+            {children}
+          </TriggerElement>
+        </PopoverAnchor>
+      </NewWindowContextMenu>
       {open ? (
         <UserProfilePopoverBody
           botIdenticonValue={botIdenticonValue}

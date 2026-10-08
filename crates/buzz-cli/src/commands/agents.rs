@@ -15,6 +15,14 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
             channel,
             display_name,
             system_prompt,
+            runtime,
+            model,
+            respond_to,
+            env,
+            avatar_emoji,
+            avatar_color,
+            run_on,
+            provider_config,
         } => {
             let owner = require_owner(client)?;
             let built = build_create(
@@ -24,6 +32,14 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
                     channel_id: channel,
                     display_name,
                     system_prompt: read_or_stdin(&system_prompt)?,
+                    runtime,
+                    model,
+                    respond_to,
+                    env_vars: env,
+                    avatar_emoji,
+                    avatar_color,
+                    run_on,
+                    provider_config,
                 },
             )?;
             let response = client.publish_ephemeral_event(built.event).await?;

@@ -15,6 +15,7 @@ pub(crate) mod admission_test_support;
 mod backend;
 pub(crate) mod bestie_assignment;
 pub(crate) mod claude_config;
+pub(crate) mod community_scope;
 pub(crate) mod config_bridge;
 pub(crate) mod custom_harnesses;
 mod definition_validation;
@@ -86,8 +87,9 @@ pub use env_vars::*;
 pub(crate) use git_bash::git_bash_available;
 pub(crate) use git_bash::{discover_git_bash, GitBashPrerequisite};
 pub(crate) use global_config::{
-    load_global_agent_config, resolve_effective_model_provider, save_global_agent_config,
-    validate_global_config, GlobalAgentConfig,
+    load_agent_defaults_for_agent, load_agent_defaults_for_record, load_agent_defaults_for_relay,
+    load_community_agent_defaults, resolve_effective_model_provider, save_agent_defaults_for_relay,
+    validate_global_config, CommunityAgentDefaults, GlobalAgentConfig,
 };
 pub(crate) use managed_node_paths::*;
 pub use nest::*;

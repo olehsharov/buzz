@@ -126,6 +126,7 @@ fn inbound_catalog_head_retains_arrival_witness_through_the_production_reconcile
     let refresh = reconcile_inbound_persona_event_blocking(
         event.as_json(),
         RELAY.to_string(),
+        RELAY.to_string(),
         app.handle().clone(),
     )
     .expect("reconcile of a signed 30178 head must succeed");

@@ -11,6 +11,11 @@ import * as React from "react";
 export type MentionRevalidationOptions = {
   phase?: "prepare" | "publish";
   intendedAgentPubkeys?: readonly string[];
+  /**
+   * Drop agents the sender may not mention instead of failing the send. Used
+   * by `@all`, which addresses only the eligible agents of a channel.
+   */
+  skipIneligibleAgents?: boolean;
 };
 
 export class AgentMentionAuthorizationError extends Error {
@@ -22,21 +27,20 @@ export class AgentMentionAuthorizationError extends Error {
   }
 }
 
+/** The agent directories could not prove which agents may be mentioned. */
+export class AgentMentionDirectoryError extends Error {
+  constructor() {
+    super("Could not load the agent directories to check mention access.");
+    this.name = "AgentMentionDirectoryError";
+  }
+}
+
 type DirectoryResult<T> = {
   data: T | undefined;
   error: Error | null;
 };
 
-export async function revalidateAgentMentionPubkeys({
-  pubkeys,
-  agentPubkeys,
-  currentPubkey,
-  eligibilityScope,
-  sharedChannelIds,
-  refetchManagedAgents,
-  fetchRelayAgents,
-  phase = "publish",
-}: {
+type AgentMentionAdmissionInput = {
   phase?: "prepare" | "publish";
   pubkeys: readonly string[];
   agentPubkeys: ReadonlySet<string>;
@@ -45,12 +49,57 @@ export async function revalidateAgentMentionPubkeys({
   sharedChannelIds: ReadonlySet<string>;
   refetchManagedAgents: () => Promise<DirectoryResult<ManagedAgent[]>>;
   fetchRelayAgents: (pubkeys: string[]) => Promise<RelayAgent[]>;
-}) {
+};
+
+export async function revalidateAgentMentionPubkeys(
+  input: AgentMentionAdmissionInput,
+) {
+  const { requested, admitted } = await admitAgentMentionPubkeys(input);
+  if ([...requested].some((pubkey) => !admitted.has(pubkey))) {
+    throw new AgentMentionAuthorizationError();
+  }
+  return [...input.pubkeys];
+}
+
+/**
+ * Like {@link revalidateAgentMentionPubkeys}, but drops agents the sender may
+ * not mention instead of failing. Fails closed with
+ * {@link AgentMentionDirectoryError} only when an agent is dropped while a
+ * directory that could have admitted it was unavailable.
+ */
+export async function filterEligibleAgentMentionPubkeys(
+  input: AgentMentionAdmissionInput,
+) {
+  const { requested, admitted, directoriesLoaded } =
+    await admitAgentMentionPubkeys(input);
+  const dropped = [...requested].filter((pubkey) => !admitted.has(pubkey));
+  if (dropped.length > 0 && !directoriesLoaded) {
+    throw new AgentMentionDirectoryError();
+  }
+  return input.pubkeys.filter(
+    (pubkey) => !dropped.includes(normalizePubkey(pubkey)),
+  );
+}
+
+async function admitAgentMentionPubkeys({
+  pubkeys,
+  agentPubkeys,
+  currentPubkey,
+  eligibilityScope,
+  sharedChannelIds,
+  refetchManagedAgents,
+  fetchRelayAgents,
+  phase = "publish",
+}: AgentMentionAdmissionInput) {
   const requestedAgentPubkeys = new Set(
     pubkeys.map(normalizePubkey).filter((pubkey) => agentPubkeys.has(pubkey)),
   );
   if (requestedAgentPubkeys.size === 0) {
-    return [...pubkeys];
+    return {
+      requested: requestedAgentPubkeys,
+      admitted: new Set<string>(),
+      directoriesLoaded: true,
+    };
   }
 
   const [managedResult, relayAgents] = await Promise.all([
@@ -87,12 +136,11 @@ export async function revalidateAgentMentionPubkeys({
       );
     }),
   );
-  if (
-    [...requestedAgentPubkeys].some((pubkey) => !admittedPubkeys.has(pubkey))
-  ) {
-    throw new AgentMentionAuthorizationError();
-  }
-  return [...pubkeys];
+  return {
+    requested: requestedAgentPubkeys,
+    admitted: admittedPubkeys,
+    directoriesLoaded: relayDirectoryReady && managedResult?.error === null,
+  };
 }
 
 export function useAgentMentionRevalidation({
@@ -124,7 +172,10 @@ export function useAgentMentionRevalidation({
             channelId: destinationChannelId,
           }
         : eligibilityScope;
-      return revalidateAgentMentionPubkeys({
+      const revalidate = options.skipIneligibleAgents
+        ? filterEligibleAgentMentionPubkeys
+        : revalidateAgentMentionPubkeys;
+      return revalidate({
         pubkeys,
         agentPubkeys: new Set([
           ...agentPubkeys,

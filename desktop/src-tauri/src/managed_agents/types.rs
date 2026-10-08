@@ -10,6 +10,9 @@ pub enum BackendKind {
         id: String,
         config: serde_json::Value,
     },
+    /// Runs on an approved agent host (`buzz host`), addressed by the host's
+    /// pubkey. Deploy and undeploy go over NIP-44 observer control frames.
+    Host { host_pubkey: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -595,6 +598,10 @@ pub struct ManagedAgentSummary {
     pub env_vars: BTreeMap<String, String>,
     pub backend: BackendKind,
     pub backend_agent_id: Option<String>,
+    /// The saved access policy has not yet been delivered by a successful
+    /// redeploy of this provider or paired-machine agent, which still runs
+    /// with its previous access. Retried on community load and by Deploy.
+    pub provider_policy_pending: bool,
     pub status: String,
     pub pid: Option<u32>,
     pub created_at: String,

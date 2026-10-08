@@ -5,7 +5,7 @@ export type MentionCandidateForRanking = {
   isAgent: boolean;
   isActiveAgent?: boolean;
   isMember: boolean;
-  kind: "identity" | "persona" | "team";
+  kind: "identity" | "persona" | "team" | "group";
   personaId?: string | null;
   personaName?: string | null;
   pubkey?: string;
@@ -23,7 +23,16 @@ export type RankedMentionCandidate<T extends MentionCandidateForRanking> = {
 function getMentionCandidateGroupRank(
   candidate: MentionCandidateForRanking,
   activePersonaIds: ReadonlySet<string>,
+  lowerQuery: string,
 ) {
+  if (candidate.kind === "group") {
+    // A typed prefix of the group's label (`@a`, `@al`, `@all`) asks for the
+    // group, so it leads: behind the roster it sank below the visible list
+    // and past the suggestion cap, since nearly every hex key contains "a".
+    // On a bare `@` it stays after the roster, never the default selection.
+    const label = candidate.displayName?.toLowerCase() ?? "";
+    return lowerQuery.length > 0 && label.startsWith(lowerQuery) ? -1 : 1;
+  }
   if (candidate.isMember) return 0;
 
   const isRunnablePersona =
@@ -122,6 +131,7 @@ export function rankMentionCandidates<T extends MentionCandidateForRanking>(
       const groupRank = getMentionCandidateGroupRank(
         candidate,
         activePersonaIds,
+        lowerQuery,
       );
 
       const labelScores = [

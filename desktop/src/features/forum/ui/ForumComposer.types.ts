@@ -9,6 +9,8 @@ export type ForumComposerProps = {
   draftKey?: string;
   /** Known channel type for channel-backed composers; omitted uses fail closed. */
   channelType?: ChannelType | null;
+  /** Offer and resolve the `@all` group mention (forum channel posts/replies). */
+  mentionAll?: boolean;
   /** Override mention source when no channel is available (e.g. Pulse). */
   members?: ChannelMember[];
   className?: string;

@@ -12,6 +12,8 @@ use buzz_sdk::mentions::{
     extract_at_mentions_with_known, extract_nostr_uris, strip_code_regions, MENTION_CAP,
 };
 
+use super::mention_all;
+
 /// Extract the thread root event ID from a Nostr tag array.
 ///
 /// Delegates marker parsing and collapse to [`buzz_core::nip10`] (shared with
@@ -152,20 +154,38 @@ fn resolve_names_to_pubkeys(
     Ok(resolved)
 }
 
+/// Mentions resolved from content and flags against the channel snapshot.
+#[derive(Debug, Default)]
+struct ContentMentions {
+    /// Current channel member pubkeys (kind:39002).
+    members: Vec<String>,
+    /// Uniquely name-resolved `@Name` pubkeys.
+    resolved: Vec<String>,
+    /// Whether `@all` (token or `--mention-all`) was requested.
+    mention_all: bool,
+    /// Whether content already carries an `@all` token outside code.
+    has_all_token: bool,
+    /// Recipients of `@all` (empty unless `mention_all`).
+    all_recipients: Vec<String>,
+}
+
 /// Resolve mention text against the channel membership snapshot.
 ///
-/// Returns both the current member set and uniquely name-resolved pubkeys.
-/// Lookup failures are fatal when mention processing is requested: publishing
-/// visible mention text without its intended `p` tag is worse than not sending.
+/// Returns the current member set, uniquely name-resolved pubkeys, and the
+/// `@all` expansion (see [`super::mention_all`]). Lookup failures are fatal
+/// when mention processing is requested: publishing visible mention text
+/// without its intended `p` tag is worse than not sending.
 async fn resolve_content_mentions(
     client: &BuzzClient,
     channel_id: &str,
     content: &str,
     has_explicit_mentions: bool,
-) -> Result<(Vec<String>, Vec<String>), CliError> {
+    mention_all_flag: bool,
+) -> Result<ContentMentions, CliError> {
     let stripped = strip_code_regions(content);
-    if !stripped.contains('@') && !has_explicit_mentions {
-        return Ok((vec![], vec![]));
+    let has_at = stripped.contains('@');
+    if !has_at && !has_explicit_mentions && !mention_all_flag {
+        return Ok(ContentMentions::default());
     }
 
     let members_filter = serde_json::json!({
@@ -173,26 +193,36 @@ async fn resolve_content_mentions(
         "#d": [channel_id],
         "limit": 1,
     });
-    let member_pubkeys = fetch_member_pubkeys(client, &members_filter)
+    let roster_event = fetch_events(client, &members_filter)
         .await
+        .and_then(|events| events.into_iter().next())
         .ok_or_else(|| {
             CliError::Other("could not load channel membership for mention preflight".into())
         })?;
+    let member_pubkeys = parse_member_pubkeys(&roster_event);
 
-    if !stripped.contains('@') {
-        return Ok((member_pubkeys, vec![]));
+    if !has_at && !mention_all_flag {
+        return Ok(ContentMentions {
+            members: member_pubkeys,
+            ..ContentMentions::default()
+        });
     }
 
-    let profiles_filter = serde_json::json!({
-        "kinds": [0],
-        "authors": member_pubkeys,
-        "limit": member_pubkeys.len(),
-    });
-    let profile_events = fetch_events(client, &profiles_filter)
-        .await
-        .ok_or_else(|| {
-            CliError::Other("could not load member profiles for mention resolution".into())
-        })?;
+    // Profiles only resolve `@Name` text; `@all` needs the roster alone.
+    let profile_events = if member_pubkeys.is_empty() || !has_at {
+        vec![]
+    } else {
+        let profiles_filter = serde_json::json!({
+            "kinds": [0],
+            "authors": member_pubkeys,
+            "limit": member_pubkeys.len(),
+        });
+        fetch_events(client, &profiles_filter)
+            .await
+            .ok_or_else(|| {
+                CliError::Other("could not load member profiles for mention resolution".into())
+            })?
+    };
 
     let mut name_to_pubkeys: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
@@ -222,10 +252,51 @@ async fn resolve_content_mentions(
         display_names.push(name.to_string());
     }
 
-    let known_refs: Vec<&str> = display_names.iter().map(String::as_str).collect();
-    let names = extract_at_mentions_with_known(&stripped, &known_refs);
+    // `all` is a known reference so `@all,` / `@all.` tokenize like any member
+    // name; a longer member name sharing the prefix (`@All Hands`) still wins.
+    let mut known_refs: Vec<&str> = display_names.iter().map(String::as_str).collect();
+    known_refs.push(mention_all::MENTION_GROUP_ALL);
+    let names = if has_at {
+        extract_at_mentions_with_known(&stripped, &known_refs)
+    } else {
+        vec![]
+    };
+    let (has_all_token, names) = mention_all::split_mention_all(names);
     let resolved = resolve_names_to_pubkeys(&names, &name_to_pubkeys, has_explicit_mentions)?;
-    Ok((member_pubkeys, resolved))
+
+    let mention_all = has_all_token || mention_all_flag;
+    let all_recipients = if mention_all {
+        ensure_not_dm(client, channel_id).await?;
+        let sender = client.keys().public_key().to_hex();
+        mention_all::expand_mention_all(&member_pubkeys, &sender)?
+    } else {
+        vec![]
+    };
+
+    Ok(ContentMentions {
+        members: member_pubkeys,
+        resolved,
+        mention_all,
+        has_all_token,
+        all_recipients,
+    })
+}
+
+/// Reject `@all` in DM channels; a metadata lookup failure is fatal.
+async fn ensure_not_dm(client: &BuzzClient, channel_id: &str) -> Result<(), CliError> {
+    let filter = serde_json::json!({
+        "kinds": [39000],
+        "#d": [channel_id],
+        "limit": 1,
+    });
+    let metadata = fetch_events(client, &filter)
+        .await
+        .and_then(|events| events.into_iter().next())
+        .ok_or_else(|| CliError::Other("could not load channel metadata for @all".into()))?;
+    if mention_all::channel_metadata_is_dm(&metadata) {
+        return Err(mention_all::dm_rejection());
+    }
+    Ok(())
 }
 
 fn normalize_explicit_mentions(values: &[String]) -> Result<Vec<String>, CliError> {
@@ -263,7 +334,8 @@ fn merge_message_mentions(
     }
     if mentions.len() > MENTION_CAP {
         return Err(CliError::Usage(format!(
-            "too many unique message mentions (max {MENTION_CAP})"
+            "too many unique message mentions ({}, max {MENTION_CAP})",
+            mentions.len()
         )));
     }
     Ok(mentions)
@@ -300,15 +372,6 @@ async fn fetch_events(
     let raw = client.query(filter).await.ok()?;
     let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
     parsed.as_array().cloned()
-}
-
-/// Extract member pubkeys (the `p` tag values) from a single 39002 event.
-async fn fetch_member_pubkeys(
-    client: &BuzzClient,
-    filter: &serde_json::Value,
-) -> Option<Vec<String>> {
-    let events = fetch_events(client, filter).await?;
-    Some(parse_member_pubkeys(events.first()?))
 }
 
 /// Parse member pubkeys from a kind 39002 event JSON value.
@@ -606,6 +669,8 @@ pub struct SendMessageParams {
     pub broadcast: bool,
     pub files: Vec<String>,
     pub mentions: Vec<String>,
+    /// Mention every channel member (`@all`) without the content token.
+    pub mention_all: bool,
 }
 
 pub async fn cmd_send_message(
@@ -631,11 +696,30 @@ pub async fn cmd_send_message(
     // Uniquely resolvable member names still add their own p-tags; callers must supply
     // every intended identity whose visible label cannot be resolved uniquely.
     let has_explicit_mentions = !explicit_mentions.is_empty() || !uri_pubkeys.is_empty();
-    let (member_pubkeys, auto_resolved) =
-        resolve_content_mentions(client, &p.channel_id, &p.content, has_explicit_mentions).await?;
+    let content_mentions = resolve_content_mentions(
+        client,
+        &p.channel_id,
+        &p.content,
+        has_explicit_mentions,
+        p.mention_all,
+    )
+    .await?;
+    let auto_resolved: Vec<String> = content_mentions
+        .resolved
+        .iter()
+        .chain(content_mentions.all_recipients.iter())
+        .cloned()
+        .collect();
     let mention_pubkeys = merge_message_mentions(&explicit_mentions, &uri_pubkeys, &auto_resolved)?;
 
-    let missing = missing_members(&mention_pubkeys, &member_pubkeys);
+    // Contract: content carries the literal `@all` whenever the marker is
+    // emitted, so `--mention-all` without the token prepends it.
+    if content_mentions.mention_all && !content_mentions.has_all_token {
+        p.content = mention_all::prepend_all_token(&p.content);
+        validate_content_size(&p.content)?;
+    }
+
+    let missing = missing_members(&mention_pubkeys, &content_mentions.members);
     if !missing.is_empty() {
         return Err(CliError::Usage(
             serde_json::json!({
@@ -740,6 +824,12 @@ pub async fn cmd_send_message(
                 "--kind {k} is not supported (use 9, 45001, or 45003)"
             )))
         }
+    };
+
+    let builder = if content_mentions.mention_all {
+        builder.tag(mention_all::mention_all_marker_tag()?)
+    } else {
+        builder
     };
 
     let event = client.sign_event(builder)?;
@@ -945,6 +1035,7 @@ pub async fn dispatch(
             broadcast,
             files,
             mentions,
+            mention_all,
         } => {
             cmd_send_message(
                 client,
@@ -956,6 +1047,7 @@ pub async fn dispatch(
                     broadcast,
                     files,
                     mentions,
+                    mention_all,
                 },
             )
             .await
@@ -1717,6 +1809,7 @@ mod tests {
             broadcast: false,
             files: vec![],
             mentions: vec![],
+            mention_all: false,
         }
     }
 
@@ -1889,3 +1982,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "messages_mention_all_tests.rs"]
+mod mention_all_send_tests;

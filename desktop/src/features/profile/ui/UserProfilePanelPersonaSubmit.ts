@@ -1,5 +1,6 @@
 import { toast } from "sonner";
 
+import type { BackendIntent } from "@/features/agents/lib/instanceInputForDefinition";
 import { personaManagedAgentUpdate } from "@/features/profile/ui/UserProfilePanelUtils";
 import type {
   AcpRuntimeCatalogEntry,
@@ -14,7 +15,10 @@ import type {
 type SubmitProfilePersonaDialogOptions = {
   createManagedAgentForPersona: (
     persona: AgentPersona,
+    backendIntent?: BackendIntent | null,
   ) => Promise<CreateManagedAgentResponse>;
+  /** Where a newly created definition's first instance runs. */
+  backendIntent?: BackendIntent | null;
   createPersona: (input: CreatePersonaInput) => Promise<AgentPersona>;
   input: CreatePersonaInput | UpdatePersonaInput;
   managedAgent: ManagedAgent | undefined;
@@ -64,6 +68,7 @@ export function validateLinkedAgentRuntimeEdit({
 }
 
 export async function submitProfilePersonaDialog({
+  backendIntent,
   createManagedAgentForPersona,
   createPersona,
   input,
@@ -104,7 +109,10 @@ export async function submitProfilePersonaDialog({
     } else {
       const persona = await createPersona(input);
       try {
-        const created = await createManagedAgentForPersona(persona);
+        const created = await createManagedAgentForPersona(
+          persona,
+          backendIntent,
+        );
         if (created.spawnError) {
           toast.error(
             `${persona.displayName} was created, but it did not start: ${created.spawnError}`,

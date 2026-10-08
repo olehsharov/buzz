@@ -67,7 +67,7 @@ class JumpToLatestButton extends HookWidget {
             key: ValueKey('$id-jump-to-latest-visual-anchor'),
             alignment: Alignment.bottomCenter,
             child: ClipOval(
-              child: BackdropFilter(
+              child: BackdropFilter.grouped(
                 filter: ImageFilter.blur(sigmaX: 20, sigmaY: 20),
                 child: Container(
                   key: ValueKey('$id-jump-to-latest-surface'),

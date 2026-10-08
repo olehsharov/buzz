@@ -17,6 +17,7 @@ import { UserAvatar } from "@/shared/ui/UserAvatar";
 import {
   type AgentRunLocation,
   agentAccessWarningText,
+  agentDmScopeNote,
 } from "@/features/agents/lib/agentAccessWarning";
 import { useAgentRunLocation } from "./AgentRunLocationContext";
 import { PersonaDropdownField } from "./PersonaDropdownField";
@@ -194,6 +195,15 @@ export function CreateAgentRespondToField({
       </p>
     </div>
   ) : null;
+  const dmScopeText = agentDmScopeNote(mode);
+  const dmScopeNote = dmScopeText ? (
+    <p
+      className="text-xs text-muted-foreground"
+      data-testid="agent-respond-to-dm-scope"
+    >
+      {dmScopeText}
+    </p>
+  ) : null;
 
   return (
     <div className="space-y-2" data-testid="agent-respond-to">
@@ -241,6 +251,7 @@ export function CreateAgentRespondToField({
         </p>
       ) : null}
       {mode === "anyone" ? accessWarning : null}
+      {mode === "anyone" ? dmScopeNote : null}
       {mode === "owner-only" ? (
         <p className="text-xs text-muted-foreground">
           Only you and your agents can send instructions.
@@ -275,6 +286,7 @@ export function CreateAgentRespondToField({
         />
       ) : null}
       {mode === "allowlist" ? accessWarning : null}
+      {mode === "allowlist" ? dmScopeNote : null}
     </div>
   );
 }

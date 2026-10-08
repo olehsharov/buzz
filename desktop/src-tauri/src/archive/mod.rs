@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::app_state::AppState;
-use crate::relay::{query_relay, relay_ws_url_with_override};
+use crate::relay::query_relay_at;
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
@@ -148,10 +148,11 @@ pub struct ArchiveBatchResult {
 /// connection, transaction, or lock is held across the relay-query await.
 #[tauri::command]
 pub async fn archive_events(
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
     candidates: Vec<ArchiveCandidate>,
 ) -> Result<ArchiveBatchResult, String> {
-    archive_candidates(&state, candidates).await
+    archive_candidates(&state, relay.ws_url(), candidates).await
 }
 
 /// The body of [`archive_events`], callable without a command invocation.
@@ -161,10 +162,12 @@ pub async fn archive_events(
 /// reintroduce the IPC round trip the move exists to delete.
 pub(crate) async fn archive_candidates(
     state: &AppState,
+    // The community relay the candidates were read from.
+    relay_url: &str,
     candidates: Vec<ArchiveCandidate>,
 ) -> Result<ArchiveBatchResult, String> {
     let identity_pk = identity_pubkey(state)?;
-    let relay_url = relay_ws_url_with_override(state);
+    let relay_url = relay_url.to_string();
     let now = now_secs();
 
     // ── Phase 1: plan (blocking SQLite) ─────────────────────────────────────
@@ -299,6 +302,7 @@ fn validate_ephemeral_frame(
 /// - `owner_p`: restricted to the current identity's own pubkey (v1).
 #[tauri::command]
 pub async fn create_save_subscription(
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
     sync_state: State<'_, sync::ArchiveSyncState>,
     scope_type: ScopeType,
@@ -306,7 +310,7 @@ pub async fn create_save_subscription(
     kinds: Vec<u32>,
 ) -> Result<(), String> {
     let identity_pk = identity_pubkey(&state)?;
-    let relay_url = relay_ws_url_with_override(&state);
+    let relay_url = relay.ws_url().to_string();
     let now = now_secs();
 
     // Reject kinds outside the valid NIP-01 range 0..=65535 — the nostr crate
@@ -321,10 +325,10 @@ pub async fn create_save_subscription(
     // Per-scope access probe.
     match &scope_type {
         ScopeType::ChannelH => {
-            probe_channel_access(&state, &identity_pk, &scope_value).await?;
+            probe_channel_access(&state, &relay.api_base(), &identity_pk, &scope_value).await?;
         }
         ScopeType::ReferencedE => {
-            probe_event_readable(&state, &scope_value).await?;
+            probe_event_readable(&state, &relay.api_base(), &scope_value).await?;
         }
         ScopeType::OwnerP => {
             // v1: only the current identity's own pubkey is allowed.
@@ -361,12 +365,14 @@ pub async fn create_save_subscription(
 /// Probe: the current user has access to `channel_id` (kind 39002 lists them).
 async fn probe_channel_access(
     state: &AppState,
+    api_base_url: &str,
     identity_pk: &str,
     channel_id: &str,
 ) -> Result<(), String> {
     // Fetch the channel's members event (kind 39002, #d = channel_id).
-    let events = query_relay(
+    let events = query_relay_at(
         state,
+        api_base_url,
         &[serde_json::json!({
             "kinds": [39002],
             "#d": [channel_id],
@@ -378,8 +384,9 @@ async fn probe_channel_access(
     // If no members event exists this could be an open channel — try to read
     // its metadata (kind 39000) as a fallback proof of readability.
     if events.is_empty() {
-        let meta = query_relay(
+        let meta = query_relay_at(
             state,
+            api_base_url,
             &[serde_json::json!({
                 "kinds": [39000],
                 "#d": [channel_id],
@@ -416,9 +423,14 @@ async fn probe_channel_access(
 }
 
 /// Probe: the given event id is currently readable by the current user.
-async fn probe_event_readable(state: &AppState, event_id: &str) -> Result<(), String> {
-    let events = query_relay(
+async fn probe_event_readable(
+    state: &AppState,
+    api_base_url: &str,
+    event_id: &str,
+) -> Result<(), String> {
+    let events = query_relay_at(
         state,
+        api_base_url,
         &[serde_json::json!({
             "ids": [event_id],
             "limit": 1
@@ -447,6 +459,7 @@ async fn probe_event_readable(state: &AppState, event_id: &str) -> Result<(), St
 /// list → merge-in-TS → create pattern.
 #[tauri::command]
 pub async fn merge_save_subscription_kinds(
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
     sync_state: State<'_, sync::ArchiveSyncState>,
     kind: u32,
@@ -456,7 +469,7 @@ pub async fn merge_save_subscription_kinds(
     }
 
     let identity_pk = identity_pubkey(&state)?;
-    let relay_url = relay_ws_url_with_override(&state);
+    let relay_url = relay.ws_url().to_string();
     let now = now_secs();
     let owner_pk = identity_pk.clone();
     state
@@ -485,6 +498,7 @@ pub async fn merge_save_subscription_kinds(
 /// which would drop the *other* kind if `subs` state was stale.
 #[tauri::command]
 pub async fn remove_save_subscription_kind(
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
     sync_state: State<'_, sync::ArchiveSyncState>,
     kind: u32,
@@ -494,7 +508,7 @@ pub async fn remove_save_subscription_kind(
     }
 
     let identity_pk = identity_pubkey(&state)?;
-    let relay_url = relay_ws_url_with_override(&state);
+    let relay_url = relay.ws_url().to_string();
     let owner_pk = identity_pk.clone();
     state
         .archive_db
@@ -511,10 +525,11 @@ pub async fn remove_save_subscription_kind(
 /// List all save subscriptions for the current identity + relay.
 #[tauri::command]
 pub async fn list_save_subscriptions(
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<Vec<store::SaveSubscription>, String> {
     let identity_pk = identity_pubkey(&state)?;
-    let relay_url = relay_ws_url_with_override(&state);
+    let relay_url = relay.ws_url().to_string();
     state
         .archive_db
         .with_conn(move |conn| store::list_save_subscriptions(conn, &identity_pk, &relay_url))
@@ -529,13 +544,14 @@ pub async fn list_save_subscriptions(
 /// GC of orphaned event rows happens in P4 purge commands, not here.
 #[tauri::command]
 pub async fn delete_save_subscription(
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
     sync_state: State<'_, sync::ArchiveSyncState>,
     scope_type: ScopeType,
     scope_value: String,
 ) -> Result<bool, String> {
     let identity_pk = identity_pubkey(&state)?;
-    let relay_url = relay_ws_url_with_override(&state);
+    let relay_url = relay.ws_url().to_string();
     let removed = state
         .archive_db
         .with_conn(move |conn| {
@@ -571,6 +587,7 @@ pub async fn delete_save_subscription(
 /// identically to `read_archived_events`.
 #[tauri::command]
 pub async fn read_archived_observer_events_for_channel(
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
     channel_id: String,
     before_created_at: Option<i64>,
@@ -578,7 +595,7 @@ pub async fn read_archived_observer_events_for_channel(
     limit: Option<i64>,
 ) -> Result<Vec<String>, String> {
     let identity_pk = identity_pubkey(&state)?;
-    let relay_url = relay_ws_url_with_override(&state);
+    let relay_url = relay.ws_url().to_string();
     state
         .archive_db
         .with_conn(move |conn| {
@@ -607,11 +624,12 @@ pub async fn read_archived_observer_events_for_channel(
 /// Idempotent: rows that are already indexed are left unchanged.
 #[tauri::command]
 pub async fn index_observer_channel_id(
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
     entries: Vec<ObserverChannelIndexEntry>,
 ) -> Result<(), String> {
     let identity_pk = identity_pubkey(&state)?;
-    let relay_url = relay_ws_url_with_override(&state);
+    let relay_url = relay.ws_url().to_string();
     state
         .archive_db
         .with_conn(move |conn| {
@@ -654,10 +672,11 @@ pub struct ObserverChannelIndexEntry {
 /// Slice 1 acceptance criteria (Thufir Pass 4).
 #[tauri::command]
 pub async fn read_unindexed_observer_rows(
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<Vec<RawObserverRow>, String> {
     let identity_pk = identity_pubkey(&state)?;
-    let relay_url = relay_ws_url_with_override(&state);
+    let relay_url = relay.ws_url().to_string();
     state
         .archive_db
         .with_conn(move |conn| {
@@ -703,7 +722,9 @@ const DEFAULT_READ_LIMIT: i64 = 50;
 /// caller doing `Event::from_json` on an unfiltered read must filter by kind
 /// first (today's only reader filters `kinds: [24200]`).
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn read_archived_events(
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
     scope_type: ScopeType,
     scope_value: String,
@@ -713,7 +734,7 @@ pub async fn read_archived_events(
     limit: Option<i64>,
 ) -> Result<Vec<String>, String> {
     let identity_pk = identity_pubkey(&state)?;
-    let relay_url = relay_ws_url_with_override(&state);
+    let relay_url = relay.ws_url().to_string();
     let scope_type_str = scope_type.as_str().to_string();
     let read_limit = limit.unwrap_or(DEFAULT_READ_LIMIT);
     state
@@ -815,11 +836,12 @@ fn agent_usage_series(
 /// + relay (Rev 3 frozen contract). See [`agent_usage_series`] for the logic.
 #[tauri::command]
 pub async fn get_agent_usage_series(
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
     request: agent_usage::AgentUsageSeriesRequest,
 ) -> Result<agent_usage::AgentUsageSeries, String> {
     let identity_pk = identity_pubkey(&state)?;
-    let relay_url = relay_ws_url_with_override(&state);
+    let relay_url = relay.ws_url().to_string();
     state
         .archive_db
         .with_conn(move |conn| agent_usage_series(conn, &identity_pk, &relay_url, &request))

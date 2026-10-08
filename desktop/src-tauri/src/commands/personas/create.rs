@@ -7,8 +7,8 @@ use uuid::Uuid;
 use crate::{
     app_state::AppState,
     managed_agents::{
-        apply_persona_behavior, load_personas, save_personas, try_regenerate_nest,
-        validate_agent_definition_text, AgentDefinition, CatalogSource, CreatePersonaRequest,
+        apply_persona_behavior, load_personas, try_regenerate_nest, validate_agent_definition_text,
+        AgentDefinition, CatalogSource, CreatePersonaRequest,
     },
     util::now_iso,
 };
@@ -19,6 +19,7 @@ use super::{normalize_description, pending, retain_persona_pending, trim_optiona
 pub async fn create_persona(
     input: CreatePersonaRequest,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
 ) -> Result<AgentDefinition, String> {
     use tauri::Manager;
     tokio::task::spawn_blocking(move || {
@@ -48,7 +49,7 @@ pub async fn create_persona(
             .lock()
             .map_err(|error| error.to_string())?;
         let mut personas = load_personas(&app)?;
-        pending::project_active_persona_sharing(&app, &state, &mut personas);
+        pending::project_active_persona_sharing(&app, &state, relay.ws_url(), &mut personas);
         let name_pool: Vec<String> = input
             .name_pool
             .into_iter()
@@ -86,8 +87,13 @@ pub async fn create_persona(
         };
         apply_persona_behavior(&mut persona, input.behavior)?;
         personas.push(persona.clone());
-        save_personas(&app, &personas)?;
-        retain_persona_pending(&app, &state, &persona);
+        crate::managed_agents::save_personas_assigning(
+            &app,
+            &personas,
+            &[persona.id.as_str()],
+            relay.ws_url(),
+        )?;
+        retain_persona_pending(&app, &state, relay.ws_url(), &persona);
         try_regenerate_nest(&app);
         Ok(persona)
     })

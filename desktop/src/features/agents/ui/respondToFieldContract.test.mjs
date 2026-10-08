@@ -34,6 +34,20 @@ test("every shared-access mode renders a persistent warning", () => {
   assert.match(respondToFieldSource, /mode === "allowlist" \? accessWarning/);
 });
 
+test("Anyone and Selected people say where the access applies", () => {
+  assert.match(respondToFieldSource, /mode === "anyone" \? dmScopeNote/);
+  assert.match(respondToFieldSource, /mode === "allowlist" \? dmScopeNote/);
+  assert.match(
+    collapsedSource,
+    /const dmScopeText = agentDmScopeNote\(mode\);/,
+  );
+  // The note follows the Selected people warning, after the picker.
+  assert.ok(
+    respondToFieldSource.indexOf('mode === "allowlist" ? dmScopeNote') >
+      respondToFieldSource.indexOf('mode === "allowlist" ? accessWarning'),
+  );
+});
+
 test("the Selected people warning sits after the people picker", () => {
   // It must not sit between the user and the selection they came here to make.
   const pickerAt = respondToFieldSource.indexOf("<AllowlistPicker");

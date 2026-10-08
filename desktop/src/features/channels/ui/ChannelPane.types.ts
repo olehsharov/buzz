@@ -4,6 +4,7 @@ import type { ChannelAgentSessionAgent } from "@/features/channels/ui/useChannel
 import type { MessageComposerEditTarget } from "@/features/messages/ui/MessageComposer.types";
 import type { MainTimelineEntry } from "@/features/messages/lib/threadPanel";
 import type { ChannelWindowThreadSummary } from "@/features/messages/lib/channelWindowStore";
+import type { StreamDraft } from "@/features/messages/lib/streamDrafts";
 import type { TimelineMessage } from "@/features/messages/types";
 import type { TypingIndicatorEntry } from "@/features/messages/useChannelTyping";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
@@ -202,6 +203,8 @@ export type ChannelPaneProps = {
   /** Search text to highlight within the clicked result. */
   targetSearchQuery?: string;
   typingPubkeys: string[];
+  /** Live reply ghosts (kind 20003) for the open channel, every scope. */
+  streamDrafts?: readonly StreamDraft[];
   isFollowingThread?: boolean;
   onFollowThread?: () => void;
   onUnfollowThread?: () => void;

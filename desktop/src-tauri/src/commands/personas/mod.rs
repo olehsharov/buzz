@@ -76,8 +76,12 @@ pub use inbound::reconcile_inbound_persona_event;
 pub(crate) use inbound::retain_inbound_catalog_witness;
 
 #[tauri::command]
-pub async fn list_personas(app: AppHandle) -> Result<Vec<AgentDefinition>, String> {
+pub async fn list_personas(
+    app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
+) -> Result<Vec<AgentDefinition>, String> {
     use tauri::Manager;
+    let community_relay = relay.ws_url().to_string();
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let _store_guard = state
@@ -85,11 +89,37 @@ pub async fn list_personas(app: AppHandle) -> Result<Vec<AgentDefinition>, Strin
             .lock()
             .map_err(|error| error.to_string())?;
         let mut personas = load_personas(&app)?;
-        pending::project_active_persona_sharing(&app, &state, &mut personas);
+        retain_community_personas(&app, &community_relay, &mut personas)?;
+        pending::project_active_persona_sharing(&app, &state, relay.ws_url(), &mut personas);
         Ok(personas)
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
+}
+
+/// Definitions belong to ONE community like their agents (built-ins are
+/// global templates): keep only the community on `community_relay`.
+pub(crate) fn retain_community_personas<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    community_relay: &str,
+    personas: &mut Vec<AgentDefinition>,
+) -> Result<(), String> {
+    use tauri::Manager;
+    let workspace_relay = crate::relay::relay_ws_url_with_override(&app.state::<AppState>());
+    let hidden: std::collections::HashSet<String> =
+        crate::managed_agents::storage::load_agent_definitions(app)?
+            .into_iter()
+            .filter(|record| {
+                !crate::managed_agents::community_scope::record_in_community(
+                    record,
+                    &workspace_relay,
+                    community_relay,
+                )
+            })
+            .filter_map(|record| record.slug)
+            .collect();
+    personas.retain(|persona| persona.is_builtin || !hidden.contains(&persona.id));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -146,7 +176,11 @@ fn commit_cascade_agents(
 }
 
 #[tauri::command]
-pub async fn delete_persona(id: String, app: AppHandle) -> Result<(), String> {
+pub async fn delete_persona(
+    id: String,
+    app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
+) -> Result<(), String> {
     use tauri::Manager;
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -274,9 +308,9 @@ pub async fn delete_persona(id: String, app: AppHandle) -> Result<(), String> {
                 delete_agent_key(pk);
                 // Tombstone + NIP-IA kind:9035 archive enqueue atomically; the
                 // archive's `persona_id` is derived from the retained 30177 head.
-                super::agents::tombstone_managed_agent_pending(&app, &state, pk);
+                super::agents::tombstone_managed_agent_pending(&app, &state, relay.ws_url(), pk);
             }
-            tombstone_persona_pending(&app, &state, &d_tag);
+            tombstone_persona_pending(&app, &state, relay.ws_url(), &d_tag);
 
             // _store_guard drops here, before try_regenerate_nest.
         }

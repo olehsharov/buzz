@@ -1,5 +1,6 @@
 import * as React from "react";
 
+import { AgentDefaultsCommunityScope } from "./AgentDefaultsCommunityScope";
 import {
   AgentDefaultsEditor,
   type GlobalAgentConfigSaveResult,
@@ -88,9 +89,8 @@ export function AgentDefaultsDialog({
           <DialogHeader>
             <DialogTitle>Agent defaults</DialogTitle>
             <DialogDescription>
-              These settings apply to all agents unless you override them.
-              Agent-specific settings always take priority. Changes may restart
-              running agents.
+              <AgentDefaultsCommunityScope lead="These settings apply to" />{" "}
+              Changes may restart running agents.
             </DialogDescription>
           </DialogHeader>
           <AgentDefaultsEditor

@@ -266,3 +266,31 @@ export function deriveShellRoute(pathname: string): {
     selectedView: "home",
   };
 }
+
+/**
+ * What one window of the shared app shell owns, by window role.
+ *
+ * - `isAuxWindow` (huddle room, pop-out): no sidebar, top chrome, or rail.
+ * - `isSecondaryWindow` (pop-out, community window): no settings, presence,
+ *   persona/agent sync or reconciliation, reminders, or startup restores.
+ * - `ownsAppGlobals` (main window only): notifications, dock badge, deep
+ *   links, tray, community rail, pop-out navigation, mark-all-read.
+ *
+ * A community window keeps the full chat surface (sidebar, channels, top
+ * chrome, composer, search, profiles) of its own community.
+ */
+export function appShellWindowRoles(
+  windowKind: "main" | "huddle" | "popout" | "community",
+  isHuddleRoom: boolean,
+) {
+  const isPopout = windowKind === "popout";
+  const isCommunityWindowShell = windowKind === "community";
+  const isAuxWindow = isHuddleRoom || isPopout;
+  return {
+    isPopout,
+    isCommunityWindowShell,
+    isAuxWindow,
+    isSecondaryWindow: isPopout || isCommunityWindowShell,
+    ownsAppGlobals: !isAuxWindow && !isCommunityWindowShell,
+  };
+}

@@ -1,8 +1,11 @@
 //! Owner-reviewed agent draft requests published through Buzz observer frames.
 
+use std::collections::BTreeMap;
+
 use buzz_core::observer::{encrypt_observer_payload, OBSERVER_FRAME_TELEMETRY};
 use nostr::{Event, Keys, PublicKey};
 use serde::Serialize;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::error::CliError;
 
@@ -10,13 +13,65 @@ const AGENT_REQUEST_KIND: &str = "agent_management_request";
 const PROJECT_CHANNEL_REQUEST_KIND: &str = "project_channel_request";
 const MAX_NAME_CHARS: usize = 120;
 const MAX_PROMPT_CHARS: usize = 20_000;
+const MAX_VALUE_CHARS: usize = 300;
+const MAX_ID_CHARS: usize = 64;
+const MAX_PROVIDER_CONFIG_ENTRIES: usize = 20;
+const MAX_EMOJI_BYTES: usize = 16;
+/// The only environment variables an agent may propose; Desktop rejects any other key.
+const ALLOWED_ENV_KEYS: [&str; 3] = [
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    "BUZZ_ACP_RESUME_SESSION",
+];
+const RESUME_SESSION_ENV_KEY: &str = "BUZZ_ACP_RESUME_SESSION";
+const RESPOND_TO_VALUES: [&str; 4] = ["owner-only", "allowlist", "anyone", "nobody"];
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+/// Unvalidated `draft-create` input as received from the command line.
+///
+/// `env_vars` and `provider_config` hold raw `KEY=VALUE` strings; [`build_create`]
+/// parses and validates every field against the Desktop create-draft contract.
+#[derive(Debug, Clone, Default)]
 pub struct CreateAgentDraft {
     pub channel_id: String,
     pub display_name: String,
     pub system_prompt: String,
+    pub runtime: Option<String>,
+    pub model: Option<String>,
+    pub respond_to: Option<String>,
+    pub env_vars: Vec<String>,
+    pub avatar_emoji: Option<String>,
+    pub avatar_color: Option<String>,
+    pub run_on: Option<String>,
+    pub provider_config: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CreateAgentAvatar {
+    emoji: String,
+    color: String,
+}
+
+/// Wire shape of the decrypted `request` object for action `create`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateAgentRequest {
+    channel_id: String,
+    display_name: String,
+    system_prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    respond_to: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    env_vars: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    avatar: Option<CreateAgentAvatar>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_on: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    provider_config: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -96,7 +151,149 @@ fn required(value: String, label: &str, max: usize) -> Result<String, CliError> 
 }
 
 fn optional(value: Option<String>, label: &str) -> Result<Option<String>, CliError> {
-    value.map(|value| required(value, label, 300)).transpose()
+    value
+        .map(|value| required(value, label, MAX_VALUE_CHARS))
+        .transpose()
+}
+
+/// `[a-z0-9][a-z0-9_-]*`, at most 64 characters (runtime and provider ids).
+fn optional_id(value: Option<String>, label: &str) -> Result<Option<String>, CliError> {
+    let Some(value) = optional(value, label)? else {
+        return Ok(None);
+    };
+    let mut chars = value.chars();
+    let valid = value.len() <= MAX_ID_CHARS
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-');
+    if !valid {
+        return Err(CliError::Usage(format!(
+            "invalid {label} '{value}': use lowercase letters, digits, '_' or '-', \
+             starting with a letter or digit (max {MAX_ID_CHARS} characters)"
+        )));
+    }
+    Ok(Some(value))
+}
+
+fn is_lowercase_uuid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(byte),
+        })
+}
+
+fn is_provider_config_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    key.len() <= MAX_ID_CHARS
+        && chars
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Parses repeated `KEY=VALUE` flags, rejecting malformed entries and duplicate keys.
+fn key_values(entries: Vec<String>, flag: &str) -> Result<BTreeMap<String, String>, CliError> {
+    let mut map = BTreeMap::new();
+    for entry in entries {
+        let Some((key, value)) = entry.split_once('=') else {
+            return Err(CliError::Usage(format!("{flag} expects KEY=VALUE")));
+        };
+        if value.chars().count() > MAX_VALUE_CHARS {
+            return Err(CliError::Usage(format!(
+                "{flag} value for {key} is too long (max {MAX_VALUE_CHARS} characters)"
+            )));
+        }
+        if map.insert(key.to_owned(), value.to_owned()).is_some() {
+            return Err(CliError::Usage(format!(
+                "{flag} {key} is given more than once"
+            )));
+        }
+    }
+    Ok(map)
+}
+
+fn env_vars(entries: Vec<String>) -> Result<BTreeMap<String, String>, CliError> {
+    let map = key_values(entries, "--env")?;
+    for (key, value) in &map {
+        if !ALLOWED_ENV_KEYS.contains(&key.as_str()) {
+            return Err(CliError::Usage(format!(
+                "--env {key} is not allowed; allowed keys: {}",
+                ALLOWED_ENV_KEYS.join(", ")
+            )));
+        }
+        if key == RESUME_SESSION_ENV_KEY && !is_lowercase_uuid(value) {
+            return Err(CliError::Usage(format!(
+                "--env {RESUME_SESSION_ENV_KEY} must be a lowercase hyphenated session UUID"
+            )));
+        }
+    }
+    Ok(map)
+}
+
+fn provider_config(
+    entries: Vec<String>,
+    run_on: Option<&str>,
+) -> Result<BTreeMap<String, String>, CliError> {
+    if entries.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    if run_on.is_none() {
+        return Err(CliError::Usage(
+            "--provider-config requires --run-on".into(),
+        ));
+    }
+    if entries.len() > MAX_PROVIDER_CONFIG_ENTRIES {
+        return Err(CliError::Usage(format!(
+            "--provider-config accepts at most {MAX_PROVIDER_CONFIG_ENTRIES} entries"
+        )));
+    }
+    let map = key_values(entries, "--provider-config")?;
+    for (key, value) in &map {
+        if !is_provider_config_key(key) {
+            return Err(CliError::Usage(format!(
+                "invalid --provider-config key '{key}': use lowercase letters, digits and '_', \
+                 not starting with a digit (max {MAX_ID_CHARS} characters)"
+            )));
+        }
+        if value.trim().is_empty() {
+            return Err(CliError::Usage(format!(
+                "--provider-config {key} needs a value"
+            )));
+        }
+    }
+    Ok(map)
+}
+
+fn avatar(
+    emoji: Option<String>,
+    color: Option<String>,
+) -> Result<Option<CreateAgentAvatar>, CliError> {
+    let (emoji, color) = match (emoji, color) {
+        (None, None) => return Ok(None),
+        (Some(emoji), Some(color)) => (emoji.trim().to_owned(), color.trim().to_owned()),
+        _ => {
+            return Err(CliError::Usage(
+                "--avatar-emoji and --avatar-color must be given together".into(),
+            ))
+        }
+    };
+    if emoji.graphemes(true).count() != 1 || emoji.len() > MAX_EMOJI_BYTES {
+        return Err(CliError::Usage(format!(
+            "--avatar-emoji must be a single emoji (max {MAX_EMOJI_BYTES} bytes)"
+        )));
+    }
+    let color_valid = color.len() == 7
+        && color.starts_with('#')
+        && color.bytes().skip(1).all(|byte| byte.is_ascii_hexdigit());
+    if !color_valid {
+        return Err(CliError::Usage(format!(
+            "--avatar-color must be a #RRGGBB hex color, got '{color}'"
+        )));
+    }
+    Ok(Some(CreateAgentAvatar { emoji, color }))
 }
 
 fn build<T: Serialize>(
@@ -149,10 +346,34 @@ pub fn build_create(
     let channel_id = required(draft.channel_id, "channel", 128)?;
     uuid::Uuid::parse_str(&channel_id)
         .map_err(|_| CliError::Usage(format!("invalid channel UUID: {channel_id}")))?;
-    let request = CreateAgentDraft {
+    // The prompt may be empty: the owner can write it in the Desktop dialog.
+    let system_prompt = draft.system_prompt.trim().to_owned();
+    if system_prompt.chars().count() > MAX_PROMPT_CHARS {
+        return Err(CliError::Usage(format!(
+            "system prompt is too long (max {MAX_PROMPT_CHARS} characters)"
+        )));
+    }
+    let respond_to = optional(draft.respond_to, "respond-to")?;
+    if let Some(value) = respond_to.as_deref() {
+        if !RESPOND_TO_VALUES.contains(&value) {
+            return Err(CliError::Usage(format!(
+                "respond-to must be one of: {}",
+                RESPOND_TO_VALUES.join(", ")
+            )));
+        }
+    }
+    let run_on = optional_id(draft.run_on, "run-on")?;
+    let request = CreateAgentRequest {
         channel_id: channel_id.clone(),
         display_name: required(draft.display_name, "display name", MAX_NAME_CHARS)?,
-        system_prompt: required(draft.system_prompt, "system prompt", MAX_PROMPT_CHARS)?,
+        system_prompt,
+        runtime: optional_id(draft.runtime, "runtime")?,
+        model: optional(draft.model, "model")?,
+        respond_to,
+        env_vars: env_vars(draft.env_vars)?,
+        avatar: avatar(draft.avatar_emoji, draft.avatar_color)?,
+        provider_config: provider_config(draft.provider_config, run_on.as_deref())?,
+        run_on,
     };
     build(
         keys,
@@ -269,6 +490,7 @@ mod tests {
                 channel_id: CHANNEL.into(),
                 display_name: "Research helper".into(),
                 system_prompt: "Find sources.".into(),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -302,8 +524,245 @@ mod tests {
             payload["payload"]["request"]["displayName"],
             "Research helper"
         );
-        assert!(payload["payload"]["request"].get("runtime").is_none());
-        assert!(payload["payload"]["request"].get("respondTo").is_none());
+        // Unset optional fields are omitted entirely (never null): Desktop rejects extra keys.
+        let request = payload["payload"]["request"].as_object().unwrap();
+        let mut keys: Vec<&str> = request.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["channelId", "displayName", "systemPrompt"]);
+        assert_eq!(request["systemPrompt"], "Find sources.");
+    }
+
+    const RESUME: &str = "0f3c2a9e-6b1d-4e7a-9c55-2d8f1a3b4c6e";
+
+    fn full_draft() -> CreateAgentDraft {
+        CreateAgentDraft {
+            channel_id: CHANNEL.into(),
+            display_name: "Session resumer".into(),
+            system_prompt: String::new(),
+            runtime: Some("claude".into()),
+            model: Some("claude-opus-4".into()),
+            respond_to: Some("allowlist".into()),
+            env_vars: vec![
+                "ANTHROPIC_AUTH_TOKEN=".into(),
+                "ANTHROPIC_BASE_URL=https://gateway.example/v1".into(),
+                format!("BUZZ_ACP_RESUME_SESSION={RESUME}"),
+            ],
+            avatar_emoji: Some("🐝".into()),
+            avatar_color: Some("#1A2b3C".into()),
+            run_on: Some("remote-host".into()),
+            provider_config: vec!["host=box-7.internal".into(), "workdir=/srv/repo".into()],
+        }
+    }
+
+    fn decrypted_request(draft: CreateAgentDraft) -> serde_json::Value {
+        let owner = Keys::generate();
+        let built = build_create(&Keys::generate(), &owner.public_key(), draft).unwrap();
+        let payload: serde_json::Value = decrypt_observer_payload(&owner, &built.event).unwrap();
+        payload["payload"]["request"].clone()
+    }
+
+    #[test]
+    fn create_carries_every_contract_field_when_set() {
+        let request = decrypted_request(full_draft());
+        assert_eq!(
+            request,
+            serde_json::json!({
+                "channelId": CHANNEL,
+                "displayName": "Session resumer",
+                "systemPrompt": "",
+                "runtime": "claude",
+                "model": "claude-opus-4",
+                "respondTo": "allowlist",
+                "envVars": {
+                    "ANTHROPIC_AUTH_TOKEN": "",
+                    "ANTHROPIC_BASE_URL": "https://gateway.example/v1",
+                    "BUZZ_ACP_RESUME_SESSION": RESUME,
+                },
+                "avatar": { "emoji": "🐝", "color": "#1A2b3C" },
+                "runOn": "remote-host",
+                "providerConfig": { "host": "box-7.internal", "workdir": "/srv/repo" },
+            })
+        );
+    }
+
+    #[test]
+    fn create_accepts_every_respond_to_mode_and_run_on_without_config() {
+        for mode in ["owner-only", "allowlist", "anyone", "nobody"] {
+            let request = decrypted_request(CreateAgentDraft {
+                respond_to: Some(mode.into()),
+                provider_config: Vec::new(),
+                ..full_draft()
+            });
+            assert_eq!(request["respondTo"], mode);
+            assert_eq!(request["runOn"], "remote-host");
+            assert!(request.get("providerConfig").is_none());
+        }
+    }
+
+    #[test]
+    fn create_rejects_contract_violations() {
+        type Mutate = fn(&mut CreateAgentDraft);
+        let cases: &[(&str, Mutate, &str)] = &[
+            (
+                "disallowed env key",
+                |d| d.env_vars.push("OPENAI_API_KEY=x".into()),
+                "allowed keys: ANTHROPIC_AUTH_TOKEN, ANTHROPIC_BASE_URL, BUZZ_ACP_RESUME_SESSION",
+            ),
+            (
+                "env entry without '='",
+                |d| d.env_vars = vec!["ANTHROPIC_BASE_URL".into()],
+                "expects KEY=VALUE",
+            ),
+            (
+                "duplicate env key",
+                |d| d.env_vars.push("ANTHROPIC_AUTH_TOKEN=".into()),
+                "more than once",
+            ),
+            (
+                "env value too long",
+                |d| d.env_vars = vec![format!("ANTHROPIC_BASE_URL={}", "a".repeat(301))],
+                "too long",
+            ),
+            (
+                "resume id not a uuid",
+                |d| d.env_vars = vec!["BUZZ_ACP_RESUME_SESSION=latest".into()],
+                "session UUID",
+            ),
+            (
+                "resume id uppercase",
+                |d| d.env_vars = vec![format!("BUZZ_ACP_RESUME_SESSION={}", RESUME.to_uppercase())],
+                "session UUID",
+            ),
+            (
+                "resume id without hyphens",
+                |d| {
+                    d.env_vars = vec![format!(
+                        "BUZZ_ACP_RESUME_SESSION={}",
+                        RESUME.replace('-', "")
+                    )]
+                },
+                "session UUID",
+            ),
+            (
+                "color without #",
+                |d| d.avatar_color = Some("1a2b3c".into()),
+                "#RRGGBB",
+            ),
+            (
+                "color short form",
+                |d| d.avatar_color = Some("#abc".into()),
+                "#RRGGBB",
+            ),
+            (
+                "color non-hex",
+                |d| d.avatar_color = Some("#12345g".into()),
+                "#RRGGBB",
+            ),
+            (
+                "emoji without color",
+                |d| d.avatar_color = None,
+                "given together",
+            ),
+            (
+                "color without emoji",
+                |d| d.avatar_emoji = None,
+                "given together",
+            ),
+            (
+                "two emoji",
+                |d| d.avatar_emoji = Some("🐝🐝".into()),
+                "single emoji",
+            ),
+            (
+                "emoji over 16 bytes",
+                |d| d.avatar_emoji = Some("👩‍👩‍👧‍👦".into()),
+                "single emoji",
+            ),
+            (
+                "provider config without run-on",
+                |d| d.run_on = None,
+                "--provider-config requires --run-on",
+            ),
+            (
+                "provider config key with uppercase",
+                |d| d.provider_config = vec!["Host=x".into()],
+                "invalid --provider-config key",
+            ),
+            (
+                "provider config key starting with digit",
+                |d| d.provider_config = vec!["1host=x".into()],
+                "invalid --provider-config key",
+            ),
+            (
+                "provider config empty value",
+                |d| d.provider_config = vec!["host=".into()],
+                "needs a value",
+            ),
+            (
+                "too many provider config entries",
+                |d| d.provider_config = (0..21).map(|i| format!("k{i}=v")).collect(),
+                "at most 20",
+            ),
+            (
+                "runtime uppercase",
+                |d| d.runtime = Some("Claude".into()),
+                "invalid runtime",
+            ),
+            (
+                "runtime leading dash",
+                |d| d.runtime = Some("-claude".into()),
+                "invalid runtime",
+            ),
+            (
+                "runtime too long",
+                |d| d.runtime = Some("a".repeat(65)),
+                "invalid runtime",
+            ),
+            (
+                "run-on with space",
+                |d| d.run_on = Some("render illa".into()),
+                "invalid run-on",
+            ),
+            (
+                "run-on with dot",
+                |d| d.run_on = Some("remote-host.v2".into()),
+                "invalid run-on",
+            ),
+            (
+                "unknown respond-to",
+                |d| d.respond_to = Some("everyone".into()),
+                "respond-to must be one of",
+            ),
+            (
+                "model too long",
+                |d| d.model = Some("m".repeat(301)),
+                "model is too long",
+            ),
+            (
+                "system prompt too long",
+                |d| d.system_prompt = "p".repeat(MAX_PROMPT_CHARS + 1),
+                "system prompt is too long",
+            ),
+            (
+                "display name too long",
+                |d| d.display_name = "n".repeat(MAX_NAME_CHARS + 1),
+                "display name is too long",
+            ),
+        ];
+        for (name, mutate, expected) in cases {
+            let mut draft = full_draft();
+            mutate(&mut draft);
+            let error = build_create(&Keys::generate(), &Keys::generate().public_key(), draft)
+                .expect_err(name);
+            assert!(
+                matches!(error, CliError::Usage(_)),
+                "{name}: expected a usage error, got {error:?}"
+            );
+            assert!(
+                error.to_string().contains(expected),
+                "{name}: '{error}' does not contain '{expected}'"
+            );
+        }
     }
 
     #[test]
@@ -335,6 +794,7 @@ mod tests {
                 channel_id: "general".into(),
                 display_name: "Scout".into(),
                 system_prompt: "Help".into(),
+                ..Default::default()
             },
         )
         .unwrap_err();

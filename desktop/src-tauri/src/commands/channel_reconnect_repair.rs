@@ -1,6 +1,6 @@
 use tauri::State;
 
-use crate::{app_state::AppState, relay::query_relay};
+use crate::{app_state::AppState, relay::query_relay_at};
 
 const MAX_REPAIR_PAGE_LIMIT: u32 = 500;
 const CHANNEL_REPAIR_KINDS: [u32; 15] = [
@@ -51,6 +51,7 @@ pub async fn get_channel_reconnect_repair(
     limit: u32,
     until: Option<u64>,
     before_id: Option<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let filter = build_channel_reconnect_repair_filter(
@@ -60,7 +61,7 @@ pub async fn get_channel_reconnect_repair(
         until,
         before_id.as_deref(),
     )?;
-    Ok(query_relay(&state, &[filter])
+    Ok(query_relay_at(&state, &relay.api_base(), &[filter])
         .await?
         .iter()
         .filter_map(|event| serde_json::to_value(event).ok())

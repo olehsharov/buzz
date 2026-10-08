@@ -131,6 +131,25 @@ pub fn live_process_sweeps(app: &tauri::AppHandle, tracked_pids: &[u32]) {
     super::sweep_untracked_bundle_harnesses(tracked_pids);
 }
 
+/// Local auto-start agents to restore on `restore_relay` (the active
+/// community): only those that belong to it. An agent from another community
+/// is started by that community's reconcile on its own relay, never here.
+fn restore_candidates(records: &[super::ManagedAgentRecord], restore_relay: &str) -> Vec<String> {
+    records
+        .iter()
+        .filter(|record| {
+            record.start_on_app_launch
+                && record.backend == BackendKind::Local
+                && crate::relay::agent_belongs_to_relay(
+                    &record.relay_url,
+                    restore_relay,
+                    restore_relay,
+                )
+        })
+        .map(|record| record.pubkey.clone())
+        .collect()
+}
+
 /// Restore managed agents that were running before the app was closed.
 ///
 /// Split into three phases to minimise lock contention with the frontend:
@@ -201,11 +220,7 @@ async fn restore_managed_agents_on_launch<R: tauri::Runtime>(
             .collect();
         sweeps(app, &tracked_pids);
 
-        let candidates: Vec<String> = records
-            .iter()
-            .filter(|record| record.start_on_app_launch && record.backend == BackendKind::Local)
-            .map(|record| record.pubkey.clone())
-            .collect();
+        let candidates = restore_candidates(&records, restore_relay);
 
         let mut to_start = Vec::new();
         for pubkey in &candidates {
@@ -283,11 +298,14 @@ async fn restore_managed_agents_on_launch<R: tauri::Runtime>(
         // `relay_mesh` bytes never contribute. See `start_local_agent_with_preflight`
         // in `commands/agents.rs` for the identical rationale on the interactive path.
         let personas = load_personas(app).unwrap_or_default();
-        let global = super::load_global_agent_config(app).unwrap_or_default();
+        let defaults = super::load_community_agent_defaults(app).unwrap_or_default();
         let mut mesh_preflight_failures = std::collections::HashSet::new();
         for record in &agents_to_start {
+            // Each agent resolves against its OWN community's defaults.
             let mesh_model_id = super::effective_config::resolve_effective_relay_mesh_model_id(
-                record, &personas, &global,
+                record,
+                &personas,
+                defaults.for_record(record, restore_relay),
             );
             if mesh_model_id.is_none() {
                 continue;
@@ -372,13 +390,12 @@ fn spawn_and_register_restored_agents<R: tauri::Runtime>(
                     .filter(|_| !shutdown_started.load(Ordering::SeqCst))
                     .map(|record| {
                         let handle = scope.spawn(move || {
-                            let relay_url = crate::relay::effective_agent_relay_url(
-                                &record.relay_url,
-                                restore_relay,
-                            );
+                            // Candidates belong to this community (see
+                            // `restore_candidates`), so their pair is the
+                            // restore relay's.
                             let outcome = match super::ManagedAgentRuntimeKey::new(
                                 record.pubkey.clone(),
-                                &relay_url,
+                                restore_relay,
                             ) {
                                 Ok(key) => {
                                     // F2: if a concurrent startup reconcile already
@@ -731,3 +748,38 @@ mod launch_restore_admission_tests {
 #[cfg(all(test, not(target_os = "windows")))]
 #[path = "restore_admission_tests.rs"]
 mod admission_entry_tests;
+
+#[cfg(test)]
+mod candidate_tests {
+    use super::restore_candidates;
+
+    fn record(pubkey: &str, relay_url: &str, auto: bool) -> super::super::ManagedAgentRecord {
+        serde_json::from_value(serde_json::json!({
+            "pubkey": pubkey,
+            "name": "restore-test",
+            "relay_url": relay_url,
+            "acp_command": "buzz-acp",
+            "agent_command": "goose",
+            "agent_args": [],
+            "mcp_command": "",
+            "turn_timeout_seconds": 320,
+            "start_on_app_launch": auto,
+            "created_at": "",
+            "updated_at": ""
+        }))
+        .expect("record fixture")
+    }
+
+    #[test]
+    fn restore_starts_only_agents_of_the_restored_community() {
+        let own = record(&"aa".repeat(32), "wss://one.example", true);
+        let foreign = record(&"bb".repeat(32), "wss://two.example", true);
+        let unassigned = record(&"cc".repeat(32), "", true);
+        let manual = record(&"dd".repeat(32), "wss://one.example", false);
+        let records = [own, foreign, unassigned, manual];
+        assert_eq!(
+            restore_candidates(&records, "WSS://one.example/"),
+            vec!["aa".repeat(32), "cc".repeat(32)]
+        );
+    }
+}

@@ -1,0 +1,31 @@
+[package]
+name = "buzz-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Buzz agent host daemon: pairs a machine with a Buzz desktop and runs agents on command"
+
+[lib]
+name = "buzz_host"
+path = "src/lib.rs"
+
+[dependencies]
+buzz-core = { workspace = true }
+buzz-sdk = { workspace = true }
+buzz-ws-client = { workspace = true }
+nostr = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+zeroize = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

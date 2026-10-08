@@ -32,6 +32,7 @@ pub async fn set_persona_shared(
     id: String,
     shared: bool,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
 ) -> Result<SetPersonaSharedResult, String> {
     let prepared = tokio::task::spawn_blocking({
         let app = app.clone();
@@ -53,7 +54,7 @@ pub async fn set_persona_shared(
 
             // Strict path: unlike ordinary definition saves, an enqueue failure
             // for this privacy-sensitive toggle must reach the command/UI.
-            prepare_persona_publication(&app, &state, persona, Some(shared))
+            prepare_persona_publication(&app, &state, relay.ws_url(), persona, Some(shared))
         }
     })
     .await
@@ -76,18 +77,30 @@ pub async fn set_persona_shared(
 pub async fn update_persona_and_publish(
     input: crate::managed_agents::UpdatePersonaRequest,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
 ) -> Result<SetPersonaSharedResult, String> {
-    let (_, prepared) =
-        super::update::update_persona_with(input, app.clone(), |app, state, persona| {
+    let community_relay = relay.ws_url().to_string();
+    let retain_relay = community_relay.clone();
+    let (_, prepared) = super::update::update_persona_with(
+        input,
+        app.clone(),
+        community_relay,
+        move |app, state, persona| {
             // Strict path: this command's contract is to report the publication
             // outcome, so an enqueue failure must reach the UI rather than being
             // logged and swallowed.
-            let result = prepare_persona_publication(app, state, persona, None)?;
+            let result = prepare_persona_publication(app, state, &retain_relay, persona, None)?;
             // F2: refresh any shared 30178 heads that include this persona.
-            crate::commands::refresh_team_catalog_heads_for_persona(app, state, &persona.id);
+            crate::commands::refresh_team_catalog_heads_for_persona(
+                app,
+                state,
+                &retain_relay,
+                &persona.id,
+            );
             Ok(result)
-        })
-        .await?;
+        },
+    )
+    .await?;
 
     let state = app.state::<AppState>();
     publish_prepared_persona(&state, prepared).await

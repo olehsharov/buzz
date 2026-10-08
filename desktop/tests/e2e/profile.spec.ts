@@ -1075,7 +1075,7 @@ test("keeps Send disabled when a stale attachment attempt finishes", async ({
 
 test("proxies feedback attachment previews", async ({ page }) => {
   const sha256 = "c".repeat(64);
-  const proxyUrl = `http://127.0.0.1:54321/media/${sha256}.png`;
+  const proxyUrl = `http://127.0.0.1:54321/media/localhost:3000/${sha256}.png`;
   await installMockBridge(page, {
     uploadDescriptors: [
       {

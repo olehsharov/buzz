@@ -6,7 +6,7 @@
 //! the not-modified hash, and the member-count collection. The Tauri commands
 //! and channel writes stay in `channels.rs`.
 
-use crate::{app_state::AppState, models::ChannelInfo, nostr_convert, relay::query_relay};
+use crate::{app_state::AppState, models::ChannelInfo, nostr_convert, relay::query_relay_at};
 
 pub(super) const DIRECTORY_PAGE_SIZE: usize = 500;
 // Keep this aligned with the relay's aggregate explicit-`#h` request bound.
@@ -29,13 +29,14 @@ pub(super) fn advance_directory_cursor(filter: &mut serde_json::Value, page: &[n
 /// than one page of events shares the same second.
 async fn query_relay_all(
     state: &AppState,
+    api_base_url: &str,
     mut filter: serde_json::Value,
 ) -> Result<Vec<nostr::Event>, String> {
     filter["limit"] = serde_json::json!(DIRECTORY_PAGE_SIZE);
     let mut all = Vec::new();
 
     loop {
-        let page = query_relay(state, &[filter.clone()]).await?;
+        let page = query_relay_at(state, api_base_url, &[filter.clone()]).await?;
         let done = page.len() < DIRECTORY_PAGE_SIZE;
 
         if !done {
@@ -153,11 +154,12 @@ pub(super) fn last_message_filter_batches(
 
 async fn query_last_messages(
     state: &AppState,
+    api_base_url: &str,
     filters: &[serde_json::Value],
 ) -> Result<Vec<nostr::Event>, String> {
     let mut messages = Vec::with_capacity(filters.len());
     for batch in last_message_filter_batches(filters) {
-        messages.extend(query_relay(state, batch).await?);
+        messages.extend(query_relay_at(state, api_base_url, batch).await?);
     }
     Ok(messages)
 }
@@ -193,6 +195,7 @@ pub(super) enum DirectoryScope {
 ///   authoritative empty result.
 pub(super) async fn fetch_channels(
     state: &AppState,
+    api_base_url: &str,
     scope: DirectoryScope,
 ) -> Result<Vec<ChannelInfo>, String> {
     #[cfg(debug_assertions)]
@@ -219,6 +222,7 @@ pub(super) async fn fetch_channels(
             // Step 1: kind:39002 events listing my pubkey as a member.
             let member_events = query_relay_all(
                 state,
+                api_base_url,
                 serde_json::json!({"kinds": [39002], "#p": [&my_pubkey]}),
             )
             .await?;
@@ -250,8 +254,9 @@ pub(super) async fn fetch_channels(
             // kind:39000 is addressable: exactly one event per `d` tag, so a limit
             // equal to the number of ids is both necessary and sufficient.
             let meta_events = if !member_channel_ids.is_empty() {
-                query_relay(
+                query_relay_at(
                     state,
+                    api_base_url,
                     &[serde_json::json!({
                         "kinds": [39000],
                         "#d": &member_channel_ids,
@@ -273,11 +278,13 @@ pub(super) async fn fetch_channels(
         async {
             match scope {
                 DirectoryScope::IncludeOpenDirectory => {
-                    query_relay_all(state, serde_json::json!({"kinds": [39000]})).await
+                    query_relay_all(state, api_base_url, serde_json::json!({"kinds": [39000]}))
+                        .await
                 }
                 DirectoryScope::MemberOnly if !pending_owned_ids.is_empty() => {
-                    query_relay(
+                    query_relay_at(
                         state,
+                        api_base_url,
                         &[serde_json::json!({
                             "kinds": [39000],
                             "#d": &pending_owned_ids,
@@ -292,8 +299,9 @@ pub(super) async fn fetch_channels(
         // Step 6: NIP-DV hidden-DM snapshot. Tolerant — a failure means no DMs
         // are hidden rather than aborting the whole fetch.
         async {
-            let events = query_relay(
+            let events = query_relay_at(
                 state,
+                api_base_url,
                 &[serde_json::json!({
                     "kinds": [buzz_core_pkg::kind::KIND_DM_VISIBILITY],
                     "#p": [&my_pubkey],
@@ -399,12 +407,12 @@ pub(super) async fn fetch_channels(
                 if missing_member_ids.is_empty() {
                     Ok(Vec::new())
                 } else {
-                    query_relay(state, &member_count_filters).await
+                    query_relay_at(state, api_base_url, &member_count_filters).await
                 }
             },
             // Step 5: preserve one indexed filter per channel while keeping
             // every relay request within its aggregate explicit-channel cap.
-            query_last_messages(state, &last_msg_filters),
+            query_last_messages(state, api_base_url, &last_msg_filters),
         );
         // Message timestamps drive the user-selected Recent ordering. Unlike
         // member counts, a failed query must not masquerade as an authoritative

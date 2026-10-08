@@ -24,14 +24,15 @@ async fn created_starter_channels_are_reported_when_metadata_is_unavailable() {
     *state.relay_url_override.lock().unwrap() = Some(url);
 
     let mut changed = Vec::new();
-    let result = ensure_starter_channels_inner(&state, &mut changed).await;
+    let api_base = crate::relay::relay_api_base_url_with_override(&state);
+    let result = ensure_starter_channels_inner(&state, &api_base, &mut changed).await;
     server.abort();
 
     assert_eq!(
         result.err().as_deref(),
         Some("starter channels created but metadata not yet available")
     );
-    let scope = relay_api_base_url_with_override(&state);
+    let scope = crate::relay::relay_api_base_url_with_override(&state);
     let expected: Vec<String> = STARTER_CHANNELS
         .iter()
         .map(|spec| starter_channel_uuid(&scope, spec.slug).to_string())

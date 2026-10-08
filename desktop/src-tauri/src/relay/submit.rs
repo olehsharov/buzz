@@ -75,9 +75,18 @@ pub async fn submit_event(
     builder: nostr::EventBuilder,
     state: &AppState,
 ) -> Result<SubmitEventResponse, String> {
-    let api_base_url = relay_api_base_url_with_override(state);
+    submit_event_at(builder, state, &relay_api_base_url_with_override(state)).await
+}
+
+/// Sign with the active identity and submit to an explicit relay HTTP API
+/// base. Commands scoped to their window's relay (`WindowRelay`) use this.
+pub async fn submit_event_at(
+    builder: nostr::EventBuilder,
+    state: &AppState,
+    api_base_url: &str,
+) -> Result<SubmitEventResponse, String> {
     let keys = state.signing_keys()?;
-    submit_event_at_with_keys(builder, state, &api_base_url, &keys).await
+    submit_event_at_with_keys(builder, state, api_base_url, &keys).await
 }
 
 /// Sign with an explicit identity, submit to an explicit HTTP API base URL,
@@ -111,11 +120,14 @@ pub async fn submit_event_at_created_at(
     Ok((result, created_at))
 }
 
-/// Like `submit_event_with_keys`, but also returns the signed event's
-/// `created_at` — same cursor rationale as [`submit_event_at_created_at`].
-pub async fn submit_event_with_keys_created_at(
+/// Sign with explicit keys (a managed agent's own identity), submit to an
+/// explicit relay HTTP API base with the agent's NIP-OA `auth_tag`, and also
+/// return the signed event's `created_at` — same cursor rationale as
+/// [`submit_event_at_created_at`].
+pub async fn submit_event_with_keys_at_created_at(
     builder: nostr::EventBuilder,
     state: &AppState,
+    api_base_url: &str,
     keys: &nostr::Keys,
     auth_tag: Option<&str>,
 ) -> Result<(SubmitEventResponse, i64), String> {
@@ -123,6 +135,8 @@ pub async fn submit_event_with_keys_created_at(
         .sign_with_keys(keys)
         .map_err(|e| format!("failed to sign event: {e}"))?;
     let created_at = event.created_at.as_secs() as i64;
-    let result = super::submit_signed_event_with_keys(&event, state, keys, auth_tag).await?;
+    let result =
+        super::submit_signed_event_with_keys_at(&event, state, api_base_url, keys, auth_tag)
+            .await?;
     Ok((result, created_at))
 }

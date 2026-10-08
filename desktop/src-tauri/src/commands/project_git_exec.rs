@@ -346,12 +346,12 @@ pub(crate) fn validate_local_clone_url(clone_url: &str) -> Result<(), String> {
 
 pub(crate) fn validate_local_clone_url_for_workspace(
     clone_url: &str,
-    state: &AppState,
+    relay: &crate::window_relay::WindowRelay,
 ) -> Result<(), String> {
     if validate_github_clone_url(clone_url).is_ok() {
         return Ok(());
     }
-    validate_workspace_clone_url(clone_url, state)
+    validate_workspace_clone_url(clone_url, relay)
 }
 
 pub(crate) fn clone_url_owner(clone_url: &str) -> Option<String> {
@@ -364,12 +364,13 @@ pub(crate) fn clone_url_owner(clone_url: &str) -> Option<String> {
     (segments.len() == index + 3).then(|| segments[index + 1].to_ascii_lowercase())
 }
 
+/// Validate a project clone URL against the invoking window's community
+/// relay: a community window's projects live on its own relay.
 pub(crate) fn validate_workspace_clone_url(
     clone_url: &str,
-    state: &AppState,
+    relay: &crate::window_relay::WindowRelay,
 ) -> Result<(), String> {
-    let relay_base = crate::relay::relay_api_base_url_with_override(state);
-    validate_clone_url_against_relay(clone_url, &relay_base)
+    validate_clone_url_against_relay(clone_url, &relay.api_base())
 }
 
 fn validate_clone_url_against_relay(clone_url: &str, relay_base: &str) -> Result<(), String> {

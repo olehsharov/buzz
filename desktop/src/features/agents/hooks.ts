@@ -1,4 +1,6 @@
 import * as React from "react";
+import { listAgentHosts } from "@/shared/api/agentHosts";
+import { excludeMachineAgents } from "@/features/agents/hosts/hostRunOptions";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
@@ -382,11 +384,25 @@ export function useManagedAgentPrereqsQuery(
   });
 }
 
+/**
+ * A machine's host key authenticates as one of the owner's NIP-OA agents, so
+ * the relay reports it as an agent. Machines are not agents: drop approved
+ * machine keys from the agent list every picker, mention source and roster
+ * builds on.
+ */
+async function listRelayAgentsWithoutMachines() {
+  const [agents, hosts] = await Promise.all([
+    listRelayAgents(),
+    listAgentHosts().catch(() => []),
+  ]);
+  return excludeMachineAgents(agents, hosts);
+}
+
 export function useRelayAgentsQuery(options?: { enabled?: boolean }) {
   const refetchInterval = useFocusedRefetchInterval(AGENTS_FOCUS_STALE_TIME_MS);
   return useQuery({
     queryKey: relayAgentsQueryKey,
-    queryFn: listRelayAgents,
+    queryFn: listRelayAgentsWithoutMachines,
     // Relay agent discovery is scoped to the viewer's relay-signed channel
     // memberships, then resolves exact agent/profile/policy coordinates in
     // protocol-sized batches. Polling remains the only refresh path for remote

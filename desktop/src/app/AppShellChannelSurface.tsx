@@ -11,6 +11,7 @@ type AppShellChannelSurfaceProps = {
   hasCommunityRail: boolean;
   isHuddleRoom: boolean;
   isHuddleRoomStarting: boolean;
+  isPopout?: boolean;
   mainInsetRef: React.RefObject<HTMLElement | null>;
   terminal?: React.ReactNode;
 };
@@ -20,12 +21,15 @@ export function AppShellChannelSurface({
   hasCommunityRail,
   isHuddleRoom,
   isHuddleRoomStarting,
+  isPopout = false,
   mainInsetRef,
   terminal,
 }: AppShellChannelSurfaceProps) {
   const { isMobile, openMobile, state: sidebarState } = useSidebar();
+  // Auxiliary windows have no sidebar to frame the content against.
+  const unframed = isHuddleRoom || isPopout;
   const hasCollapsedSidebarGutter =
-    !isHuddleRoom &&
+    !unframed &&
     !hasCommunityRail &&
     (isMobile ? !openMobile : sidebarState === "collapsed");
 
@@ -35,11 +39,11 @@ export function AppShellChannelSurface({
         ref={mainInsetRef}
         className={cn(
           "isolate z-0 min-h-0 min-w-0 overflow-hidden",
-          isHuddleRoom ? "bg-background" : "bg-sidebar",
+          unframed ? "bg-background" : "bg-sidebar",
           hasCollapsedSidebarGutter && "pl-2",
         )}
-        data-buzz-content-surface={isHuddleRoom ? true : undefined}
-        data-buzz-content-unframed={isHuddleRoom ? true : undefined}
+        data-buzz-content-surface={unframed ? true : undefined}
+        data-buzz-content-unframed={unframed ? true : undefined}
         data-buzz-glass-inset
         data-buzz-shadow-viewport
         style={chromeCssVarDefaults as React.CSSProperties}
@@ -51,7 +55,7 @@ export function AppShellChannelSurface({
           />
         ) : null}
         {isHuddleRoom && !isHuddleRoomStarting ? <HuddleRoomHeader /> : null}
-        <BuzzTheme.ContentSurface terminal={terminal} unframed={isHuddleRoom}>
+        <BuzzTheme.ContentSurface terminal={terminal} unframed={unframed}>
           {isHuddleRoomStarting ? <HuddleStartingView /> : children}
         </BuzzTheme.ContentSurface>
       </SidebarInset>

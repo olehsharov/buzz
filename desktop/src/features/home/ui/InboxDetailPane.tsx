@@ -246,6 +246,7 @@ function InboxMessageDetailPane({
         fullTimestampLabel: item.fullTimestampLabel,
         id: item.id,
         isSelected: true,
+        mentionAll: item.mentionAll,
         mentionNames: item.mentionNames,
         mentionPubkeysByName: item.mentionPubkeysByName,
         kind: item.item.kind,

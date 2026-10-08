@@ -251,7 +251,7 @@ export const MessageRow = React.memo(
       },
       [currentPubkey, onSendToChannel, profiles],
     );
-    const { mentionNames, mentionPubkeysByName } = React.useMemo(
+    const { mentionAll, mentionNames, mentionPubkeysByName } = React.useMemo(
       () => resolveMentionProps(message.tags, profiles, message.body),
       [profiles, message.tags, message.body],
     );
@@ -453,6 +453,7 @@ export const MessageRow = React.memo(
               customEmoji={customEmoji}
               imetaByUrl={imetaByUrl}
               agentMentionPubkeysByName={agentMentionPubkeysByName}
+              mentionAll={mentionAll}
               mentionNames={mentionNames}
               mentionPubkeysByName={mentionPubkeysByName}
               searchQuery={searchQuery}

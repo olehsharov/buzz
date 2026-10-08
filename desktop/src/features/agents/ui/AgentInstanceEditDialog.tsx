@@ -682,8 +682,8 @@ export function AgentInstanceEditDialog({
       const input: UpdateManagedAgentInput = {
         pubkey: agent.pubkey,
         name: name.trim() !== agent.name ? name.trim() : undefined,
-        // relayUrl deliberately never submitted: the legacy per-record pin is
-        // ignored (#2122) and the stored value is preserved as-is.
+        // relayUrl is never submitted: it is the agent's community, fixed at
+        // creation (the backend ignores it on update).
         acpCommand:
           acpCommand.trim() !== agent.acpCommand
             ? acpCommand.trim()
@@ -1008,7 +1008,7 @@ export function AgentInstanceEditDialog({
               onAllowlistChange={setRespondToAllowlist}
               onModeChange={setRespondTo}
             />
-            <RunOnSummarySection backend={agent.backend} />
+            <RunOnSummarySection agent={agent} />
 
             {/* Provider (runtime) */}
             <div className="space-y-1.5">

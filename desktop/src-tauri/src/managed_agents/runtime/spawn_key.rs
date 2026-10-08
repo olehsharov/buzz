@@ -15,9 +15,15 @@ pub(crate) fn bound_runtime_key(
     record: &ManagedAgentRecord,
     workspace_relay: &crate::relay::ScopedWorkspaceRelay,
 ) -> Result<ManagedAgentRuntimeKey, String> {
-    let relay_url =
-        crate::relay::effective_agent_relay_url(&record.relay_url, workspace_relay.as_str());
-    ManagedAgentRuntimeKey::new(record.pubkey.clone(), &relay_url)
+    // An agent belongs to ONE community: refuse to spawn it on any other
+    // relay rather than key a pair where it must not run.
+    crate::relay::ensure_agent_belongs_to_relay(
+        &record.name,
+        &record.relay_url,
+        workspace_relay.as_str(),
+        workspace_relay.as_str(),
+    )?;
+    ManagedAgentRuntimeKey::new(record.pubkey.clone(), workspace_relay.as_str())
 }
 
 #[cfg(test)]
@@ -68,17 +74,26 @@ mod tests {
     }
 
     #[test]
-    fn production_spawn_key_ignores_a_legacy_record_pin() {
-        // agents-everywhere (#2122): the stored per-record pin never
-        // contributes; the bound workspace relay is the only input. Pins the
-        // same contract at the production seam so a regression re-honoring
-        // the pin fails loudly.
-        let record = record(&"bb".repeat(32), "wss://stale-pin.example");
+    fn production_spawn_key_refuses_an_agent_from_another_community() {
+        // Agents belong to ONE community (narrows #2122): an agent pinned to
+        // another relay must never be keyed (and so never spawned) here.
+        let record = record(&"bb".repeat(32), "wss://other-community.example");
         let bound =
             crate::relay::bind_expected_relay_scope(None, "wss://tenant-a.example".to_string())
                 .expect("unscoped bind");
 
-        let key = bound_runtime_key(&record, &bound).expect("keyable record and relay");
+        let error = bound_runtime_key(&record, &bound).expect_err("foreign agent refused");
+        assert!(error.contains("belongs to the community on wss://other-community.example"));
+    }
+
+    #[test]
+    fn production_spawn_key_accepts_the_agents_own_community() {
+        let record = record(&"bb".repeat(32), "WSS://Tenant-A.example:443/");
+        let bound =
+            crate::relay::bind_expected_relay_scope(None, "wss://tenant-a.example".to_string())
+                .expect("unscoped bind");
+
+        let key = bound_runtime_key(&record, &bound).expect("own community");
         assert_eq!(key.relay_url, "wss://tenant-a.example");
     }
 }

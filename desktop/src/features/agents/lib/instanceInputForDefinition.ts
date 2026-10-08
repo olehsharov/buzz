@@ -82,11 +82,15 @@ export function resolveStartRuntimeForDefinition(
  *   is true because the preset commands deliberately override the
  *   definition's runtime preference.
  */
-export type BackendIntent = {
-  type: "provider";
-  id: string;
-  config: Record<string, unknown>;
-};
+export type BackendIntent =
+  | {
+      type: "provider";
+      id: string;
+      config: Record<string, unknown>;
+    }
+  /** An approved agent host. Same create shape as a provider: nothing local
+   * is spawned, and the deploy waits for the machine's acknowledgement. */
+  | { type: "host"; hostPubkey: string };
 
 /**
  * The single definition→instance mapping (Phase 1B.3.5 rows 2–4). Every
@@ -124,6 +128,16 @@ export async function buildInstanceInputForDefinition(
     systemPrompt: persona.systemPrompt,
     avatarUrl,
   };
+
+  if (backendIntent?.type === "host") {
+    return {
+      ...base,
+      harnessOverride: false,
+      spawnAfterCreate: true,
+      startOnAppLaunch: false,
+      backend: { type: "host", host_pubkey: backendIntent.hostPubkey },
+    };
+  }
 
   if (backendIntent?.type === "provider") {
     return {

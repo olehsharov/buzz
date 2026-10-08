@@ -42,6 +42,31 @@ fn nest_skill_contains_safe_mention_workflow() {
 }
 
 #[test]
+fn nest_skill_teaches_plain_text_replies_in_streaming_mode() {
+    assert!(BUZZ_CLI_SKILL_MD.contains("### Replying in Streaming Mode"));
+    assert!(BUZZ_CLI_SKILL_MD.contains("\"Reply Delivery\" section"));
+    assert!(BUZZ_CLI_SKILL_MD.contains("do not use `buzz messages send` for the direct reply"));
+}
+
+#[test]
+fn refresh_skill_upgrades_installs_from_before_streaming_replies() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join(".buzz");
+    ensure_nest_at(&root).unwrap();
+
+    // Version 6 is the last skill without the streaming-reply section.
+    let skill_dir = root.join(".agents/skills/buzz-cli");
+    fs::write(skill_dir.join("SKILL.md"), "version 6 skill content").unwrap();
+    fs::write(skill_dir.join(".skill-version"), "6\n").unwrap();
+
+    ensure_nest_at(&root).unwrap();
+
+    let content = fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+    assert_eq!(content, BUZZ_CLI_SKILL_MD);
+    assert!(content.contains("### Replying in Streaming Mode"));
+}
+
+#[test]
 fn nest_agents_template_separates_commit_attribution_claims() {
     assert_eq!(AGENTS_MD.matches("## Git Commit Attribution").count(), 1);
     assert!(AGENTS_MD.contains(

@@ -6,6 +6,7 @@ import { JSDOM } from "jsdom";
 import * as React from "react";
 import ts from "typescript";
 import * as draftStore from "../../messages/lib/useDrafts.ts";
+import * as sendFlowHelpers from "../../messages/ui/useMentionSendFlow.helpers.ts";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", {
   url: "http://localhost",
@@ -140,6 +141,8 @@ async function setup(options = {}) {
           settlePendingMentionBindings: async () => {
             if (control.settle) await control.settle.promise;
           },
+          resolveMentionAllForSend: async () =>
+            control.mentionAll ?? { status: "none" },
           cancelMentionAutocomplete: noop,
           updateMentionQuery: noop,
           clearMentions: () => {
@@ -201,6 +204,7 @@ async function setup(options = {}) {
     "@/features/messages/lib/imetaMediaMarkdown": {
       buildOutgoingMessage: (content, imeta) => ({ content, mediaTags: imeta }),
     },
+    "@/features/messages/ui/useMentionSendFlow.helpers": sendFlowHelpers,
     "@/features/messages/ui/NonMemberMentionDialog": {
       NonMemberMentionDialog: (props) => {
         prompt = props;
@@ -576,3 +580,39 @@ for (const action of ["navigation", "return", "edit", "unmount"]) {
     if (action === "edit") assert.equal(s.text, "new authored draft");
   });
 }
+
+const ALICE = "c".repeat(64);
+const BOB = "d".repeat(64);
+
+test("forum @all publishes the resolved recipients plus the group marker", async () => {
+  const s = await setup();
+  s.control.mentionAll = { status: "resolved", recipients: [ALICE, BOB] };
+  s.edit("@all standup moved", []);
+  await s.submit();
+  const sends = s.calls.filter((call) => call[0] === "send");
+  assert.equal(sends.length, 1);
+  const [, , content, pubkeys, mediaTags] = sends[0];
+  assert.equal(content, "@all standup moved");
+  // The composer runs in a vm realm; compare by value across realms.
+  assert.deepEqual(JSON.parse(JSON.stringify(pubkeys)), [ALICE, BOB]);
+  assert.deepEqual(JSON.parse(JSON.stringify(mediaTags)), [
+    ["buzz:mention-group", "all"],
+  ]);
+});
+
+test("forum @all blocked at send keeps the draft and publishes nothing", async () => {
+  const s = await setup();
+  s.control.mentionAll = {
+    status: "blocked",
+    message:
+      "@all can notify at most 50 members. This channel has 51 besides you.",
+  };
+  s.edit("@all standup moved", []);
+  await s.submit();
+  assert.equal(s.calls.filter((call) => call[0] === "send").length, 0);
+  assert.deepEqual(
+    s.calls.filter((call) => call[0] === "error").map((call) => call[1]),
+    ["@all can notify at most 50 members. This channel has 51 besides you."],
+  );
+  assert.equal(s.text, "@all standup moved");
+});

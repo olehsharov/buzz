@@ -41,6 +41,8 @@ export type MarkdownRuntime = {
   imetaByUrl?: ImetaLookup;
   /** Inline content supplied to the first prose-capable Markdown block. */
   leadingInlineContent?: React.ReactNode;
+  /** Render an owned `@all` token as the group pill (see `resolveMentionProps`). */
+  mentionAll?: boolean;
   mentionPubkeysByName?: Record<string, string>;
   onOpenChannel: (channelId: string) => void;
   /** Navigate to a Buzz git entity (`buzz://pr|issue|repo` deep link). */
@@ -90,6 +92,8 @@ export type MarkdownProps = {
    */
   blockCode?: boolean;
   agentMentionPubkeysByName?: Record<string, string>;
+  /** The event carries the `@all` marker; see `resolveMentionProps`. */
+  mentionAll?: boolean;
   mentionNames?: string[];
   mentionPubkeysByName?: Record<string, string>;
   mediaInset?: boolean;

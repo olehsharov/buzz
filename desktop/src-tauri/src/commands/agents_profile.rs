@@ -130,6 +130,14 @@ pub(crate) fn load_pending_profile_reconciliations(
         // A queue write deliberately precedes the migrated agent-store write.
         // If the process dies between them, retain (but do not execute) the
         // stale item until the next boot finishes renaming the record.
+        // A kind:0 profile is published only where the agent belongs.
+        .filter(|record| {
+            crate::relay::agent_belongs_to_relay(
+                &record.relay_url,
+                workspace_relay,
+                workspace_relay,
+            )
+        })
         .filter(|record| {
             pending.iter().any(|entry| {
                 entry.pubkey == record.pubkey
@@ -203,6 +211,7 @@ pub(crate) async fn reconcile_agent_profile<R: tauri::Runtime>(
     let relay_url = resolve_reconcile_relay(
         data.target_relay_url.as_deref(),
         &data.relay_url,
+        // window-relay: unassigned-record fallback behind the pinned target.
         &relay_ws_url_with_override(state),
     );
 

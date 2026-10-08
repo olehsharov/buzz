@@ -6,11 +6,13 @@ import { setupAudioWorklet, type AudioWorkletHandle } from "./lib/audioWorklet";
 import { type AudioInputDevice, useAudioDevices } from "./lib/useAudioDevices";
 import { usePipelineHotstart } from "./lib/usePipelineHotstart";
 import { formatHuddleActionError } from "./lib/huddleError";
+import { acquireMicrophone } from "./lib/microphone";
 import {
   type VoiceInputMode,
   useHuddlePttState,
 } from "./lib/useHuddlePttState";
 import { useHuddleSpeakerActivity } from "./lib/useHuddleSpeakerActivity";
+import { isCommunityWindow } from "@/shared/lib/windowKind";
 import { useMicLevelAnalyser } from "./lib/useMicLevelAnalyser";
 import { useTtsSubscription } from "./lib/useTtsSubscription";
 import type {
@@ -567,17 +569,16 @@ export function HuddleProvider({
 
       // Get mic — Rust backend owns the audio WS connection.
       // Request 48 kHz to match the Opus encoder and worklet buffer size (960 samples = 20ms).
-      const audioConstraints: MediaTrackConstraints = {
-        echoCancellation: true,
-        noiseSuppression: true,
-        sampleRate: 48000,
-      };
-      if (selectedDeviceId) {
-        audioConstraints.deviceId = { exact: selectedDeviceId };
+      // A selected device that is gone falls back once to the system default.
+      const { stream, fellBackToDefault } = await acquireMicrophone(
+        (constraints) => navigator.mediaDevices.getUserMedia(constraints),
+        { echoCancellation: true, noiseSuppression: true, sampleRate: 48000 },
+        selectedDeviceId,
+      );
+      if (fellBackToDefault) {
+        // Forget the missing device so the next huddle doesn't retry it.
+        setLocalSelectedDeviceId("");
       }
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: audioConstraints,
-      });
       const audioTrack = stream.getAudioTracks()[0];
 
       // Wrap post-getUserMedia steps so the stream is always cleaned up on
@@ -619,7 +620,7 @@ export function HuddleProvider({
         throw err;
       }
     },
-    [getVoiceInputMode, selectedDeviceId],
+    [getVoiceInputMode, selectedDeviceId, setLocalSelectedDeviceId],
   );
 
   const startHuddle = React.useCallback(
@@ -628,6 +629,11 @@ export function HuddleProvider({
       memberPubkeys: string[],
       channelName?: string,
     ) => {
+      // Huddle audio is owned by the main window (one capture pipeline, one
+      // native huddle state on the main community's relay).
+      if (isCommunityWindow()) {
+        throw new Error(HUDDLES_IN_MAIN_WINDOW_ONLY);
+      }
       if (busyRef.current) return;
       busyRef.current = true;
 
@@ -708,6 +714,11 @@ export function HuddleProvider({
       ephemeralChannelId: string,
       huddleThreadEventId?: string,
     ) => {
+      // Huddle audio is owned by the main window (one capture pipeline, one
+      // native huddle state on the main community's relay).
+      if (isCommunityWindow()) {
+        throw new Error(HUDDLES_IN_MAIN_WINDOW_ONLY);
+      }
       if (busyRef.current) return;
       busyRef.current = true;
       tokenRef.current += 1;
@@ -975,3 +986,7 @@ export function useHuddleLevels(): HuddleLevelsValue {
   }
   return ctx;
 }
+
+/** Shown when a huddle is started or joined from a community window. */
+export const HUDDLES_IN_MAIN_WINDOW_ONLY =
+  "Huddles run in the main Buzz window. Switch the main window to this community to start or join one.";

@@ -4,12 +4,7 @@ use nostr::{
 use tauri::Manager;
 use tauri::State;
 
-use crate::{
-    app_state::AppState,
-    models::IdentityInfo,
-    nostr_bind,
-    relay::{self, relay_api_base_url_with_override, relay_ws_url_with_override},
-};
+use crate::{app_state::AppState, models::IdentityInfo, nostr_bind, relay};
 
 /// Encode `pubkey` as npub bech32 and truncate it for display: first 8
 /// chars, an ellipsis, then the last 4 chars, mirroring the frontend
@@ -114,14 +109,17 @@ pub fn is_shared_identity() -> bool {
             .is_some()
 }
 
+/// The relay WebSocket URL of the invoking window: its bound community relay
+/// in a community window, the workspace relay everywhere else.
 #[tauri::command]
-pub fn get_relay_ws_url(state: State<'_, AppState>) -> String {
-    relay_ws_url_with_override(&state)
+pub fn get_relay_ws_url(relay: crate::window_relay::WindowRelay) -> String {
+    relay.ws_url().to_string()
 }
 
+/// The relay HTTP API base of the invoking window (see [`get_relay_ws_url`]).
 #[tauri::command]
-pub fn get_relay_http_url(state: State<'_, AppState>) -> String {
-    relay_api_base_url_with_override(&state)
+pub fn get_relay_http_url(relay: crate::window_relay::WindowRelay) -> String {
+    relay.api_base()
 }
 
 #[tauri::command]

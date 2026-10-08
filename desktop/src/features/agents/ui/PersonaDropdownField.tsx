@@ -5,8 +5,10 @@ import { cn } from "@/shared/lib/cn";
 import {
   DropdownMenu,
   DropdownMenuContent,
+  DropdownMenuItem,
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/shared/ui/dropdown-menu";
 import {
@@ -14,12 +16,13 @@ import {
   PERSONA_FIELD_CONTROL_CLASS,
   PERSONA_FIELD_SHELL_CLASS,
 } from "./agentConfigOptions";
-import { OptionLabel } from "./PersonaDropdownOptionLabel";
+import { OptionLabel, PresenceSlot } from "./PersonaDropdownOptionLabel";
 
 export function PersonaDropdownField({
   ariaDescribedBy,
   contentClassName,
   disabled,
+  footerAction,
   id,
   onValueChange,
   options,
@@ -29,6 +32,8 @@ export function PersonaDropdownField({
   ariaDescribedBy?: string;
   contentClassName?: string;
   disabled?: boolean;
+  /** A command after the options (e.g. "Add machine…"); never a value. */
+  footerAction?: { label: string; onSelect: () => void; testId?: string };
   id: string;
   onValueChange: (value: string) => void;
   options: readonly PersonaDropdownOption[];
@@ -37,6 +42,9 @@ export function PersonaDropdownField({
 }) {
   const [open, setOpen] = React.useState(false);
   const selectedOption = options.find((option) => option.value === value);
+  // One left edge for every row: the radio indicator slot (pl-8) for all,
+  // plus the presence-dot slot for all when any option has a dot.
+  const reservePresenceSlot = options.some((option) => option.presence);
 
   return (
     <div className={PERSONA_FIELD_SHELL_CLASS}>
@@ -92,11 +100,30 @@ export function PersonaDropdownField({
                   key={option.value}
                   value={option.value}
                 >
-                  <OptionLabel option={option} />
+                  <OptionLabel
+                    option={option}
+                    reservePresenceSlot={reservePresenceSlot}
+                  />
                 </DropdownMenuRadioItem>
               ))}
             </DropdownMenuRadioGroup>
           </div>
+          {footerAction ? (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                data-testid={footerAction.testId}
+                inset
+                onSelect={() => {
+                  setOpen(false);
+                  footerAction.onSelect();
+                }}
+              >
+                {reservePresenceSlot ? <PresenceSlot /> : null}
+                {footerAction.label}
+              </DropdownMenuItem>
+            </>
+          ) : null}
         </DropdownMenuContent>
       </DropdownMenu>
     </div>

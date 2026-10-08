@@ -101,6 +101,9 @@ pub(super) fn add_verified_team(
     scope: crate::managed_agents::retention::RetentionScope,
     source: &TeamCatalogSource,
     content: &TeamCatalogContent,
+    // The invoking window: the fence below re-resolves ITS relay, so a
+    // community window's adoption fences against its own binding.
+    relay: &crate::window_relay::WindowRelay,
 ) -> Result<AddTeamFromCatalogResult, String> {
     let state = app.state::<AppState>();
     // Held across load, plan, and save: the replay check is only meaningful if
@@ -117,9 +120,10 @@ pub(super) fn add_verified_team(
     // commit A's team into the workspace-global stores and enqueue A's owner
     // heads in B's retention db, so B's flush publishes A's config into the wrong
     // community.
+    let current_relay = crate::window_relay::relay_ws_url_for_window(&state, relay.label())?;
     assert_adoption_scope_unchanged(
         &scope,
-        &crate::relay::relay_api_base_url_with_override(&state),
+        &crate::relay::relay_http_base_url(&current_relay),
         &state.signing_keys()?.public_key().to_hex(),
     )?;
 

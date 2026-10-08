@@ -257,6 +257,7 @@ function AgentDeleteConfirmDialog({
   open: boolean;
 }) {
   const isProviderAgent = agent.backend.type === "provider";
+  const isHostAgent = agent.backend.type === "host";
 
   return (
     <AlertDialog onOpenChange={onOpenChange} open={open}>
@@ -266,7 +267,9 @@ function AgentDeleteConfirmDialog({
           <AlertDialogDescription>
             {isProviderAgent
               ? "Deleting removes this agent’s local management record, not its remote deployment."
-              : "Deleting this agent stops and removes the agent from this community."}
+              : isHostAgent
+                ? "Deleting first removes this agent from its machine, then removes it from this community."
+                : "Deleting this agent stops and removes the agent from this community."}
           </AlertDialogDescription>
         </AlertDialogHeader>
         <ul className="list-disc space-y-1.5 pl-5 text-sm text-muted-foreground">
@@ -279,7 +282,9 @@ function AgentDeleteConfirmDialog({
           <li>
             {isProviderAgent
               ? "Unless the agent is known to be Offline, Buzz first requests shutdown through a channel when available. A failed request cancels deletion. The remote process may still be running even after a successful request."
-              : "Stops any local agent process before deleting the record"}
+              : isHostAgent
+                ? "Asks the machine to stop and remove the agent, and waits for it to confirm"
+                : "Stops any local agent process before deleting the record"}
           </li>
         </ul>
         <p className="text-sm text-muted-foreground">

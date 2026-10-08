@@ -6,7 +6,7 @@ import {
 } from "@/features/agents/hooks";
 import {
   coalesceAgentAutocompleteCandidates,
-  getMentionableAgentPubkeys,
+  getDirectMessageRecipientAgentPubkeys,
   getSharedChannelIds,
 } from "@/features/agents/lib/agentAutocompleteEligibility";
 import { useChannelsQuery } from "@/features/channels/hooks";
@@ -109,9 +109,9 @@ export function useNewMessageRecipients({
     const currentPubkeyNormalized = currentPubkey
       ? normalizePubkey(currentPubkey)
       : null;
-    const eligibleAgentPubkeys = getMentionableAgentPubkeys({
+    // A DM reaches only the viewer's own agents; others ignore it.
+    const eligibleAgentPubkeys = getDirectMessageRecipientAgentPubkeys({
       currentPubkey,
-      eligibilityScope: { type: "community" },
       managedAgentPubkeys: (managedAgentsQuery.data ?? []).map(
         (agent) => agent.pubkey,
       ),

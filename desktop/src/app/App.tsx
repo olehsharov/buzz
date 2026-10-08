@@ -1,5 +1,6 @@
 import { isTauri } from "@tauri-apps/api/core";
 import { emit } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { RouterProvider } from "@tanstack/react-router";
 import {
@@ -23,7 +24,17 @@ import { CommunityThemeController } from "@/shared/theme/CommunityThemeControlle
 import { useReloadShortcut } from "@/app/useReloadShortcut";
 import { useCloseWindowShortcut } from "@/app/useCloseWindowShortcut";
 import { KnownAgentPubkeysProvider } from "@/features/agents/useKnownAgentPubkeys";
-import { huddleWindowChannelId } from "@/features/huddle/lib/huddleWindow";
+import { getPopoutSession } from "@/features/popout/popoutSession";
+import { usePopoutCommunityGate } from "@/features/popout/popoutCommunityGate";
+import {
+  openInMainWindow,
+  PopoutUnavailableState,
+} from "@/features/popout/ui/PopoutChrome";
+import {
+  isCommunityWindow,
+  isMainWindow,
+  isPopoutWindow,
+} from "@/shared/lib/windowKind";
 import { useAppOnboardingState } from "@/features/onboarding/hooks";
 import { useMachineOnboardingState } from "@/features/onboarding/machineOnboarding";
 import {
@@ -695,6 +706,179 @@ function CommunityApp({
   );
 }
 
+/**
+ * Pop-out community boundary. Unlike CommunityApp it never applies the
+ * workspace to the backend, never switches or persists the active community,
+ * and renders only while popoutCommunityGate reports that its community is
+ * the one the main window (and backend) has active; otherwise it pauses and
+ * tears down this window's relay connection and community singletons.
+ */
+function PopoutCommunityApp({
+  currentPubkey,
+  sharedIdentity,
+}: {
+  currentPubkey: string | null;
+  sharedIdentity: boolean;
+}) {
+  const communityId = getPopoutSession()?.communityId ?? null;
+  if (!communityId) return <PopoutUnavailableState kind="empty" />;
+  return (
+    <PopoutGatedCommunityApp
+      communityId={communityId}
+      currentPubkey={currentPubkey}
+      sharedIdentity={sharedIdentity}
+    />
+  );
+}
+
+function PopoutGatedCommunityApp({
+  communityId,
+  currentPubkey,
+  sharedIdentity,
+}: {
+  communityId: string;
+  currentPubkey: string | null;
+  sharedIdentity: boolean;
+}) {
+  const { activeCommunity, communities, reinitKey } = useCommunities();
+  const gate = usePopoutCommunityGate(
+    communityId,
+    getPopoutSession()?.bound === true,
+  );
+  const isActive = gate.status === "active" && activeCommunity !== null;
+  const communityKey = `popout-${communityId}-${activeCommunity?.relayUrl ?? ""}-${reinitKey}-${currentPubkey ?? "anonymous"}`;
+  // A null community is the pause path: useCommunityInit disconnects the
+  // relay and resets this window's singletons without touching the backend.
+  const community = useCommunityInit(
+    isActive ? activeCommunity : null,
+    communityKey,
+    sharedIdentity,
+    true,
+    communities,
+    { popout: true },
+  );
+  const communityApplied =
+    isActive && community.isReady && community.appliedKey === communityKey;
+
+  if (gate.status === "missing") {
+    return <PopoutUnavailableState kind="missing" />;
+  }
+  if (gate.status === "paused") {
+    return (
+      <PopoutUnavailableState
+        communityName={gate.community?.name}
+        kind="paused"
+      />
+    );
+  }
+  if ("error" in community && community.error) {
+    return (
+      <CommunityApplyErrorScreen
+        error={community.error}
+        onChangeCommunity={() => openInMainWindow(null, true)}
+        onRetry={() => window.location.reload()}
+      />
+    );
+  }
+  if (!communityApplied) return <CommunitySwitchGate />;
+  return (
+    <CommunityQueryProvider
+      key={communityKey}
+      pubkey={community.identityPubkey}
+      relayUrl={activeCommunity?.relayUrl ?? null}
+    >
+      <CommunityThemeController />
+      <AppReady
+        continueOnboarding={false}
+        isCommunitySwitch
+        isSharedIdentity={sharedIdentity}
+        key={communityKey}
+      />
+    </CommunityQueryProvider>
+  );
+}
+
+/**
+ * Community-window boundary (`community-<id>`): a whole second community
+ * beside the main window. Like a pop-out it never applies the workspace or
+ * persists the active community; instead its community init binds this
+ * window's relay natively, so every relay command it makes targets its own
+ * community while the main window keeps the workspace. It renders only once
+ * that binding has succeeded.
+ */
+function CommunityWindowApp({
+  currentPubkey,
+  sharedIdentity,
+}: {
+  currentPubkey: string | null;
+  sharedIdentity: boolean;
+}) {
+  const { activeCommunity, communities, reinitKey } = useCommunities();
+  const communityKey = `community-window-${activeCommunity?.id ?? "none"}-${activeCommunity?.relayUrl ?? ""}-${reinitKey}-${currentPubkey ?? "anonymous"}`;
+  const community = useCommunityInit(
+    activeCommunity,
+    communityKey,
+    sharedIdentity,
+    true,
+    communities,
+    { communityWindow: true },
+  );
+  useCloseWhenCommunityRemoved(activeCommunity !== null);
+  const communityApplied =
+    activeCommunity !== null &&
+    community.isReady &&
+    community.appliedKey === communityKey;
+
+  if (activeCommunity === null) {
+    return <PopoutUnavailableState kind="missing" />;
+  }
+  if ("error" in community && community.error) {
+    return (
+      <CommunityApplyErrorScreen
+        error={community.error}
+        onChangeCommunity={() => openInMainWindow(null, true)}
+        onRetry={() => window.location.reload()}
+      />
+    );
+  }
+  if (!communityApplied) return <CommunitySwitchGate />;
+  return (
+    <CommunityQueryProvider
+      key={communityKey}
+      pubkey={community.identityPubkey}
+      relayUrl={activeCommunity.relayUrl}
+    >
+      <CommunityThemeController />
+      <AppReady
+        continueOnboarding={false}
+        isCommunitySwitch
+        isSharedIdentity={sharedIdentity}
+        key={communityKey}
+      />
+    </CommunityQueryProvider>
+  );
+}
+
+/**
+ * A community window whose community is removed from this device closes:
+ * its relay binding would otherwise outlive the community it belonged to.
+ */
+function useCloseWhenCommunityRemoved(hasCommunity: boolean) {
+  const hadCommunityRef = useRef(hasCommunity);
+  useEffect(() => {
+    if (hasCommunity) {
+      hadCommunityRef.current = true;
+      return;
+    }
+    if (!hadCommunityRef.current || !isTauri()) return;
+    void getCurrentWindow()
+      .close()
+      .catch((error: unknown) => {
+        console.error("Failed to close the community window:", error);
+      });
+  }, [hasCommunity]);
+}
+
 function MachineBootstrap({ sharedIdentity }: { sharedIdentity: boolean }) {
   const { activeCommunity } = useCommunities();
   const communityOnboarding = useCommunityOnboarding();
@@ -738,7 +922,7 @@ function MachineBootstrap({ sharedIdentity }: { sharedIdentity: boolean }) {
   // Community links are app-global work. A Huddle companion loads the same
   // React tree, but must never race the main window for the native pending-link
   // queue or replace its dedicated transcript surface with onboarding.
-  const acceptsCommunityDeepLinks = huddleWindowChannelId() === null;
+  const acceptsCommunityDeepLinks = isMainWindow();
   useEffect(() => {
     if (!acceptsCommunityDeepLinks) return;
 
@@ -756,6 +940,22 @@ function MachineBootstrap({ sharedIdentity }: { sharedIdentity: boolean }) {
   if (machine.stage === "keyring-locked") return <KeyringLockedScreen />;
   if (machine.stage === "relaunch-required") return <RelaunchRequiredScreen />;
   if (machine.stage === "blocking") return <AppLoadingGate />;
+  if (machine.stage === "ready" && isCommunityWindow()) {
+    return (
+      <CommunityWindowApp
+        currentPubkey={machine.currentPubkey}
+        sharedIdentity={sharedIdentity}
+      />
+    );
+  }
+  if (machine.stage === "ready" && isPopoutWindow()) {
+    return (
+      <PopoutCommunityApp
+        currentPubkey={machine.currentPubkey}
+        sharedIdentity={sharedIdentity}
+      />
+    );
+  }
   if (machine.stage === "ready") {
     return (
       <CommunityApp

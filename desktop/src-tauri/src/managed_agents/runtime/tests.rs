@@ -2,6 +2,29 @@ use crate::managed_agents::known_acp_runtime;
 #[path = "cli_tests.rs"]
 mod cli_tests;
 
+// ── summary mirrors provider_policy_pending ─────────────────────────────
+
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn summary_mirrors_provider_policy_pending() {
+    let test = crate::managed_agents::admission_test_support::app_with_keyless_agent();
+    let handle = test.app.handle();
+    let mut record = crate::managed_agents::load_managed_agents(handle).unwrap()[0].clone();
+    for pending in [true, false] {
+        record.provider_policy_pending = pending;
+        let summary = super::build_managed_agent_summary(
+            handle,
+            &record,
+            &std::collections::HashMap::new(),
+            &[],
+            &[],
+            &crate::managed_agents::GlobalAgentConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(summary.provider_policy_pending, pending);
+    }
+}
+
 // ── desktop binary name tests ───────────────────────────────────────────
 
 #[test]
@@ -1007,10 +1030,10 @@ fn unpinned_record_resolves_pair_key_per_workspace() {
 }
 
 #[test]
-fn stored_relay_pin_is_ignored_in_pair_key_resolution() {
-    // Legacy pins are ignored (#2122): a record carrying a creation-era
-    // `relay_url` resolves the same per-workspace pair key an unpinned record
-    // does, so summaries/stop act on the community being viewed.
+fn stored_relay_pin_selects_the_agents_own_pair_key() {
+    // Agents belong to ONE community (narrows #2122): a pinned record always
+    // resolves the pair on its own relay, whichever community is viewed, so
+    // summaries/stop act on the only pair it may have.
     let pubkey = "aa".repeat(32);
     let from_a =
         super::resolve_workspace_pair_key(&pubkey, "wss://pinned.example", "wss://one.example")
@@ -1018,9 +1041,11 @@ fn stored_relay_pin_is_ignored_in_pair_key_resolution() {
     let from_b =
         super::resolve_workspace_pair_key(&pubkey, "wss://pinned.example", "wss://two.example")
             .unwrap();
-    assert_ne!(from_a, from_b);
-    assert_eq!(from_a.relay_url, "wss://one.example");
-    assert_eq!(from_b.relay_url, "wss://two.example");
+    assert_eq!(from_a, from_b);
+    assert_eq!(from_a.relay_url, "wss://pinned.example");
+    // An unassigned record still resolves to the viewed workspace.
+    let unassigned = super::resolve_workspace_pair_key(&pubkey, "", "wss://two.example").unwrap();
+    assert_eq!(unassigned.relay_url, "wss://two.example");
 }
 
 #[test]

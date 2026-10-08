@@ -276,10 +276,9 @@ export function EditAgentAdvancedFields({
         ) : null}
       </div>
 
-      {/* Relay URL: intentionally no editor. The legacy per-record relay pin
-          is ignored (#2122 agents-everywhere) — agents always run on the
-          active community relay — so offering a knob here would advertise a
-          setting with no effect. The stored field is preserved untouched. */}
+      {/* Relay URL: intentionally no editor. An agent belongs to the
+          community it was created in (its stored relay) and is hidden from
+          every other one; an edit never moves it, so there is no knob. */}
 
       {/* Definition-less legacy agents keep a direct ACP command control. */}
       {linkedPersona == null ? (

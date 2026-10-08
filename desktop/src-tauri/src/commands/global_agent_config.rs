@@ -1,14 +1,18 @@
-//! Tauri commands for global agent configuration defaults.
+//! Tauri commands for a community's agent configuration defaults.
 //!
-//! `get_global_agent_config` / `set_global_agent_config` — simple load/save
-//! around the `global_config` module with the standard save-time validation.
+//! `get_global_agent_config` / `set_global_agent_config` read and write the
+//! defaults of the INVOKING WINDOW's community (the main window's active
+//! community, or a community window's own), with the standard save-time
+//! validation. Defaults are per community (see
+//! `managed_agents::global_config::community`); the command names keep their
+//! historical "global" spelling.
 //!
 //! `set_global_agent_config` additionally auto-restarts any running local agent
-//! whose effective env changes under the new global config — including agents
-//! that were in setup-listener mode (`NotReady`) but become `Ready`, and agents
-//! already running whose provider/model/env vars change.  This is the only
-//! honest way to deliver new env vars to a running process — the env is baked
-//! at spawn time and cannot be mutated in place.
+//! OF THAT COMMUNITY whose effective env changes under the new defaults —
+//! including agents that were in setup-listener mode (`NotReady`) but become
+//! `Ready`, and agents already running whose provider/model/env vars change.
+//! This is the only honest way to deliver new env vars to a running process —
+//! the env is baked at spawn time and cannot be mutated in place.
 
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
@@ -17,11 +21,12 @@ use crate::{
     app_state::AppState,
     managed_agents::{
         agent_readiness, current_instance_id, find_managed_agent_mut, known_acp_runtime,
-        load_global_agent_config, load_managed_agents, load_personas, record_agent_command,
-        resolve_effective_agent_env, save_global_agent_config, save_managed_agents,
+        load_agent_defaults_for_relay, load_managed_agents, load_personas, record_agent_command,
+        resolve_effective_agent_env, save_agent_defaults_for_relay, save_managed_agents,
         stop_managed_agent_process, sync_managed_agent_processes, validate_global_config,
-        AgentReadiness, BackendKind, GlobalAgentConfig,
+        AgentReadiness, BackendKind, GlobalAgentConfig, ManagedAgentRecord,
     },
+    window_relay::WindowRelay,
 };
 
 /// Result returned by `set_global_agent_config`.
@@ -31,7 +36,7 @@ use crate::{
 /// `failed_restart_count` to surface partial failures ("M failed to restart").
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalAgentConfigSaveResult {
-    /// The persisted global config (after strip-on-write).
+    /// The persisted community defaults (after strip-on-write).
     pub config: GlobalAgentConfig,
     /// Number of local agents successfully stopped and restarted.
     pub restarted_count: u32,
@@ -39,18 +44,38 @@ pub struct GlobalAgentConfigSaveResult {
     pub failed_restart_count: u32,
 }
 
-/// Read the current global agent configuration.
+/// Read the agent defaults of the invoking window's community.
 ///
-/// Returns the default (empty) config if `global-agent-config.json` has not
-/// been written yet.
+/// Returns the default (empty) config if nothing was saved for it yet.
 #[tauri::command]
-pub fn get_global_agent_config(app: AppHandle) -> Result<GlobalAgentConfig, String> {
-    load_global_agent_config(&app)
+pub fn get_global_agent_config<R: tauri::Runtime>(
+    app: AppHandle<R>,
+    relay: WindowRelay,
+) -> Result<GlobalAgentConfig, String> {
+    load_agent_defaults_for_relay(&app, relay.ws_url())
 }
 
-/// Validate and persist a new global agent configuration, then auto-restart
-/// any running local agent whose effective env changes under the new config
-/// (including setup-listener agents whose readiness flips to `Ready`).
+/// Whether `record` is an agent of the community on `community_relay`, i.e.
+/// one whose defaults a save there changes. An unassigned record resolves to
+/// the active workspace, as everywhere else.
+fn agent_of_community(
+    state: &AppState,
+    record: &ManagedAgentRecord,
+    community_relay: &str,
+) -> bool {
+    crate::managed_agents::community_scope::record_in_community(
+        record,
+        // window-relay: unassigned-record fallback only (see record_in_community).
+        &crate::relay::relay_ws_url_with_override(state),
+        community_relay,
+    )
+}
+
+/// Validate and persist the agent defaults of the invoking window's
+/// community, then auto-restart any running local agent of that community
+/// whose effective env changes under them (including setup-listener agents
+/// whose readiness flips to `Ready`). Agents of other communities are never
+/// touched: these defaults never reach them.
 ///
 /// Strips empty env values before writing (empty = "inherit" semantics), then
 /// applies standard validation: POSIX key shape, reserved-key reject,
@@ -63,35 +88,28 @@ pub fn get_global_agent_config(app: AppHandle) -> Result<GlobalAgentConfig, Stri
 pub async fn set_global_agent_config(
     config: GlobalAgentConfig,
     app: AppHandle,
+    relay: WindowRelay,
 ) -> Result<GlobalAgentConfigSaveResult, String> {
+    let community_relay = relay.ws_url().to_string();
     // ── Phase 1: disk write (sync, spawn_blocking) ────────────────────────
     //
-    // Validate, snapshot old config, write new config, collect pre-filter
-    // candidate pubkeys (local backend + recorded PID + old NotReady + new
-    // Ready).  The candidate list is a hint — eligibility is re-checked under
-    // lock in Phase 2 after sync_managed_agent_processes.
+    // Validate, write the new defaults (reading the previous ones under the
+    // same store lock), collect pre-filter candidate pubkeys (this
+    // community's local agents with a live runtime whose readiness or env
+    // changes).  The candidate list is a hint — eligibility is re-checked
+    // under lock in Phase 2 after sync_managed_agent_processes.
     let app_for_write = app.clone();
-    let phase1 = tokio::task::spawn_blocking(move || {
-        validate_global_config(&config)?;
-
-        let old_global = load_global_agent_config(&app_for_write).unwrap_or_default();
-
-        save_global_agent_config(&app_for_write, &config)?;
-
-        // Re-read from disk so the returned value reflects the strip-on-write pass.
-        let new_global = load_global_agent_config(&app_for_write)?;
-
-        // Pre-filter: identify agents that look eligible before taking any locks.
-        // This is a hint only; definitive eligibility check happens under lock
-        // in Phase 2.
-        let (candidates, personas_snapshot) =
-            collect_restart_candidates(&app_for_write, &old_global, &new_global);
-
-        Ok::<_, String>((new_global, old_global, candidates, personas_snapshot))
+    let relay_for_write = community_relay.clone();
+    let SavedCommunityDefaults {
+        old_global,
+        new_global,
+        candidates,
+        personas_snapshot,
+    } = tokio::task::spawn_blocking(move || {
+        save_community_defaults(&app_for_write, &relay_for_write, &config)
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))??;
-    let (new_global, old_global, candidates, personas_snapshot) = phase1;
 
     // ── Phase 2: async restart (outside spawn_blocking) ──────────────────
     //
@@ -105,21 +123,20 @@ pub async fn set_global_agent_config(
     // failed_restart_count surfaces stops that succeeded but respawn failed.
     let mut restarted_count: u32 = 0;
     let mut failed_restart_count: u32 = 0;
-    if !candidates.is_empty() {
-        for pubkey in &candidates {
-            let outcome = restart_local_agent_on_config_change(
-                &app,
-                pubkey,
-                &old_global,
-                &new_global,
-                &personas_snapshot,
-            )
-            .await;
-            match outcome {
-                RestartOutcome::Restarted => restarted_count += 1,
-                RestartOutcome::FailedAfterStop => failed_restart_count += 1,
-                RestartOutcome::Skipped => {}
-            }
+    for pubkey in &candidates {
+        let outcome = restart_local_agent_on_config_change(
+            &app,
+            pubkey,
+            &community_relay,
+            &old_global,
+            &new_global,
+            &personas_snapshot,
+        )
+        .await;
+        match outcome {
+            RestartOutcome::Restarted => restarted_count += 1,
+            RestartOutcome::FailedAfterStop => failed_restart_count += 1,
+            RestartOutcome::Skipped => {}
         }
     }
 
@@ -127,6 +144,35 @@ pub async fn set_global_agent_config(
         config: new_global,
         restarted_count,
         failed_restart_count,
+    })
+}
+
+/// Phase 1 of [`set_global_agent_config`].
+struct SavedCommunityDefaults {
+    old_global: GlobalAgentConfig,
+    new_global: GlobalAgentConfig,
+    candidates: Vec<String>,
+    personas_snapshot: Vec<crate::managed_agents::AgentDefinition>,
+}
+
+/// Phase 1 of [`set_global_agent_config`] (blocking): validate `config`,
+/// persist it as the defaults of the community on `community_relay` only
+/// (reading the previous ones under the same store lock), and collect that
+/// community's restart candidates.
+fn save_community_defaults<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    community_relay: &str,
+    config: &GlobalAgentConfig,
+) -> Result<SavedCommunityDefaults, String> {
+    validate_global_config(config)?;
+    let (old_global, new_global) = save_agent_defaults_for_relay(app, community_relay, config)?;
+    let (candidates, personas_snapshot) =
+        collect_restart_candidates(app, community_relay, &old_global, &new_global);
+    Ok(SavedCommunityDefaults {
+        old_global,
+        new_global,
+        candidates,
+        personas_snapshot,
     })
 }
 
@@ -155,8 +201,9 @@ enum RestartOutcome {
 /// - it was already `Ready`, its process is currently alive, and its effective
 ///   env changed (provider, model, or env var update that needs a restart to
 ///   take effect, since env is baked at spawn time).
-fn collect_restart_candidates(
-    app: &AppHandle,
+fn collect_restart_candidates<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    community_relay: &str,
     old_global: &GlobalAgentConfig,
     new_global: &GlobalAgentConfig,
 ) -> (Vec<String>, Vec<crate::managed_agents::AgentDefinition>) {
@@ -188,7 +235,9 @@ fn collect_restart_candidates(
     let candidates = records
         .iter()
         .filter(|record| {
-            if record.backend != BackendKind::Local {
+            if record.backend != BackendKind::Local
+                || !agent_of_community(&state, record, community_relay)
+            {
                 return false;
             }
             let has_live_runtime = runtimes.iter_mut().any(|(key, runtime)| {
@@ -247,6 +296,7 @@ fn collect_restart_candidates(
 async fn restart_local_agent_on_config_change(
     app: &AppHandle,
     pubkey: &str,
+    community_relay: &str,
     old_global: &GlobalAgentConfig,
     new_global: &GlobalAgentConfig,
     personas_snapshot: &[crate::managed_agents::AgentDefinition],
@@ -257,6 +307,7 @@ async fn restart_local_agent_on_config_change(
     let old_global_clone = old_global.clone();
     let new_global_clone = new_global.clone();
     let personas_owned = personas_snapshot.to_vec();
+    let community_owned = community_relay.to_string();
     use tauri::Manager;
     // Captured before the stop: a community removed meanwhile refuses the start.
     let admission = crate::managed_agents::AdmissionSnapshot::capture(&app.state::<AppState>());
@@ -294,6 +345,11 @@ async fn restart_local_agent_on_config_change(
 
         if record.backend != BackendKind::Local {
             return Err(format!("agent {pubkey_owned} is no longer a local agent"));
+        }
+        if !agent_of_community(&state, record, &community_owned) {
+            return Err(format!(
+                "agent {pubkey_owned} is not an agent of the community whose defaults changed"
+            ));
         }
         let runtime_keys =
             crate::managed_agents::managed_agent_runtime_keys(&runtimes, &pubkey_owned);
@@ -422,6 +478,14 @@ fn persist_last_error(app: &AppHandle, pubkey: &str, error: &str) -> Result<(), 
 fn should_restart_on_config_change(old_ready: bool, new_ready: bool, env_changed: bool) -> bool {
     (!old_ready && new_ready) || (old_ready && env_changed)
 }
+
+#[cfg(test)]
+#[path = "global_agent_config_tests.rs"]
+mod community_tests;
+
+#[cfg(test)]
+#[path = "agent_defaults_seam_tests.rs"]
+mod seam_tests;
 
 #[cfg(test)]
 mod tests {

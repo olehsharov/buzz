@@ -17,6 +17,7 @@ pub fn run_event_sync(
     app: &tauri::AppHandle,
     owner_keys: &nostr::Keys,
     db_path: &Path,
+    relay_url: &str,
 ) -> Result<(), String> {
     // Persona and agent legs stay best-effort: they log and swallow, and their
     // failure does not undo the boot team-membership repair. The team leg is
@@ -25,10 +26,14 @@ pub fn run_event_sync(
     // a stale relay roster. If it fails, the caller must not let the frontend
     // expose the community and start inbound replay against an un-superseded
     // disk state.
-    migrate_personas_to_events(app, owner_keys, db_path);
+    // Agents and definitions belong to ONE community: the persona and agent
+    // legs publish only the records of the community this scope is for.
+    migrate_personas_to_events(app, owner_keys, db_path, relay_url);
     migrate_teams_to_events(app, owner_keys, db_path)?;
     reconcile_team_catalog_heads(app, owner_keys, db_path);
-    crate::managed_agents::reconcile::reconcile_agents_to_events(app, owner_keys, db_path);
+    crate::managed_agents::reconcile::reconcile_agents_to_events(
+        app, owner_keys, db_path, relay_url,
+    );
     // Negative-side backstop: retract any retained head whose disk record is
     // gone (a deletion whose atomic tombstone failed after removing the JSON).
     // Runs LAST so the positive legs' just-retained live heads are matched and
@@ -53,10 +58,13 @@ pub async fn run_event_sync_blocking(
     app: tauri::AppHandle,
     owner_keys: nostr::Keys,
     db_path: std::path::PathBuf,
+    relay_url: String,
 ) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || run_event_sync(&app, &owner_keys, &db_path))
-        .await
-        .map_err(|e| format!("event-sync: spawn_blocking failed: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        run_event_sync(&app, &owner_keys, &db_path, &relay_url)
+    })
+    .await
+    .map_err(|e| format!("event-sync: spawn_blocking failed: {e}"))?
 }
 
 /// Reconcile `personas.json` into the persona-event retention store.
@@ -79,14 +87,19 @@ pub async fn run_event_sync_blocking(
 /// `pending_sync = 1` for later relay publish. Migration succeeds on local
 /// write, not relay acknowledgment. Every retained row is a real signed
 /// event — there is no placeholder path.
-pub fn migrate_personas_to_events(app: &tauri::AppHandle, keys: &nostr::Keys, db_path: &Path) {
+pub fn migrate_personas_to_events(
+    app: &tauri::AppHandle,
+    keys: &nostr::Keys,
+    db_path: &Path,
+    relay_url: &str,
+) {
     use crate::managed_agents::managed_agents_base_dir;
 
     let Ok(base_dir) = managed_agents_base_dir(app) else {
         return;
     };
 
-    match migrate_personas_in_dir_at(&base_dir, keys, db_path) {
+    match migrate_personas_in_dir_at(&base_dir, keys, db_path, Some(relay_url)) {
         Ok(0) => {}
         Ok(migrated) => {
             eprintln!(
@@ -106,13 +119,17 @@ pub fn migrate_personas_to_events(app: &tauri::AppHandle, keys: &nostr::Keys, db
 /// (or there are none to reconcile).
 #[cfg(test)]
 fn migrate_personas_in_dir(base_dir: &Path, keys: &nostr::Keys) -> Result<u32, String> {
-    migrate_personas_in_dir_at(base_dir, keys, &base_dir.join("retention.db"))
+    migrate_personas_in_dir_at(base_dir, keys, &base_dir.join("retention.db"), None)
 }
 
-fn migrate_personas_in_dir_at(
+/// `community`: the relay this retention scope publishes to. Only
+/// definitions belonging to it are reconciled (`None` = every definition, for
+/// the legacy unit-test helper).
+pub(crate) fn migrate_personas_in_dir_at(
     base_dir: &Path,
     keys: &nostr::Keys,
     db_path: &Path,
+    community: Option<&str>,
 ) -> Result<u32, String> {
     use crate::managed_agents::{
         persona_events::{build_persona_event, monotonic_created_at, persona_d_tag},
@@ -128,7 +145,11 @@ fn migrate_personas_in_dir_at(
     // (run_event_sync runs after run_boot_migrations, so the fold has
     // already happened) never reach this path with personas.json present —
     // but read it as a fallback for one release in case the fold errored.
-    let records = read_persona_definitions(base_dir)?;
+    let mut records = read_persona_definitions(base_dir)?;
+    if let Some(community) = community {
+        let foreign = foreign_definition_slugs(base_dir, community)?;
+        records.retain(|record| !foreign.contains(&record.id));
+    }
 
     if records.is_empty() {
         return Ok(0);
@@ -562,7 +583,8 @@ fn emit_team_catalog_auto_retracted(app: &tauri::AppHandle, team_name: &str, rea
         reason: &'a str,
     }
 
-    if let Err(e) = app.emit(
+    if let Err(e) = app.emit_to(
+        crate::popout::MAIN_WINDOW_LABEL,
         "team-catalog-auto-retracted",
         TeamCatalogAutoRetractedPayload { team_name, reason },
     ) {
@@ -758,6 +780,27 @@ pub(crate) fn read_json_store_pub<T: serde::de::DeserializeOwned>(
     path: &Path,
 ) -> Result<Vec<T>, String> {
     read_json_store(path)
+}
+
+/// Slugs of the definitions in the unified store that belong to a community
+/// other than `community` (an unassigned definition belongs to the scope it
+/// is synced in).
+fn foreign_definition_slugs(
+    base_dir: &Path,
+    community: &str,
+) -> Result<std::collections::HashSet<String>, String> {
+    let all: Vec<crate::managed_agents::ManagedAgentRecord> =
+        read_json_store(&base_dir.join("managed-agents.json"))?;
+    Ok(all
+        .into_iter()
+        .filter(|record| {
+            record.pubkey.is_empty()
+                && !crate::managed_agents::community_scope::record_in_community(
+                    record, community, community,
+                )
+        })
+        .filter_map(|record| record.slug)
+        .collect())
 }
 
 /// Read every persona definition in the legacy shape, from whichever store

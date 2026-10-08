@@ -8,6 +8,7 @@ import {
 } from "@/features/messages/lib/timelineSnapshot";
 import { handleTimelineMentionCopy } from "@/features/messages/lib/timelineMentionCopy";
 import { preloadTimelineImages } from "@/features/messages/lib/timelineImagePreload";
+import type { StreamDraft } from "@/features/messages/lib/streamDrafts";
 import type { TimelineMessage } from "@/features/messages/types";
 import type { MainTimelineEntry } from "@/features/messages/lib/threadPanel";
 import type { ChannelWindowThreadSummary } from "@/features/messages/lib/channelWindowStore";
@@ -127,6 +128,8 @@ type MessageTimelineProps = {
   unreadCount?: number;
   /** Per-thread unread counts keyed by thread root id. */
   threadUnreadCounts?: ReadonlyMap<string, number>;
+  /** Live reply ghosts for top-level replies, rendered after the last row. */
+  streamDrafts?: readonly StreamDraft[];
 };
 
 /** Stable empty reference used as the `useDeferredValue` initial value so the
@@ -215,6 +218,7 @@ const MessageTimelineBase = React.forwardRef<
     firstUnreadMessageId = null,
     unreadCount = 0,
     threadUnreadCounts,
+    streamDrafts,
   }: MessageTimelineProps,
   ref,
 ) {
@@ -483,6 +487,25 @@ const MessageTimelineBase = React.forwardRef<
     [prepareForOwnMessage, scrollToBottom, timelineVirtualizerApi],
   );
 
+  // Ghosts live in the bottom-spacer row. Keep a reader who is at the floor
+  // pinned to it while reply text streams in; a reader in history is left
+  // alone (the ghost grows below their viewport).
+  const streamDraftLayoutKey =
+    streamDrafts
+      ?.map((draft) => `${draft.key}:${draft.status}:${draft.content.length}`)
+      .join("|") ?? "";
+  React.useEffect(() => {
+    if (!streamDraftLayoutKey || !isAtBottom || !isSemanticallyAtBottom) {
+      return;
+    }
+    timelineVirtualizerApi?.settleAtBottom();
+  }, [
+    isAtBottom,
+    isSemanticallyAtBottom,
+    streamDraftLayoutKey,
+    timelineVirtualizerApi,
+  ]);
+
   // Jump-to-message is purely DOM-based now: all loaded rows are mounted, so
   // `scrollToMessage` always finds the target row. No virtualizer convergence.
   const jumpToMessage = React.useCallback(
@@ -696,6 +719,7 @@ const MessageTimelineBase = React.forwardRef<
       searchMatchingMessageIds={searchMatchingMessageIds}
       searchQuery={searchQuery}
       useVirtualizer={useTimelineVirtualizer}
+      streamDrafts={streamDrafts}
       threadUnreadCounts={threadUnreadCounts}
       unfollowThreadById={unfollowThreadById}
     />

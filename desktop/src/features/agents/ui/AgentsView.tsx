@@ -357,7 +357,7 @@ export function AgentsView() {
             personas.handleSubmit(
               input,
               undefined,
-              undefined,
+              options.backendIntent,
               undefined,
               options,
             )

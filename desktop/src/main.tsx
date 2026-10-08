@@ -11,7 +11,18 @@ import "@/shared/styles/globals.css";
 import { UpdaterProvider } from "@/features/settings/hooks/UpdaterProvider";
 import { migrateLegacyCommunityStorageBeforeRender } from "@/features/communities/legacyCommunityStorage";
 import { CommunitiesProvider } from "@/features/communities/useCommunities";
-import { huddleWindowChannelId } from "@/features/huddle/lib/huddleWindow";
+import { router } from "@/app/router";
+import { communityLandingRoute } from "@/features/popout/popoutRoute";
+import {
+  getPopoutSession,
+  initializePopoutSession,
+} from "@/features/popout/popoutSession";
+import {
+  currentCommunityWindowId,
+  isCommunityWindow,
+  isMainWindow,
+  isPopoutWindow,
+} from "@/shared/lib/windowKind";
 import { CommunityOnboardingProvider } from "@/features/onboarding/communityOnboarding";
 import { ThemeProvider } from "@/shared/theme/ThemeProvider";
 import { AvatarClipPaths } from "@/shared/ui/AvatarClipPaths";
@@ -86,17 +97,24 @@ function renderApp() {
           SecurityError from localStorage can't blank the whole window. */}
       <RootErrorBoundary>
         <AvatarClipPaths />
-        <CommunitiesProvider>
-          <CommunityOnboardingProvider
-            enabled={huddleWindowChannelId() === null}
-          >
+        <CommunitiesProvider
+          pinnedCommunityId={
+            isPopoutWindow()
+              ? (getPopoutSession()?.communityId ?? null)
+              : isCommunityWindow()
+                ? currentCommunityWindowId()
+                : undefined
+          }
+        >
+          <CommunityOnboardingProvider enabled={isMainWindow()}>
             <ThemeProvider defaultTheme="buzz">
               <TooltipProvider>
                 <EmojiBurstProvider>
                   <PoofBurstProvider>
                     <UpdaterProvider>
                       <App />
-                      <NostrBindConsentDialog />
+                      {/* Nostr-bind deep links are main-window work. */}
+                      {isMainWindow() ? <NostrBindConsentDialog /> : null}
                     </UpdaterProvider>
                     <Toaster />
                   </PoofBurstProvider>
@@ -133,6 +151,19 @@ async function bootstrap() {
   startLocalStorageSweep();
   await installE2eBridgeIfConfigured();
   await migrateLegacyCommunityStorageBeforeRender();
+  // A pop-out reads its one-time launch payload before the router mounts, so
+  // its destination is the very first route it renders — nothing that runs
+  // at startup can redirect it to Home or a remembered channel first.
+  const popoutSession = await initializePopoutSession();
+  if (popoutSession) {
+    router.history.replace(popoutSession.initialRoute ?? "/");
+  }
+  // A community window opens where its community was last left. A reload
+  // keeps the route already in this window's URL.
+  const communityWindowId = currentCommunityWindowId();
+  if (communityWindowId && !window.location.hash.startsWith("#/")) {
+    router.history.replace(communityLandingRoute(communityWindowId) ?? "/");
+  }
   renderApp();
 }
 

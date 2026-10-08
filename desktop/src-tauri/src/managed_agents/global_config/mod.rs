@@ -1,7 +1,9 @@
-//! Global agent configuration defaults.
+//! Agent configuration defaults, scoped per community.
 //!
-//! A single `global-agent-config.json` record that applies to ALL managed
-//! agents. For a linked instance, the definition wins over global; for a
+//! A [`GlobalAgentConfig`] record holds one community's defaults and applies
+//! to every managed agent OF THAT COMMUNITY (see [`community`]: an agent gets
+//! the defaults of its own record's relay, never the active community's and
+//! never another community's). For a linked instance, the definition wins over global; for a
 //! definition-less (legacy) instance, the record's own fields win over
 //! global. Global is always the lowest user-settable layer.
 //!
@@ -19,21 +21,20 @@
 //!
 //! # Storage
 //!
-//! `<app-data>/agents/global-agent-config.json`, written `0o600` via
-//! `atomic_write_json_restricted` (same as the agent store).
+//! `<app-data>/agents/agent-defaults-by-community.json`, a map keyed by
+//! community relay, written `0o600` via `atomic_write_json_restricted` (same
+//! as the agent store). See [`community`].
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use tauri::AppHandle;
 
 use crate::managed_agents::env_vars::{
     validate_user_env_keys, DERIVED_PROVIDER_MODEL_ENV_KEYS, MAX_ENV_VALUE_BYTES,
 };
-use crate::managed_agents::storage::{atomic_write_json_restricted, managed_agents_base_dir};
 use crate::managed_agents::types::{AgentDefinition, ManagedAgentRecord};
 
-/// The global agent configuration record.
+/// One community's agent configuration defaults.
 ///
 /// Shape mirrors the per-agent/persona trio (`env_vars` + `provider` + `model`)
 /// so the config vocabulary is consistent across all three tiers.
@@ -45,7 +46,7 @@ use crate::managed_agents::types::{AgentDefinition, ManagedAgentRecord};
 /// consulted); for a definition-less instance, instance → global.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GlobalAgentConfig {
-    /// Global env vars injected into ALL agents unconditionally.
+    /// Env vars injected into every agent of the community.
     ///
     /// Lowest user-settable layer — per-agent and persona values win on any
     /// key collision. Reserved and derived keys are rejected at save time and
@@ -87,7 +88,7 @@ pub struct GlobalAgentConfig {
 /// - Values exceeding [`MAX_ENV_VALUE_BYTES`] are rejected.
 /// - Blank / whitespace-only values are normalized to `None` by
 ///   [`normalize_global_config_fields`], which must be called before
-///   persisting (done inside [`save_global_agent_config`]).
+///   persisting (done inside [`save_agent_defaults_for_relay`]).
 pub fn validate_global_config(config: &GlobalAgentConfig) -> Result<(), String> {
     // Strip empty values first — they mean "inherit" and must not be stored.
     let non_empty: BTreeMap<String, String> = config
@@ -136,7 +137,7 @@ pub fn validate_global_config(config: &GlobalAgentConfig) -> Result<(), String> 
                 ));
             }
             // Note: blank/whitespace-only values are normalized to None by
-            // normalize_global_config_fields, called from save_global_agent_config.
+            // normalize_global_config_fields, called from every save path.
         }
     }
 
@@ -159,7 +160,7 @@ pub fn strip_empty_env_vars(config: &mut GlobalAgentConfig) {
 /// explicitly set to nothing" rather than "inherit"). Normalizing to `None`
 /// preserves the invariant that `Some(s)` always contains a non-blank string.
 ///
-/// Called from [`save_global_agent_config`] so normalization is applied at
+/// Called from every save path so normalization is applied at
 /// every persist boundary.
 pub fn normalize_global_config_fields(config: &mut GlobalAgentConfig) {
     if let Some(v) = &config.provider {
@@ -172,41 +173,6 @@ pub fn normalize_global_config_fields(config: &mut GlobalAgentConfig) {
             config.model = None;
         }
     }
-}
-
-fn global_config_path<R: tauri::Runtime>(app: &AppHandle<R>) -> Result<std::path::PathBuf, String> {
-    Ok(managed_agents_base_dir(app)?.join("global-agent-config.json"))
-}
-
-/// Load the global agent config from disk.
-///
-/// Returns the default (all-empty) config if the file does not exist yet.
-pub fn load_global_agent_config<R: tauri::Runtime>(
-    app: &AppHandle<R>,
-) -> Result<GlobalAgentConfig, String> {
-    let path = global_config_path(app)?;
-    if !path.exists() {
-        return Ok(GlobalAgentConfig::default());
-    }
-    let content = std::fs::read_to_string(&path)
-        .map_err(|e| format!("failed to read global agent config: {e}"))?;
-    serde_json::from_str(&content).map_err(|e| format!("failed to parse global agent config: {e}"))
-}
-
-/// Save the global agent config to disk.
-///
-/// Strips empty env values and normalizes blank provider/model to `None`
-/// before writing (empty = "inherit" semantics).
-/// Written `0o600` — same protection as `managed-agents.json`.
-pub fn save_global_agent_config(app: &AppHandle, config: &GlobalAgentConfig) -> Result<(), String> {
-    let mut config = config.clone();
-    strip_empty_env_vars(&mut config);
-    normalize_global_config_fields(&mut config);
-
-    let path = global_config_path(app)?;
-    let payload = serde_json::to_vec_pretty(&config)
-        .map_err(|e| format!("failed to serialize global agent config: {e}"))?;
-    atomic_write_json_restricted(&path, &payload)
 }
 
 /// Resolve the effective model and provider for an agent.
@@ -232,6 +198,13 @@ pub(crate) fn resolve_effective_model_provider(
     super::effective_config::resolve_effective_model_provider_pair(record, personas, global)
         .unwrap_or((None, None))
 }
+
+mod community;
+pub(crate) use community::migrate_legacy_global_agent_config;
+pub use community::{
+    load_agent_defaults_for_agent, load_agent_defaults_for_record, load_agent_defaults_for_relay,
+    load_community_agent_defaults, save_agent_defaults_for_relay, CommunityAgentDefaults,
+};
 
 #[cfg(test)]
 mod tests;

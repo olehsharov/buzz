@@ -1,0 +1,258 @@
+#!/usr/bin/python3
+"""Buzz Desktop backend provider: run managed agents on an SSH host.
+
+Implements the provider protocol in docs/remote-agents.md (protocol_version
+1): one JSON request on stdin, one JSON response on stdout. Setup is described
+in docs/ssh-agent-host.md.
+
+The SSH host comes from the provider config (`host`) or, failing that, the
+BUZZ_SSH_AGENT_HOST environment variable. There is no default host. Any name
+your ~/.ssh/config resolves works, and key-based auth is required (BatchMode).
+
+deploy builds the harness environment with the same three-tier precedence as
+buzz-backend-kubernetes (crates/buzz-backend-kubernetes/src/env.rs), ships it
+over SSH stdin (never argv), and (re)starts a per-agent systemd user unit
+`buzz-agent@<id>` running buzz-acp on the host. Stop is the relay `!shutdown`
+the desktop already sends: buzz-acp exits 0 and Restart=on-failure keeps it
+down. Errors are in-band ({"ok": false}) with exit 0, like the k8s provider.
+"""
+
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+
+PROTOCOL_VERSION = 1
+VERSION = "0.1.0"
+SSH = "/usr/bin/ssh"
+HOST_ENV = "BUZZ_SSH_AGENT_HOST"
+
+AUTHORITATIVE_KEYS = [
+    "BUZZ_RELAY_URL",
+    "BUZZ_PRIVATE_KEY",
+    "NOSTR_PRIVATE_KEY",
+    "BUZZ_AUTH_TAG",
+    "BUZZ_ACP_AGENT_OWNER",
+    "BUZZ_ACP_AGENT_COMMAND",
+    "BUZZ_ACP_AGENT_ARGS",
+    "BUZZ_ACP_RESPOND_TO",
+    "BUZZ_ACP_RESPOND_TO_ALLOWLIST",
+    "BUZZ_ACP_MCP_COMMAND",
+    "BUZZ_ACP_EXIT_AFTER_INACTIVITY",
+]
+FORBIDDEN_KEY = "BUZZ_ACP_NO_PRESENCE"
+POSIX_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]*$")
+
+# Runs on the host via `python3 -c`. Reads {"id", "workdir", "env"} on stdin.
+# Contains no secrets; the env (with the nsec) only ever travels on stdin.
+REMOTE = r'''
+import json, os, shutil, subprocess, sys
+req = json.load(sys.stdin)
+home = os.path.expanduser("~")
+aid, env = req["id"], req["env"]
+cfg = os.path.join(home, ".config", "buzz", "agents")
+units = os.path.join(home, ".config", "systemd", "user")
+logs = os.path.join(home, "buzz-agents")
+for d in (cfg, units, logs):
+    os.makedirs(d, mode=0o700, exist_ok=True)
+path = os.pathsep.join([os.path.join(home, ".local", "bin"),
+                        os.path.join(home, ".npm-global", "bin"),
+                        os.path.join(home, ".cargo", "bin"),
+                        "/usr/local/bin", "/usr/bin", "/bin"])
+env.setdefault("PATH", path)
+env.setdefault("RUST_LOG", "info")
+if "BUZZ_ACP_MCP_COMMAND" not in env:
+    env["BUZZ_ACP_MCP_COMMAND"] = shutil.which("buzz-dev-mcp", path=path) or ""
+cmd = env.get("BUZZ_ACP_AGENT_COMMAND", "")
+if cmd and not shutil.which(cmd, path=path):
+    print(json.dumps({"ok": False, "error": "agent command %r is not installed on this host" % cmd}))
+    sys.exit(0)
+if not shutil.which("buzz-acp", path=path):
+    print(json.dumps({"ok": False, "error": "buzz-acp is not installed on this host"}))
+    sys.exit(0)
+workdir = os.path.expanduser(req.get("workdir") or "~")
+os.makedirs(workdir, exist_ok=True)
+old = os.umask(0o077)
+tmp = os.path.join(cfg, aid + ".json.tmp")
+with open(tmp, "w") as f:
+    json.dump({"workdir": workdir, "env": env}, f)
+os.replace(tmp, os.path.join(cfg, aid + ".json"))
+os.umask(old)
+runner = os.path.join(home, ".local", "bin", "buzz-agent-run")
+os.makedirs(os.path.dirname(runner), exist_ok=True)
+with open(runner, "w") as f:
+    f.write("""#!/usr/bin/python3
+import json, os, sys
+spec = json.load(open(os.path.expanduser("~/.config/buzz/agents/%s.json" % sys.argv[1])))
+os.chdir(spec["workdir"])
+env = dict(os.environ); env.update(spec["env"])
+os.execvpe("buzz-acp", ["buzz-acp"], env)
+""")
+os.chmod(runner, 0o755)
+with open(os.path.join(units, "buzz-agent@.service"), "w") as f:
+    f.write("""[Unit]
+Description=Buzz managed agent %i (buzz-backend-ssh)
+After=network-online.target
+
+[Service]
+Environment=PATH=""" + path + """
+ExecStart=%h/.local/bin/buzz-agent-run %i
+StandardOutput=append:%h/buzz-agents/%i.log
+StandardError=append:%h/buzz-agents/%i.log
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+""")
+unit = "buzz-agent@%s.service" % aid
+for args in (["daemon-reload"], ["enable", unit], ["restart", unit]):
+    r = subprocess.run(["systemctl", "--user"] + args, capture_output=True, text=True)
+    if r.returncode != 0:
+        print(json.dumps({"ok": False, "error": "systemctl %s failed: %s" % (" ".join(args), r.stderr.strip()[-500:])}))
+        sys.exit(0)
+print(json.dumps({"ok": True, "agent_id": unit}))
+'''
+
+
+def respond(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.exit(0)
+
+
+def fail(msg):
+    respond({"ok": False, "error": msg})
+
+
+def nonempty(v):
+    return v.strip() if isinstance(v, str) and v.strip() else None
+
+
+def build_env(agent):
+    launch = agent.get("launch") or {}
+    env = {}
+    env.update(launch.get("policy_env") or {})
+    env.update((launch.get("env") or {}) if agent.get("launch") else (agent.get("env_vars") or {}))
+    for key in env:
+        if not POSIX_KEY.match(key):
+            fail("env key %r is not a POSIX environment variable name" % key)
+        if key.upper() == FORBIDDEN_KEY:
+            fail("%s must not be set on a remote agent: presence is the only "
+                 "signal that a remote agent is alive" % FORBIDDEN_KEY)
+    for key in AUTHORITATIVE_KEYS:
+        env.pop(key, None)
+
+    relay = nonempty(agent.get("relay_url"))
+    if not relay:
+        fail("deploy refused: relay_url is empty")
+    nsec = nonempty(agent.get("private_key_nsec"))
+    if not nsec:
+        fail("deploy refused: private key is empty")
+    env["BUZZ_RELAY_URL"] = relay
+    env["BUZZ_PRIVATE_KEY"] = nsec
+    env["NOSTR_PRIVATE_KEY"] = nsec
+
+    tag = nonempty(agent.get("auth_tag"))
+    owner = nonempty(launch.get("owner_pubkey"))
+    if not tag and not owner:
+        fail("deploy refused: neither auth_tag nor launch.owner_pubkey resolved "
+             "— without an owner the agent cannot honor !shutdown")
+    if tag:
+        env["BUZZ_AUTH_TAG"] = tag
+    if owner:
+        env["BUZZ_ACP_AGENT_OWNER"] = owner
+
+    command = nonempty(launch.get("command")) or nonempty(agent.get("agent_command"))
+    if command:
+        # A host path from the desktop is meaningless remotely; resolve by name.
+        env["BUZZ_ACP_AGENT_COMMAND"] = command.rsplit("/", 1)[-1]
+    args = launch.get("args") if agent.get("launch") else agent.get("agent_args")
+    if args:
+        env["BUZZ_ACP_AGENT_ARGS"] = ",".join(args)
+
+    respond_to = nonempty(agent.get("respond_to"))
+    allowlist = agent.get("respond_to_allowlist") or []
+    if respond_to:
+        if respond_to == "allowlist" and not allowlist:
+            fail("respond_to=allowlist requires a non-empty allowlist")
+        env["BUZZ_ACP_RESPOND_TO"] = respond_to
+    if allowlist:
+        env["BUZZ_ACP_RESPOND_TO_ALLOWLIST"] = ",".join(allowlist)
+    return env
+
+
+def info():
+    respond({
+        "ok": True,
+        "name": "SSH host",
+        "version": VERSION,
+        "protocol_version": PROTOCOL_VERSION,
+        "description": "Runs the agent with buzz-acp under a systemd user unit "
+                       "on an SSH host (uses your ~/.ssh/config).",
+        "config_schema": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string", "title": "SSH host",
+                         "description": "Host alias or user@host from your "
+                                        "~/.ssh/config. Falls back to $"
+                                        + HOST_ENV + "."},
+                "workdir": {"type": "string", "title": "Working directory on host",
+                            "default": "~"},
+            },
+        },
+    })
+
+
+def deploy(req):
+    agent = req.get("agent") or {}
+    cfg = req.get("provider_config") or {}
+    host = nonempty(cfg.get("host")) or nonempty(os.environ.get(HOST_ENV))
+    if not host:
+        fail("no SSH host configured: set the provider's host field or %s" % HOST_ENV)
+    if not HOST_RE.match(host):
+        fail("invalid SSH host %r" % host)
+    workdir = nonempty(cfg.get("workdir")) or "~"
+    env = build_env(agent)
+    # Stable per-identity handle that does not reveal the key.
+    aid = hashlib.sha256(env["BUZZ_PRIVATE_KEY"].encode()).hexdigest()[:16]
+    payload = json.dumps({"id": aid, "workdir": workdir, "env": env})
+    try:
+        r = subprocess.run(
+            [SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", host,
+             "python3", "-c", _shell_quote(REMOTE)],
+            input=payload, capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        fail("ssh %s timed out" % host)
+    out = r.stdout.strip().splitlines()
+    if r.returncode != 0 or not out:
+        fail("ssh %s failed (exit %d): %s" % (host, r.returncode, r.stderr.strip()[-800:]))
+    try:
+        respond(json.loads(out[-1]))
+    except ValueError:
+        fail("unexpected output from %s" % host)
+
+
+def _shell_quote(s):
+    return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
+def main():
+    try:
+        req = json.loads(sys.stdin.read())
+    except ValueError as e:
+        sys.stderr.write("could not parse request: %s\n" % e)
+        sys.exit(1)
+    op = req.get("op")
+    if op == "info":
+        info()
+    elif op == "deploy":
+        deploy(req)
+    else:
+        fail("unknown op %r" % op)
+
+
+if __name__ == "__main__":
+    main()

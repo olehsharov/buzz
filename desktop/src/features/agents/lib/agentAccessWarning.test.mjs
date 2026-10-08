@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  AGENT_DM_SCOPE_NOTE,
   agentAccessWarningText,
+  agentDmScopeNote,
   runLocationForBackend,
   runLocationForRunOn,
 } from "./agentAccessWarning.ts";
@@ -86,4 +88,17 @@ test("runLocationForRunOn treats a blank value as unknown", () => {
   assert.equal(runLocationForRunOn(""), null);
   assert.equal(runLocationForRunOn(null), null);
   assert.equal(runLocationForRunOn(undefined), null);
+});
+
+test("the shared-access modes say direct messages stay with the owner", () => {
+  // buzz-acp's DM gate admits only the owner and the owner's agents under
+  // every mode except nobody, so Anyone and Selected people must not read as
+  // permission to DM the agent.
+  assert.equal(
+    AGENT_DM_SCOPE_NOTE,
+    "In direct messages the agent still answers only its owner and the owner's agents — @mention it in a shared channel.",
+  );
+  assert.equal(agentDmScopeNote("anyone"), AGENT_DM_SCOPE_NOTE);
+  assert.equal(agentDmScopeNote("allowlist"), AGENT_DM_SCOPE_NOTE);
+  assert.equal(agentDmScopeNote("owner-only"), null);
 });

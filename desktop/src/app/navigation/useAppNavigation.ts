@@ -13,6 +13,7 @@ import {
   type GuardedNavigation,
   traverseHistory,
 } from "@/app/navigation/navigationGuard";
+import { useOpenInNewWindow } from "@/features/popout/useOpenInNewWindow";
 import type { SearchHit } from "@/shared/api/types";
 
 type NavigationBehavior = {
@@ -26,6 +27,10 @@ export function useAppNavigation() {
   const navigate = useNavigate();
   const location = useLocation();
   const canGoBack = useCanGoBack();
+  // Sibling of commitNavigation for pop-out windows: validates the
+  // destination (MVP kinds only), builds its route, and opens it in a new
+  // window of this window's community.
+  const openInNewWindow = useOpenInNewWindow();
 
   const commitNavigation = React.useCallback(
     async (
@@ -474,6 +479,7 @@ export function useAppNavigation() {
     goSettings,
     goWorkflow,
     goWorkflows,
+    openInNewWindow,
     openSearchHit,
   };
 }

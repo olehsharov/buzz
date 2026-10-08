@@ -110,10 +110,11 @@ pub async fn open_project_terminal(
     project_dtag: String,
     clone_url: Option<String>,
     default_branch: Option<String>,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<ProjectTerminalResult, String> {
     if let Some(clone_url) = clone_url.as_deref() {
-        validate_local_clone_url_for_workspace(clone_url, &state)?;
+        validate_local_clone_url_for_workspace(clone_url, &relay)?;
     }
     // Public GitHub clones stay anonymous; Buzz remotes use the workspace
     // identity. Keep the result outside the blocking task so it borrows no
@@ -168,10 +169,11 @@ pub async fn open_project_terminal(
 #[tauri::command]
 pub async fn open_project_merge_recovery_terminal(
     input: ProjectMergeRecoveryTerminalInput,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<ProjectMergeRecoveryTerminalResult, String> {
-    validate_workspace_clone_url(&input.target_clone_url, &state)?;
-    validate_workspace_clone_url(&input.source_clone_url, &state)?;
+    validate_workspace_clone_url(&input.target_clone_url, &relay)?;
+    validate_workspace_clone_url(&input.source_clone_url, &relay)?;
     let target_branch = normalize_branch_option(Some(&input.target_branch))
         .ok_or_else(|| "Invalid target branch.".to_string())?;
     let source_branch = normalize_branch_option(Some(&input.source_branch))

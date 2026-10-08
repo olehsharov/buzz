@@ -59,3 +59,26 @@ fn restart_straddling_a_remove_and_readd_starts_nothing() {
     let error = restart_pair(test.pubkey.clone(), RELAY.into(), app, || Ok(())).unwrap_err();
     assert!(reached_spawn(&error), "{error}");
 }
+
+#[test]
+fn start_pair_refuses_a_relay_the_agent_does_not_belong_to() {
+    // Agents belong to ONE community: the fixture agent is pinned to RELAY,
+    // so any other relay is refused before admission-passing work can spawn.
+    let test = app_with_keyless_agent();
+    let state = test.app.state::<AppState>();
+    let error = start_pair(
+        test.pubkey.clone(),
+        "wss://another-community.example".into(),
+        true,
+        None,
+        &AdmissionSnapshot::capture(&state),
+        test.app.handle().clone(),
+    )
+    .unwrap_err();
+    assert!(error.contains("belongs to the community on"), "{error}");
+    // Its own community still reaches the spawn.
+    assert!(reached_spawn(&start(
+        &test,
+        &AdmissionSnapshot::capture(&state)
+    )));
+}

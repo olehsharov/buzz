@@ -6,6 +6,7 @@ import {
   filterAdmittedMentionPubkeys,
   filterCachedAgentSuggestions,
   getAgentMentionAdmission,
+  getDirectMessageRecipientAgentPubkeys,
   getMentionableAgentPubkeys,
   getSharedChannelIds,
   isAgentDirectoryReady,
@@ -633,6 +634,56 @@ test("DM ownership is independent of local configuration and still requires memb
       ...base,
       eligibilityScope: { type: "owned", channelId: null },
       phase: "prepare",
+    }),
+    new Set([PUB_A, PUB_B]),
+  );
+});
+
+test("DM recipients exclude other people's agents even when they answer anyone", () => {
+  const relayAgents = [
+    {
+      pubkey: PUB_B,
+      ownerPubkey: CURRENT_PUBKEY,
+      respondTo: "owner-only",
+      respondToAllowlist: [],
+      channelIds: [],
+    },
+    {
+      pubkey: PUB_C,
+      ownerPubkey: OTHER_OWNER_PUBKEY,
+      respondTo: "anyone",
+      respondToAllowlist: [],
+      channelIds: ["general"],
+    },
+    {
+      pubkey: PUB_D,
+      ownerPubkey: OTHER_OWNER_PUBKEY,
+      respondTo: "allowlist",
+      respondToAllowlist: [CURRENT_PUBKEY],
+      channelIds: ["general"],
+    },
+  ];
+  const sharedChannelIds = new Set(["general"]);
+
+  // In shared channels the stranger-facing policies still admit the viewer.
+  assert.deepEqual(
+    getMentionableAgentPubkeys({
+      currentPubkey: CURRENT_PUBKEY,
+      eligibilityScope: { type: "community" },
+      managedAgentPubkeys: [PUB_A],
+      relayAgents,
+      sharedChannelIds,
+    }),
+    new Set([PUB_A, PUB_B, PUB_C, PUB_D]),
+  );
+  // A DM reaches only the viewer's own agents: buzz-acp ignores everyone
+  // else's DMs whatever the policy.
+  assert.deepEqual(
+    getDirectMessageRecipientAgentPubkeys({
+      currentPubkey: CURRENT_PUBKEY,
+      managedAgentPubkeys: [PUB_A],
+      relayAgents,
+      sharedChannelIds,
     }),
     new Set([PUB_A, PUB_B]),
   );

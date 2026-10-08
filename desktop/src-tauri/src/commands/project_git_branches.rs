@@ -171,9 +171,10 @@ pub async fn create_project_remote_branch(
     source_branch: String,
     expected_commit: String,
     new_branch: String,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<ProjectRepoBranchResult, String> {
-    validate_workspace_clone_url(&clone_url, &state)?;
+    validate_workspace_clone_url(&clone_url, &relay)?;
     let source_branch = normalize_branch(&source_branch, "source")?;
     let expected_commit = normalize_commit(&expected_commit, "source")?;
     let new_branch = normalize_branch(&new_branch, "new")?;
@@ -200,9 +201,10 @@ pub async fn delete_project_remote_branch(
     clone_url: String,
     branch: String,
     expected_commit: String,
+    relay: crate::window_relay::WindowRelay,
     state: State<'_, AppState>,
 ) -> Result<ProjectRepoBranchResult, String> {
-    validate_workspace_clone_url(&clone_url, &state)?;
+    validate_workspace_clone_url(&clone_url, &relay)?;
     let branch = normalize_branch(&branch, "branch")?;
     let expected_commit = normalize_commit(&expected_commit, "branch")?;
     let auth = build_git_auth_config(&state)?;

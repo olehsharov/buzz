@@ -353,32 +353,15 @@ pub fn normalize_agent_args(command: &str, agent_args: Vec<String>) -> Vec<Strin
     normalized
 }
 
-fn profile_target_dirs(root: &Path) -> [PathBuf; 2] {
-    if cfg!(debug_assertions) {
-        // `just dev` builds fresh debug sidecars; never prefer stale release output.
-        [root.join("target/debug"), root.join("target/release")]
-    } else {
-        [root.join("target/release"), root.join("target/debug")]
-    }
-}
-
 fn command_search_dirs() -> Vec<PathBuf> {
-    let mut dirs = profile_target_dirs(&workspace_root_dir()).to_vec();
-    if let Ok(current_dir) = std::env::current_dir() {
-        dirs.extend(profile_target_dirs(&current_dir));
-    }
-
-    dirs.extend(
+    command_search::sidecar_search_dirs(
+        cfg!(debug_assertions),
         std::env::current_exe()
             .ok()
             .and_then(|path| path.parent().map(Path::to_path_buf)),
-    );
-    dirs.into_iter().fold(Vec::new(), |mut unique, dir| {
-        if !unique.contains(&dir) {
-            unique.push(dir);
-        }
-        unique
-    })
+        &workspace_root_dir(),
+        std::env::current_dir().ok(),
+    )
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -407,11 +390,11 @@ fn resolve_workspace_command(command: &str) -> Option<PathBuf> {
         return is_executable_file(&path).then_some(path);
     }
 
-    let file_name = executable_basename(command);
-    command_search_dirs()
-        .into_iter()
-        .map(|dir| dir.join(&file_name))
-        .find(|candidate| is_executable_file(candidate))
+    command_search::first_candidate_in(
+        &command_search_dirs(),
+        &executable_basename(command),
+        is_executable_file,
+    )
 }
 
 fn resolve_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<PathBuf>>>

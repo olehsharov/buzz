@@ -1,4 +1,5 @@
 import * as React from "react";
+import type { BackendIntent } from "../lib/instanceInputForDefinition";
 import { ChevronDown } from "lucide-react";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import type {
@@ -10,6 +11,7 @@ import { cn } from "@/shared/lib/cn";
 import { Input } from "@/shared/ui/input";
 import { Textarea } from "@/shared/ui/textarea";
 import { AgentCreationPreview } from "./AgentCreationPreview";
+import { AgentDraftReviewNotices } from "./AgentDraftReviewNotices";
 import { AgentIdentityFields } from "./AgentDescriptionField";
 import { PersonaDropdownField } from "./PersonaDropdownField";
 import type { EnvVarsValue } from "./EnvVarsEditor";
@@ -117,9 +119,16 @@ type AgentDefinitionDialogProps = {
   createRunSection?: React.ReactNode;
   /** Extra create-mode submit gate (e.g. incomplete provider config). */
   createSubmitBlocked?: boolean;
+  /** Create-mode notes shown above the form (agent-draft adjustments). */
+  createNotices?: readonly string[];
 };
 export type AgentDefinitionSubmitOptions = {
   publishCatalogUpdates: boolean;
+  /**
+   * Where the started instance runs, from the create-mode "Where to run"
+   * section. Absent for edits and when no run section is shown.
+   */
+  backendIntent?: BackendIntent | null;
 };
 export function AgentDefinitionDialog({
   open,
@@ -138,6 +147,7 @@ export function AgentDefinitionDialog({
   publishCatalogUpdatesOnSave = false,
   createRunSection,
   createSubmitBlocked = false,
+  createNotices,
 }: AgentDefinitionDialogProps) {
   const runtimesLoading = runtimeCatalogStatus === "loading";
   const acpCommandsQuery = useAcpCommandsQuery({ enabled: open });
@@ -751,6 +761,9 @@ export function AgentDefinitionDialog({
       />
 
       <div className="space-y-5">
+        {isCreateMode && createNotices ? (
+          <AgentDraftReviewNotices notices={createNotices} />
+        ) : null}
         <AgentIdentityFields
           description={descriptionDraft}
           disabled={isPending}

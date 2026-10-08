@@ -100,6 +100,11 @@ pub struct PairingSession {
     /// Event IDs already processed in this session (NIP-AB §Duplicate Event Handling).
     /// Duplicates are silently discarded to handle relay re-delivery.
     processed_ids: HashSet<[u8; 32]>,
+    /// (Source) A return payload from the target has been accepted.
+    return_payload_received: bool,
+    /// (Target) return payload sent / (Source) reply payload sent.
+    /// Each side may send its extra payload at most once per session.
+    extra_payload_sent: bool,
     /// When the session was created.
     created_at: Instant,
     /// Maximum session lifetime.
@@ -134,6 +139,8 @@ impl PairingSession {
             sas_code: None,
             sas_input: None,
             processed_ids: HashSet::new(),
+            return_payload_received: false,
+            extra_payload_sent: false,
             created_at: Instant::now(),
             timeout: DEFAULT_TIMEOUT,
         };
@@ -243,11 +250,40 @@ impl PairingSession {
                 payload,
             } => {
                 self.state = SessionState::PayloadExchanged;
+                self.return_payload_received = true;
                 self.record_event(event);
                 Ok((payload_type, Zeroizing::new(payload)))
             }
             other => Err(unexpected("payload", &other)),
         }
+    }
+
+    /// (Source) Answer a returned payload with a payload of our own.
+    ///
+    /// Used by two-way exchanges (e.g. agent-host pairing: the target sends
+    /// its hello via [`send_return_payload`](Self::send_return_payload), the
+    /// source answers with a grant). Requires that
+    /// [`handle_return_payload`](Self::handle_return_payload) already accepted
+    /// a payload; may be called at most once. The session stays in
+    /// [`SessionState::PayloadExchanged`] so the target's `complete` can still
+    /// be processed with [`handle_complete`](Self::handle_complete).
+    pub fn send_reply_payload(
+        &mut self,
+        payload_type: PayloadType,
+        payload: Zeroizing<String>,
+    ) -> Result<Event, PairingError> {
+        self.check_expired()?;
+        self.expect_state(SessionState::PayloadExchanged)?;
+        self.expect_role(Role::Source)?;
+        if !self.return_payload_received || self.extra_payload_sent {
+            return Err(PairingError::UnexpectedMessage {
+                expected: "one reply after a return payload".into(),
+                got: "reply not allowed".into(),
+            });
+        }
+        let event = self.build_payload_event(payload_type, &payload)?;
+        self.extra_payload_sent = true;
+        Ok(event)
     }
 
     /// (Source) Report whether a returned payload was imported successfully.
@@ -275,19 +311,7 @@ impl PairingSession {
         self.expect_state(SessionState::Transferring)?;
         self.expect_role(Role::Source)?;
 
-        let mut msg = PairingMessage::Payload {
-            payload_type,
-            payload: (*payload).clone(),
-        };
-        // Defer `?` so the transient clone is zeroized on both success and error.
-        let result = self.build_event(&msg);
-        if let PairingMessage::Payload {
-            ref mut payload, ..
-        } = msg
-        {
-            payload.zeroize();
-        }
-        let event = result?;
+        let event = self.build_payload_event(payload_type, &payload)?;
         self.state = SessionState::PayloadExchanged;
         Ok(event)
     }
@@ -347,6 +371,8 @@ impl PairingSession {
             sas_code: Some(code),
             sas_input: Some(sas_input),
             processed_ids: HashSet::new(),
+            return_payload_received: false,
+            extra_payload_sent: false,
             created_at: Instant::now(),
             timeout: DEFAULT_TIMEOUT,
         };
@@ -421,6 +447,32 @@ impl PairingSession {
         self.expect_role(Role::Target)?;
         self.state = SessionState::Transferring;
         Ok(())
+    }
+
+    /// (Target) Send a payload back to the source before receiving one.
+    ///
+    /// Valid after [`confirm_target_sas`](Self::confirm_target_sas), at most
+    /// once per session. The session stays in [`SessionState::Transferring`],
+    /// so the source's answer can still be received with
+    /// [`handle_payload`](Self::handle_payload). The source reads it with
+    /// [`handle_return_payload`](Self::handle_return_payload).
+    pub fn send_return_payload(
+        &mut self,
+        payload_type: PayloadType,
+        payload: Zeroizing<String>,
+    ) -> Result<Event, PairingError> {
+        self.check_expired()?;
+        self.expect_state(SessionState::Transferring)?;
+        self.expect_role(Role::Target)?;
+        if self.extra_payload_sent {
+            return Err(PairingError::UnexpectedMessage {
+                expected: "first return payload".into(),
+                got: "return payload already sent".into(),
+            });
+        }
+        let event = self.build_payload_event(payload_type, &payload)?;
+        self.extra_payload_sent = true;
+        Ok(event)
     }
 
     /// (Target) Process the payload event from the source.
@@ -586,6 +638,27 @@ impl PairingSession {
 }
 
 impl PairingSession {
+    /// Build a `payload` event, zeroizing the transient plaintext clone on
+    /// both success and error.
+    fn build_payload_event(
+        &self,
+        payload_type: PayloadType,
+        payload: &Zeroizing<String>,
+    ) -> Result<Event, PairingError> {
+        let mut msg = PairingMessage::Payload {
+            payload_type,
+            payload: (**payload).clone(),
+        };
+        let result = self.build_event(&msg);
+        if let PairingMessage::Payload {
+            ref mut payload, ..
+        } = msg
+        {
+            payload.zeroize();
+        }
+        result
+    }
+
     /// Encrypt a message and wrap it in a signed kind:24134 event.
     ///
     /// # Secret handling
@@ -899,6 +972,70 @@ mod tests {
             target.decrypt_message(&complete).expect("decrypt complete"),
             PairingMessage::Complete { success: true }
         ));
+    }
+
+    /// Two-way exchange (agent-host pairing): target hello, source grant,
+    /// target complete. Each extra payload is single-use and ordered.
+    ///
+    /// Mutations: drop the `return_payload_received` check in
+    /// `send_reply_payload` → the pre-hello reply succeeds → RED; drop the
+    /// `extra_payload_sent` checks → the second hello / grant succeeds → RED.
+    #[test]
+    fn two_way_payload_exchange() {
+        let (mut source, qr) = PairingSession::new_source("wss://relay.test".into());
+        let (mut target, offer) = PairingSession::new_target(&qr).expect("target");
+        source.handle_offer(&offer).expect("offer");
+        let sas_confirm = source.confirm_sas().expect("source confirm");
+        target
+            .handle_sas_confirm(&sas_confirm)
+            .expect("sas-confirm");
+        // Not before the target confirmed the SAS.
+        assert!(target
+            .send_return_payload(PayloadType::Custom, Zeroizing::new("early".into()))
+            .is_err());
+        target.confirm_target_sas().expect("target confirm");
+
+        let hello = target
+            .send_return_payload(PayloadType::Custom, Zeroizing::new("hello".into()))
+            .expect("hello");
+        assert_eq!(target.state(), SessionState::Transferring);
+        assert!(target
+            .send_return_payload(PayloadType::Custom, Zeroizing::new("again".into()))
+            .is_err());
+
+        let (pt, data) = source.handle_return_payload(&hello).expect("hello in");
+        assert_eq!((pt, data.as_str()), (PayloadType::Custom, "hello"));
+        let grant = source
+            .send_reply_payload(PayloadType::Custom, Zeroizing::new("grant".into()))
+            .expect("grant");
+        assert_eq!(source.state(), SessionState::PayloadExchanged);
+        assert!(source
+            .send_reply_payload(PayloadType::Custom, Zeroizing::new("again".into()))
+            .is_err());
+
+        let (pt, data) = target.handle_payload(&grant).expect("grant in");
+        assert_eq!((pt, data.as_str()), (PayloadType::Custom, "grant"));
+        let complete = target.send_complete().expect("complete");
+        source.handle_complete(&complete).expect("handle complete");
+        assert_eq!(source.state(), SessionState::Completed);
+        assert_eq!(target.state(), SessionState::Completed);
+    }
+
+    /// A source cannot send a reply payload unless the target sent one first
+    /// (the forward flow's `send_payload` already consumed the state).
+    #[test]
+    fn reply_payload_requires_return_payload() {
+        let (mut source, qr) = PairingSession::new_source("wss://relay.test".into());
+        let (_target, offer) = PairingSession::new_target(&qr).expect("target");
+        source.handle_offer(&offer).expect("offer");
+        source.confirm_sas().expect("confirm");
+        source
+            .send_payload(PayloadType::Nsec, Zeroizing::new("nsec1x".into()))
+            .expect("forward payload");
+        assert_eq!(source.state(), SessionState::PayloadExchanged);
+        assert!(source
+            .send_reply_payload(PayloadType::Custom, Zeroizing::new("grant".into()))
+            .is_err());
     }
 
     #[test]

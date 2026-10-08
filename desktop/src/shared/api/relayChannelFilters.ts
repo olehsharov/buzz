@@ -160,3 +160,25 @@ export function buildGlobalStreamFilter(
     limit,
   };
 }
+
+/** Startup replay window for live ephemeral channel signals (seconds). */
+export const LIVE_EPHEMERAL_LOOKBACK_SECONDS = 10;
+
+/**
+ * Live filter for a channel-scoped ephemeral signal — typing indicators
+ * (20002) and live reply drafts (20003). Ephemeral kinds are never stored, so
+ * `since` only bounds what an in-flight fan-out may still deliver; there is no
+ * history backfill.
+ */
+export function buildLiveEphemeralChannelFilter(
+  kind: number,
+  channelId: string,
+  nowMs = Date.now(),
+): RelaySubscriptionFilter {
+  return {
+    kinds: [kind],
+    "#h": [channelId],
+    limit: 10,
+    since: Math.floor(nowMs / 1_000) - LIVE_EPHEMERAL_LOOKBACK_SECONDS,
+  };
+}
