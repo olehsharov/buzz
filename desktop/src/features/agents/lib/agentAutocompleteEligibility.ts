@@ -73,6 +73,35 @@ export function relayAgentCanRespondInChannel(
   );
 }
 
+/**
+ * Agents a new direct message may address: the viewer's own agents only.
+ * buzz-acp answers a DM only from the agent's owner (or the owner's other
+ * agents) whatever its access policy (`author_allowed`, PR #2591), so
+ * offering another person's "Anyone" agent would open a conversation it
+ * ignores. Matches the DM composer's send-time revalidation, which uses the
+ * same `owned` scope (`useMentions`).
+ */
+export function getDirectMessageRecipientAgentPubkeys({
+  currentPubkey,
+  managedAgentPubkeys,
+  relayAgents,
+  sharedChannelIds,
+}: {
+  currentPubkey?: string | null;
+  managedAgentPubkeys: Iterable<string>;
+  relayAgents: readonly RelayAgent[] | undefined;
+  sharedChannelIds: ReadonlySet<string>;
+}) {
+  return getMentionableAgentPubkeys({
+    currentPubkey,
+    eligibilityScope: { type: "owned", channelId: null },
+    managedAgentPubkeys,
+    phase: "prepare",
+    relayAgents,
+    sharedChannelIds,
+  });
+}
+
 export type AgentEligibilityScope =
   | { type: "community" }
   | { type: "channel"; channelId: string }

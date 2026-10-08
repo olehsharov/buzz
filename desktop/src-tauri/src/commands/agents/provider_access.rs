@@ -1,6 +1,9 @@
-//! Upgrade reconciliation for provider-backed managed-agent access.
+//! Workspace-apply reconciliation for remote managed-agent access: redeploys
+//! deployed agents whose saved access policy no successful deployment has
+//! acknowledged yet (`provider_policy_pending`), and every provider agent on
+//! owner-only builds.
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager, Runtime};
 
 use crate::{
     app_state::AppState,
@@ -11,13 +14,24 @@ use crate::{
     util::now_iso,
 };
 
+use super::access_transition::RemoteAccessRedeploy;
+
+/// Whether workspace apply must redeploy `record` to enforce its access
+/// policy. Provider agents: on owner-only builds always, otherwise while a
+/// saved policy is pending. Paired-machine agents: while pending (owner-only
+/// builds project owner-only into every host deploy already).
 pub(super) fn needs_reconciliation_with_policy(
     record: &ManagedAgentRecord,
     owner_only_access: bool,
 ) -> bool {
-    (owner_only_access || record.provider_policy_pending)
-        && matches!(record.backend, BackendKind::Provider { .. })
-        && record.backend_agent_id.is_some()
+    if record.backend_agent_id.is_none() {
+        return false;
+    }
+    match record.backend {
+        BackendKind::Provider { .. } => owner_only_access || record.provider_policy_pending,
+        BackendKind::Host { .. } => record.provider_policy_pending,
+        BackendKind::Local => false,
+    }
 }
 
 #[derive(Debug)]
@@ -29,51 +43,81 @@ struct ProviderAccessTarget {
     agent_json: Result<serde_json::Value, String>,
 }
 
+/// Provider agents an owner-only build redeploys before the community loads.
+/// Empty on other builds: their pending provider redeploys are retried in the
+/// background (`pending_access_redeploys`).
 fn collect_targets_with(
     records: Vec<ManagedAgentRecord>,
     owner_only_access: bool,
     mut build_payload: impl FnMut(&ManagedAgentRecord) -> Result<serde_json::Value, String>,
 ) -> Vec<ProviderAccessTarget> {
+    if !owner_only_access {
+        return Vec::new();
+    }
     records
         .into_iter()
         .filter(|record| needs_reconciliation_with_policy(record, owner_only_access))
-        .map(|record| match record.backend.clone() {
-            BackendKind::Provider { id, config } => ProviderAccessTarget {
+        .filter_map(|record| match record.backend.clone() {
+            BackendKind::Provider { id, config } => Some(ProviderAccessTarget {
                 agent_json: build_payload(&record),
                 pubkey: record.pubkey,
                 provider_id: id,
                 config,
                 cached_binary_path: record.provider_binary_path,
-            },
-            BackendKind::Local | BackendKind::Host { .. } => {
-                unreachable!("provider access reconciliation selected a non-provider agent")
-            }
+            }),
+            // Paired machines are retried in the background.
+            BackendKind::Local | BackendKind::Host { .. } => None,
         })
         .collect()
 }
 
-/// Redeploy existing provider agents whose access policy requires enforcement.
+/// Redeploy existing remote agents whose access policy requires enforcement.
 ///
-/// Owner-only builds refresh every existing deployment before each community UI
-/// load. All builds also retry records whose saved policy has not yet been
-/// acknowledged by a successful provider deployment. Workspace apply fails
-/// closed if any selected provider rejects the current policy.
-pub(crate) async fn reconcile_on_workspace_apply(
-    app: &AppHandle,
+/// Owner-only builds refresh every existing provider deployment before each
+/// community UI load and fail the load closed if one rejects the enforced
+/// policy. A saved policy that no deployment has acknowledged yet
+/// (`provider_policy_pending`, set by an access edit) is retried in the
+/// background instead, for provider and paired-machine agents alike: the
+/// remote host may be unreachable, and the community must still load so the
+/// owner can see the pending agent and press Retry. A failed retry stays on
+/// the record (pending flag + `last_error`) for the next apply or Retry.
+pub(crate) async fn reconcile_on_workspace_apply<R: Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
 ) -> Result<(), String> {
-    let owner_only_access = crate::managed_agents::owner_only_access_build();
-    let targets = {
+    reconcile_with_policy(app, state, crate::managed_agents::owner_only_access_build())
+        .await
+        .map(drop)
+}
+
+/// [`reconcile_on_workspace_apply`] for an explicit build policy. Returns the
+/// background retry task, if one was started.
+async fn reconcile_with_policy<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    owner_only_access: bool,
+) -> Result<Option<tauri::async_runtime::JoinHandle<()>>, String> {
+    // window-relay: workspace apply runs for the main window's community.
+    let community_relay = crate::relay::relay_ws_url_with_override(state);
+    let (enforced, pending) = {
         let _store_guard = state
             .managed_agents_store_lock
             .lock()
             .map_err(|error| error.to_string())?;
-        collect_targets_with(load_managed_agents(app)?, owner_only_access, |record| {
+        let records = load_managed_agents(app)?;
+        let pending = super::access_transition::pending_access_redeploys(
+            &records,
+            &community_relay,
+            owner_only_access,
+        );
+        let enforced = collect_targets_with(records, owner_only_access, |record| {
             super::build_deploy_payload(app, state, record)
-        })
+        });
+        (enforced, pending)
     };
+    let background = spawn_pending_redeploys(app, pending);
 
-    for target in targets {
+    for target in enforced {
         let ProviderAccessTarget {
             pubkey,
             provider_id,
@@ -110,11 +154,38 @@ pub(crate) async fn reconcile_on_workspace_apply(
         }
     }
 
-    Ok(())
+    Ok(background)
 }
 
-pub(crate) fn persist_failure(
-    app: &AppHandle,
+/// Retry pending access redeploys without blocking the community load. Each
+/// failure is recorded on its agent by `redeploy_for_access_policy`; the
+/// Agents page is told to refresh when the retries settle.
+fn spawn_pending_redeploys<R: Runtime>(
+    app: &AppHandle<R>,
+    targets: Vec<(String, RemoteAccessRedeploy)>,
+) -> Option<tauri::async_runtime::JoinHandle<()>> {
+    if targets.is_empty() {
+        return None;
+    }
+    let app = app.clone();
+    Some(tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        for (pubkey, target) in targets {
+            if let Err(error) =
+                super::access_transition::redeploy_for_access_policy(&app, &state, &pubkey, &target)
+                    .await
+            {
+                eprintln!(
+                    "buzz-desktop: pending access redeploy for agent {pubkey} failed: {error}"
+                );
+            }
+        }
+        let _ = tauri::Emitter::emit(&app, "agents-data-changed", ());
+    }))
+}
+
+pub(crate) fn persist_failure<R: tauri::Runtime>(
+    app: &AppHandle<R>,
     state: &AppState,
     pubkey: &str,
     error: &str,
@@ -183,7 +254,7 @@ mod tests {
     }
 
     #[test]
-    fn unmarked_build_collects_only_pending_targets() {
+    fn pending_provider_redeploys_run_in_the_background_on_unmarked_builds() {
         let mut pending = record(
             BackendKind::Provider {
                 id: "pending-provider".into(),
@@ -200,18 +271,29 @@ mod tests {
             },
             Some("existing-ordinary"),
         );
+        let records = vec![ordinary, pending];
 
-        let targets = collect_targets_with(vec![ordinary, pending], false, |record| {
-            Ok(serde_json::json!({"pubkey": record.pubkey}))
-        });
-
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].pubkey, "pending-agent");
-        assert_eq!(targets[0].provider_id, "pending-provider");
-        assert_eq!(
-            targets[0].agent_json.as_ref().unwrap()["pubkey"],
-            "pending-agent"
+        // Nothing blocks the community load...
+        assert!(
+            collect_targets_with(records.clone(), false, |_| { Ok(serde_json::Value::Null) })
+                .is_empty()
         );
+        // ...the pending agent is retried in the background instead.
+        assert_eq!(
+            super::super::access_transition::pending_access_redeploys(
+                &records,
+                "wss://relay.example",
+                false
+            ),
+            vec![("pending-agent".to_string(), RemoteAccessRedeploy::Provider)]
+        );
+        // Owner-only builds redeploy every provider inline instead.
+        assert!(super::super::access_transition::pending_access_redeploys(
+            &records,
+            "wss://relay.example",
+            true
+        )
+        .is_empty());
     }
 
     #[test]
@@ -226,11 +308,15 @@ mod tests {
         undeployed.provider_policy_pending = true;
         let mut local = record(BackendKind::Local, Some("stale-provider-id"));
         local.provider_policy_pending = true;
+        let records = vec![undeployed, local];
 
-        assert!(collect_targets_with(vec![undeployed, local], false, |_| {
-            Ok(serde_json::Value::Null)
-        })
+        assert!(super::super::access_transition::pending_access_redeploys(
+            &records,
+            "wss://relay.example",
+            false
+        )
         .is_empty());
+        assert!(collect_targets_with(records, true, |_| Ok(serde_json::Value::Null)).is_empty());
     }
 
     #[test]
@@ -242,7 +328,106 @@ mod tests {
             Some(&"ab".repeat(32)),
         );
         host.provider_policy_pending = true;
-        // Selecting it would hit the non-provider `unreachable!` arm.
         assert!(collect_targets_with(vec![host], true, |_| Ok(serde_json::Value::Null)).is_empty());
+    }
+
+    #[test]
+    fn pending_host_agents_need_reconciliation_only_while_deployed() {
+        let host = BackendKind::Host {
+            host_pubkey: "ab".repeat(32),
+        };
+        let mut pending = record(host.clone(), Some(&"ab".repeat(32)));
+        pending.provider_policy_pending = true;
+        assert!(needs_reconciliation_with_policy(&pending, false));
+
+        let acknowledged = record(host.clone(), Some(&"ab".repeat(32)));
+        assert!(!needs_reconciliation_with_policy(&acknowledged, true));
+
+        let mut undeployed = record(host, None);
+        undeployed.provider_policy_pending = true;
+        assert!(!needs_reconciliation_with_policy(&undeployed, false));
+    }
+
+    // ── Workspace apply against a scripted provider ──────────────────────────
+
+    #[cfg(unix)]
+    fn apply_with(
+        fixture: &crate::commands::agents::scripted_provider_fixture::ScriptedProvider,
+        owner_only_access: bool,
+    ) -> Result<(), String> {
+        let state = fixture.state();
+        tauri::async_runtime::block_on(async {
+            let background =
+                reconcile_with_policy(fixture.app.handle(), &state, owner_only_access).await?;
+            if let Some(background) = background {
+                background.await.expect("background retries complete");
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_pending_provider_redeploy_does_not_block_the_community_load() {
+        let fixture = crate::commands::agents::scripted_provider_fixture::ScriptedProvider::new(
+            r#"{"ok":false,"error":"host unreachable"}"#,
+        );
+        let (mut agent, nsec) = fixture.deployed_agent();
+        agent.respond_to = crate::managed_agents::RespondTo::Anyone;
+        agent.provider_policy_pending = true;
+        let pubkey = agent.pubkey.clone();
+        fixture.save(&[(agent, nsec)]);
+
+        apply_with(&fixture, false).expect("the community loads with a pending redeploy");
+
+        assert!(fixture.delivered().is_some(), "the redeploy was retried");
+        let agent = fixture.load(&pubkey);
+        assert!(agent.provider_policy_pending, "kept for the next retry");
+        assert!(agent
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("host unreachable")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_pending_provider_redeploy_acknowledges_the_policy() {
+        let fixture = crate::commands::agents::scripted_provider_fixture::ScriptedProvider::new(
+            r#"{"ok":true,"agent_id":"deployed-after"}"#,
+        );
+        let (mut agent, nsec) = fixture.deployed_agent();
+        agent.provider_policy_pending = true;
+        let pubkey = agent.pubkey.clone();
+        fixture.save(&[(agent, nsec)]);
+
+        apply_with(&fixture, false).unwrap();
+
+        let agent = fixture.load(&pubkey);
+        assert!(!agent.provider_policy_pending);
+        assert_eq!(agent.backend_agent_id.as_deref(), Some("deployed-after"));
+        assert_eq!(agent.last_error, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_only_enforcement_failure_still_fails_the_load_closed() {
+        let fixture = crate::commands::agents::scripted_provider_fixture::ScriptedProvider::new(
+            r#"{"ok":false,"error":"host unreachable"}"#,
+        );
+        let (agent, nsec) = fixture.deployed_agent();
+        let pubkey = agent.pubkey.clone();
+        fixture.save(&[(agent, nsec)]);
+
+        let error = apply_with(&fixture, true).expect_err("owner-only enforcement fails closed");
+
+        assert!(
+            error.contains("provider access reconciliation failed"),
+            "{error}"
+        );
+        assert!(fixture
+            .load(&pubkey)
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("host unreachable")));
     }
 }

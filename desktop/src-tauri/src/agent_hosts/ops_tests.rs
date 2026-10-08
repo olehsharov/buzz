@@ -391,6 +391,90 @@ async fn redeploy_to_the_same_host_does_not_undeploy_first() {
     assert_eq!(fake.types().len(), 1);
 }
 
+impl Fixture {
+    /// Mark a saved `anyone` policy as not yet delivered to the machine.
+    fn save_pending_anyone_policy(&self) {
+        let mut records = load_managed_agents(self.app.handle()).unwrap();
+        records[0].respond_to = crate::managed_agents::RespondTo::Anyone;
+        records[0].provider_policy_pending = true;
+        save_managed_agents(self.app.handle(), &records).unwrap();
+    }
+
+    /// Redeploy to host A with a payload that carries `respond_to`.
+    async fn redeploy_with_policy(
+        &self,
+        ops: &HostOps,
+        channel: &FakeHosts,
+        respond_to: &str,
+    ) -> Result<(), String> {
+        let state = self.app.state::<AppState>();
+        let nsec = self.agent_nsec.clone();
+        let respond_to = respond_to.to_string();
+        deploy_agent_to_host(
+            self.app.handle(),
+            &state,
+            ops,
+            channel,
+            &self.agent(),
+            &self.host_a.public_key().to_hex(),
+            RELAY,
+            move |_record: &ManagedAgentRecord| {
+                Ok(serde_json::json!({
+                    "relay_url": RELAY,
+                    "private_key_nsec": nsec,
+                    "launch": {"command": "goose", "args": ["acp"], "env": {}, "policy_env": {}},
+                    "respond_to": respond_to,
+                    "respond_to_allowlist": [],
+                }))
+            },
+        )
+        .await
+    }
+}
+
+/// A machine restarts a redeployed agent with the frame's policy, so its ack
+/// is what delivers a pending access change.
+#[tokio::test]
+async fn acknowledged_redeploy_delivers_a_pending_access_policy() {
+    let fx = Fixture::new();
+    fx.place_on(&fx.host_a);
+    fx.save_pending_anyone_policy();
+    let ops = HostOps::default();
+    let fake = fx.fake(vec![Reply::AckOk]);
+
+    fx.redeploy_with_policy(&ops, &fake, "anyone")
+        .await
+        .unwrap();
+
+    assert_eq!(fake.received.lock().unwrap()[0].1["respond_to"], "anyone");
+    assert!(!fx.record().provider_policy_pending);
+}
+
+#[tokio::test]
+async fn refused_or_stale_redeploys_keep_the_access_policy_pending() {
+    let fx = Fixture::new();
+    fx.place_on(&fx.host_a);
+    fx.save_pending_anyone_policy();
+    let ops = HostOps::default();
+
+    let refused = fx.fake(vec![Reply::AckErr("disk full")]);
+    let error = fx
+        .redeploy_with_policy(&ops, &refused, "anyone")
+        .await
+        .unwrap_err();
+    assert!(error.contains("disk full"), "{error}");
+    let record = fx.record();
+    assert!(record.provider_policy_pending, "retried later");
+    assert_eq!(deployed_on(&record), Some(fx.host_a.public_key().to_hex()));
+
+    // A deploy that delivered an older policy does not acknowledge the newer one.
+    let stale = fx.fake(vec![Reply::AckOk]);
+    fx.redeploy_with_policy(&ops, &stale, "owner-only")
+        .await
+        .unwrap();
+    assert!(fx.record().provider_policy_pending);
+}
+
 #[tokio::test]
 async fn forgetting_the_host_mid_deploy_fences_out_the_late_ack() {
     let fx = Fixture::new();

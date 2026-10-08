@@ -215,7 +215,7 @@ pub struct CreateManagedAgentRequest {
 /// - Field absent in JSON → `None` (don't touch)
 /// - `"field": null` → `Some(None)` (clear to default)
 /// - `"field": "value"` → `Some(Some("value"))` (set)
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateManagedAgentRequest {
     pub pubkey: String,

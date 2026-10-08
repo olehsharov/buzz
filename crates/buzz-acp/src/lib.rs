@@ -9,6 +9,7 @@ mod config;
 mod edit_routing;
 mod engram_fetch;
 mod filter;
+mod gate_drop_log;
 mod isolated_execution;
 mod observer;
 mod pool;
@@ -432,6 +433,7 @@ mod inbound_author_gate {
         relay_self: Option<String>,
         // None means no authoritative NIP-11 result yet, including at startup.
         refreshed_generation: Option<u64>,
+        drop_log: super::gate_drop_log::DropLogLimiter,
     }
 
     pub(crate) fn refresh_needed(refreshed_generation: Option<u64>, event_generation: u64) -> bool {
@@ -450,6 +452,7 @@ mod inbound_author_gate {
                 agent_pubkey_hex: agent_pubkey_hex.to_string(),
                 relay_self,
                 refreshed_generation: completed.then_some(0),
+                drop_log: super::gate_drop_log::DropLogLimiter::default(),
             }
         }
 
@@ -554,14 +557,32 @@ mod inbound_author_gate {
                 )
                 .await;
             if !decision.allowed {
-                tracing::debug!(
-                    channel_id = %buzz_event.channel_id,
-                    raw_author = %buzz_event.event.pubkey.to_hex(),
-                    effective_author = %decision.effective_author,
-                    mode = %respond_to,
-                    is_dm = decision.is_dm,
-                    "inbound author gate — dropping event"
-                );
+                // Info, so an agent that silently ignores someone is visible
+                // at the default log level; rate-limited per (author,
+                // channel) because any channel member can trigger it.
+                match self.drop_log.record(
+                    &decision.effective_author,
+                    buzz_event.channel_id,
+                    std::time::Instant::now(),
+                ) {
+                    Some(suppressed) => tracing::info!(
+                        channel_id = %buzz_event.channel_id,
+                        raw_author = %buzz_event.event.pubkey.to_hex(),
+                        effective_author = %decision.effective_author,
+                        mode = %respond_to,
+                        is_dm = decision.is_dm,
+                        suppressed_since_last = suppressed,
+                        "inbound author gate — dropping event"
+                    ),
+                    None => tracing::debug!(
+                        channel_id = %buzz_event.channel_id,
+                        raw_author = %buzz_event.event.pubkey.to_hex(),
+                        effective_author = %decision.effective_author,
+                        mode = %respond_to,
+                        is_dm = decision.is_dm,
+                        "inbound author gate — dropping event"
+                    ),
+                }
                 return None;
             }
             Some(AuthorizedListenerEvent {
@@ -8458,6 +8479,112 @@ mod author_gate_tests {
             .await,
             "an allowlisted external pubkey must NOT fire a turn inside a DM"
         );
+    }
+
+    /// Counts INFO "dropping event" lines emitted by the gate.
+    struct DropLineCapture {
+        lines: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for DropLineCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Message(Option<String>);
+            impl tracing::field::Visit for Message {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = Some(format!("{value:?}"));
+                    }
+                }
+            }
+            if *event.metadata().level() != tracing::Level::INFO {
+                return;
+            }
+            let mut message = Message(None);
+            event.record(&mut message);
+            if let Some(message) = message.0 {
+                if message.contains("inbound author gate — dropping event") {
+                    self.lines.lock().unwrap().push(message);
+                }
+            }
+        }
+    }
+
+    /// A dropped event is logged at INFO through the production listener
+    /// boundary (`authorize_listener_event`), at most once per (author,
+    /// channel) window, so a sender cannot amplify the log.
+    #[tokio::test]
+    async fn test_dropped_event_logs_at_info_once_per_author_and_channel() {
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let relay_hex = nostr::Keys::generate().public_key().to_hex();
+        let agent = nostr::Keys::generate().public_key().to_hex();
+        let (rest_client, server) = nip11_server(serde_json::json!({ "self": relay_hex })).await;
+        let mut gate = InboundAuthorGate::connect(&rest_client, &agent, "test").await;
+        let stranger = nostr::Keys::generate();
+        let cache = cache_with_sibling();
+        cache.cache_sibling(stranger.public_key().to_hex(), false);
+        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
+        let channel_info = pool::ChannelInfoResolver::new(
+            HashMap::from([first, second].map(|channel_id| {
+                (
+                    channel_id,
+                    relay::ChannelInfo {
+                        name: "general".into(),
+                        channel_type: "stream".into(),
+                        description: None,
+                    },
+                )
+            })),
+            rest_client.clone(),
+        );
+        let message = |channel_id| relay::BuzzEvent {
+            connection_generation: 0,
+            channel_id,
+            event: nostr::EventBuilder::new(
+                nostr::Kind::Custom(KIND_STREAM_MESSAGE as u16),
+                "do this",
+            )
+            .sign_with_keys(&stranger)
+            .expect("signed message"),
+        };
+
+        let lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(DropLineCapture {
+            lines: lines.clone(),
+        });
+        async {
+            for channel_id in [first, first, first, second] {
+                let admitted = gate
+                    .authorize_listener_event(
+                        message(channel_id),
+                        &RespondTo::OwnerOnly,
+                        &HashSet::new(),
+                        &cache,
+                        &channel_info,
+                        &rest_client,
+                    )
+                    .await;
+                assert!(admitted.is_none(), "a stranger is dropped under owner-only");
+            }
+        }
+        .with_subscriber(subscriber)
+        .await;
+
+        assert_eq!(
+            lines.lock().unwrap().len(),
+            2,
+            "one INFO line per (author, channel), not one per dropped event"
+        );
+        server.abort();
     }
 
     #[tokio::test]

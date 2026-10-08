@@ -68,6 +68,22 @@ pub(crate) fn projected_access_with_policy(
     }
 }
 
+/// Whether a delivered deploy payload carries exactly the access policy saved
+/// on `record`. A completed remote deployment (provider or paired machine)
+/// clears `provider_policy_pending` only when this holds, so a newer policy
+/// saved while the deployment ran stays pending for its own redeploy.
+pub(crate) fn deployed_policy_matches_record(
+    record: &ManagedAgentRecord,
+    deployed_agent_json: &serde_json::Value,
+) -> bool {
+    deployed_agent_json
+        .get("respond_to")
+        .and_then(serde_json::Value::as_str)
+        == Some(record.respond_to.as_str())
+        && deployed_agent_json.get("respond_to_allowlist")
+            == Some(&serde_json::json!(record.respond_to_allowlist))
+}
+
 /// Build the inbound-author access environment for a launched agent. The
 /// explicit policy input keeps owner-only access enforcement testable without
 /// weakening the production caller's compile-time decision.

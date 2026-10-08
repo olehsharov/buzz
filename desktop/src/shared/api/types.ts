@@ -364,6 +364,12 @@ export type ManagedAgent = {
   autoRestartOnConfigChange: boolean;
   backend: ManagedAgentBackend;
   backendAgentId: string | null;
+  /**
+   * The saved access policy has not yet been delivered by a successful
+   * redeploy of this provider or paired-machine agent, which still runs with
+   * its previous access. Retried on community load and by Start/Deploy.
+   */
+  providerPolicyPending: boolean;
   /** Who the agent should respond to. Maps to `buzz-acp --respond-to`. */
   respondTo: RespondToMode;
   /**

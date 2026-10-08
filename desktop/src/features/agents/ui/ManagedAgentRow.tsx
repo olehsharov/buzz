@@ -24,6 +24,7 @@ import { ManagedAgentLogPanel } from "./ManagedAgentLogPanel";
 import { PubKey } from "@/shared/ui/PubKey";
 import { SubsectionLabel } from "@/shared/ui/PageHeader";
 import { resolveModelLabel } from "@/features/agents/lib/formatAgentModelLabel";
+import { AccessPendingBadge } from "./AccessPendingBadge";
 import { RestartDiffBadge } from "./RestartDiffBadge";
 
 export function ManagedAgentRow({
@@ -168,6 +169,9 @@ export function ManagedAgentRow({
               autoRestartEnabled={agent.autoRestartOnConfigChange}
               restartDiff={agent.restartDiff}
             />
+          ) : null}
+          {agent.providerPolicyPending && !isLocal ? (
+            <AccessPendingBadge agent={agent} />
           ) : null}
           <Button
             onClick={() => onOpenProfile(agent.pubkey)}

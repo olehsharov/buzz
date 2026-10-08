@@ -2,6 +2,29 @@ use crate::managed_agents::known_acp_runtime;
 #[path = "cli_tests.rs"]
 mod cli_tests;
 
+// ── summary mirrors provider_policy_pending ─────────────────────────────
+
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn summary_mirrors_provider_policy_pending() {
+    let test = crate::managed_agents::admission_test_support::app_with_keyless_agent();
+    let handle = test.app.handle();
+    let mut record = crate::managed_agents::load_managed_agents(handle).unwrap()[0].clone();
+    for pending in [true, false] {
+        record.provider_policy_pending = pending;
+        let summary = super::build_managed_agent_summary(
+            handle,
+            &record,
+            &std::collections::HashMap::new(),
+            &[],
+            &[],
+            &crate::managed_agents::GlobalAgentConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(summary.provider_policy_pending, pending);
+    }
+}
+
 // ── desktop binary name tests ───────────────────────────────────────────
 
 #[test]

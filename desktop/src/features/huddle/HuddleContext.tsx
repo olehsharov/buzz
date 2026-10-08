@@ -6,6 +6,7 @@ import { setupAudioWorklet, type AudioWorkletHandle } from "./lib/audioWorklet";
 import { type AudioInputDevice, useAudioDevices } from "./lib/useAudioDevices";
 import { usePipelineHotstart } from "./lib/usePipelineHotstart";
 import { formatHuddleActionError } from "./lib/huddleError";
+import { acquireMicrophone } from "./lib/microphone";
 import {
   type VoiceInputMode,
   useHuddlePttState,
@@ -568,17 +569,16 @@ export function HuddleProvider({
 
       // Get mic — Rust backend owns the audio WS connection.
       // Request 48 kHz to match the Opus encoder and worklet buffer size (960 samples = 20ms).
-      const audioConstraints: MediaTrackConstraints = {
-        echoCancellation: true,
-        noiseSuppression: true,
-        sampleRate: 48000,
-      };
-      if (selectedDeviceId) {
-        audioConstraints.deviceId = { exact: selectedDeviceId };
+      // A selected device that is gone falls back once to the system default.
+      const { stream, fellBackToDefault } = await acquireMicrophone(
+        (constraints) => navigator.mediaDevices.getUserMedia(constraints),
+        { echoCancellation: true, noiseSuppression: true, sampleRate: 48000 },
+        selectedDeviceId,
+      );
+      if (fellBackToDefault) {
+        // Forget the missing device so the next huddle doesn't retry it.
+        setLocalSelectedDeviceId("");
       }
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: audioConstraints,
-      });
       const audioTrack = stream.getAudioTracks()[0];
 
       // Wrap post-getUserMedia steps so the stream is always cleaned up on
@@ -620,7 +620,7 @@ export function HuddleProvider({
         throw err;
       }
     },
-    [getVoiceInputMode, selectedDeviceId],
+    [getVoiceInputMode, selectedDeviceId, setLocalSelectedDeviceId],
   );
 
   const startHuddle = React.useCallback(

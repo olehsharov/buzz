@@ -704,8 +704,13 @@ use databricks::{discover_databricks_models, DatabricksAuthIntent};
 
 #[path = "agent_models_update.rs"]
 mod update;
+#[cfg(test)]
+pub(crate) use update::apply_access_edit;
 pub use update::update_managed_agent;
 pub(super) use update::{flush_managed_agent_policy, managed_agent_access_policy_changed};
+pub(crate) use update::{
+    record_has_access_policy, update_managed_agent_scoped, ACCESS_PRECONDITION_FAILED,
+};
 
 // ── Model normalization ───────────────────────────────────────────────────────
 
