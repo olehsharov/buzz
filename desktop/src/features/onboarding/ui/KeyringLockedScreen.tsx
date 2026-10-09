@@ -5,21 +5,27 @@ import { importIdentity } from "@/shared/api/tauriIdentity";
 import { useSystemColorScheme } from "@/shared/theme/useSystemColorScheme";
 import { Button } from "@/shared/ui/button";
 import { StartupWindowDragRegion } from "@/shared/ui/StartupWindowDragRegion";
+import { useConfirmDialog } from "@/shared/ui/useConfirmDialog";
 import { NostrKeyImportForm } from "./NostrKeyImportForm";
 
 export function KeyringLockedScreen() {
   const queryClient = useQueryClient();
   const systemColorScheme = useSystemColorScheme();
   const [showImport, setShowImport] = React.useState(false);
+  const { confirm, confirmDialog } = useConfirmDialog();
 
-  const handleReimportClick = React.useCallback(() => {
-    const confirmed = window.confirm(
-      "Importing a different nsec replaces the identity currently locked in the keyring for this install. The previous identity will no longer be accessible. Continue?",
-    );
+  const handleReimportClick = React.useCallback(async () => {
+    const confirmed = await confirm({
+      title: "Replace the locked identity?",
+      description:
+        "Importing a different nsec replaces the identity currently locked in the keyring for this install. The previous identity will no longer be accessible.",
+      confirmLabel: "Import a different key",
+      destructive: true,
+    });
     if (confirmed) {
       setShowImport(true);
     }
-  }, []);
+  }, [confirm]);
 
   const handleImport = React.useCallback(
     async (nsec: string, password?: string) => {
@@ -39,6 +45,7 @@ export function KeyringLockedScreen() {
       data-testid="keyring-locked"
     >
       <StartupWindowDragRegion />
+      {confirmDialog}
       <div className="relative flex w-full max-w-[500px] flex-col items-center text-center">
         <h1 className="text-3xl font-semibold tracking-tight">
           Unlock your system keyring
@@ -69,7 +76,9 @@ export function KeyringLockedScreen() {
             </Button>
             <Button
               className="h-10 w-full"
-              onClick={handleReimportClick}
+              onClick={() => {
+                void handleReimportClick();
+              }}
               type="button"
               variant="secondary"
             >

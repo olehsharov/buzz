@@ -1,7 +1,9 @@
 import { captureRelayRemovals } from "@/features/agents/managedAgentRelayCleanup";
 import { HOST_UNDEPLOY_FAILED_PREFIX } from "@/shared/api/agentHosts";
+import type { ChannelCleanupReport } from "@/shared/api/channelCleanup";
 import { sendChannelMessage } from "@/shared/api/tauri";
 import type { Channel, ManagedAgent, RelayAgent } from "@/shared/api/types";
+import type { ConfirmFn } from "@/shared/ui/useConfirmDialog";
 import type { AgentAvailabilityReader } from "./useAgentAvailability";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 
@@ -12,7 +14,9 @@ type DeleteManagedAgentInput = {
 
 type StartManagedAgent = (pubkey: string) => Promise<unknown>;
 type StopManagedAgent = (pubkey: string) => Promise<unknown>;
-type DeleteManagedAgent = (input: DeleteManagedAgentInput) => Promise<unknown>;
+type DeleteManagedAgent = (
+  input: DeleteManagedAgentInput,
+) => Promise<ChannelCleanupReport | undefined>;
 
 type ManagedAgentChannelContext = {
   channels: readonly Channel[];
@@ -24,9 +28,20 @@ type ManagedAgentActionContext = ManagedAgentChannelContext & {
   getAvailability: AgentAvailabilityReader;
 };
 
+/** Show `message` until the returned function is called. */
+export type ShowProgress = (message: string) => () => void;
+
+const noProgress: ShowProgress = () => () => {};
+
+/** How long the desktop waits for a machine's acknowledgement (the hosts
+ * contract's ACK_TIMEOUT in agent_hosts/ops.rs). */
+const HOST_ACK_TIMEOUT_SECONDS = 60;
+
 export type ManagedAgentActionResult = {
   cancelled?: boolean;
   noticeMessage?: string;
+  /** Set by a completed delete: the channels the agent left or kept. */
+  channelCleanup?: ChannelCleanupReport;
 };
 
 /** Agents that run somewhere else: a provider deployment or an approved
@@ -77,6 +92,18 @@ export function resolveManagedAgentChannelId(
 ) {
   if (context.preferredChannelId) {
     return context.preferredChannelId;
+  }
+
+  // A channel whose member list (kind:39002) holds the agent: it is actually
+  // in it, unlike the agent's self-reported list, which can be stale.
+  const member = context.channels.find((channel) =>
+    channel.memberPubkeys?.some(
+      (memberPubkey) =>
+        normalizePubkey(memberPubkey) === normalizePubkey(agent.pubkey),
+    ),
+  );
+  if (member) {
+    return member.id;
   }
 
   const relayAgent = context.relayAgents.find(
@@ -152,13 +179,19 @@ export async function stopManagedAgentWithRules({
   stopManagedAgent: StopManagedAgent;
 } & ManagedAgentChannelContext): Promise<ManagedAgentActionResult> {
   if (isRemoteManagedAgent(agent)) {
+    // Provider and paired-machine agents stop on `!shutdown` sent through a
+    // channel they are in (docs/agent-hosts.md, "Stopping an agent").
     const channelId = resolveManagedAgentChannelId(agent, {
       channels,
       preferredChannelId,
       relayAgents,
     });
     if (!channelId) {
-      throw new Error("Cannot stop: agent is not in any channel");
+      throw new Error(
+        `Can't stop ${agent.name}: it is not a member of any channel, and the ` +
+          "stop request is sent through a channel. Add it to a channel, or " +
+          "delete it.",
+      );
     }
 
     await sendChannelMessage(channelId, "!shutdown", undefined, undefined, [
@@ -177,18 +210,26 @@ export async function stopManagedAgentWithRules({
 export async function deleteManagedAgentWithRules({
   agent,
   channels,
+  confirm,
   deleteManagedAgent,
   preferredChannelId,
   getAvailability,
   relayAgents,
+  showProgress = noProgress,
   skipRemoteDeleteConfirm = false,
 }: {
   agent: ManagedAgent;
+  /** In-app confirmation (see `useConfirmDialog`). */
+  confirm: ConfirmFn;
   deleteManagedAgent: DeleteManagedAgent;
+  /** Shows a long wait (a machine's acknowledgement). */
+  showProgress?: ShowProgress;
+  /** Skips the provider orphan warning the caller already showed. A
+   * machine that does not confirm is always asked about. */
   skipRemoteDeleteConfirm?: boolean;
 } & ManagedAgentActionContext): Promise<ManagedAgentActionResult> {
   if (agent.backend.type === "host") {
-    return deleteHostAgent(agent, deleteManagedAgent, skipRemoteDeleteConfirm);
+    return deleteHostAgent(agent, deleteManagedAgent, confirm, showProgress);
   }
   if (agent.backend.type === "provider" && agent.backendAgentId) {
     const availability = getAvailability(agent.pubkey);
@@ -198,6 +239,7 @@ export async function deleteManagedAgentWithRules({
       relayAgents,
     });
 
+    let warning: string;
     if (channelId) {
       // Only established Offline preserves the intentional no-request path.
       // Unknown is not evidence that shutdown can safely be skipped.
@@ -205,52 +247,50 @@ export async function deleteManagedAgentWithRules({
         await sendChannelMessage(channelId, "!shutdown", undefined, undefined, [
           agent.pubkey,
         ]);
-
-        if (!skipRemoteDeleteConfirm) {
-          const confirmed = window.confirm(
-            (availability === undefined
-              ? "This agent’s availability is unknown. "
-              : "") +
-              "Shutdown requested, but the agent may still be running. " +
-              "Deleting now removes the local record — the remote deployment " +
-              "will be orphaned if shutdown hasn't completed. Continue?",
-          );
-          if (!confirmed) {
-            return { cancelled: true };
-          }
-        }
+        warning =
+          (availability === undefined
+            ? "This agent’s availability is unknown. "
+            : "") +
+          "Shutdown requested, but the agent may still be running. " +
+          "Deleting now removes the local record — the remote deployment " +
+          "will be orphaned if shutdown hasn't completed.";
       } else {
-        if (!skipRemoteDeleteConfirm) {
-          const confirmed = window.confirm(
-            "This agent is offline but the remote deployment may still exist. " +
-              "Deleting removes the local management record. Continue?",
-          );
-          if (!confirmed) {
-            return { cancelled: true };
-          }
-        }
+        warning =
+          "This agent is offline but the remote deployment may still exist. " +
+          "Deleting removes the local management record.";
       }
     } else {
-      if (!skipRemoteDeleteConfirm) {
-        const confirmed = window.confirm(
-          "This agent is deployed but not in any channel. " +
-            "Deleting removes the local management record; the remote deployment may still be running. Continue?",
-        );
-        if (!confirmed) {
-          return { cancelled: true };
-        }
-      }
+      warning =
+        "This agent is deployed but not in any channel. " +
+        "Deleting removes the local management record; the remote deployment may still be running.";
+    }
+    if (
+      !skipRemoteDeleteConfirm &&
+      !(await confirm({
+        title: `Delete ${agent.name}?`,
+        description: warning,
+        confirmLabel: "Delete agent",
+        destructive: true,
+      }))
+    ) {
+      return { cancelled: true };
     }
   }
 
   const isDeployedRemote =
     agent.backend.type === "provider" && agent.backendAgentId;
-  await deleteManagedAgent({
-    pubkey: agent.pubkey,
-    forceRemoteDelete: isDeployedRemote ? true : undefined,
-  });
+  return deleted(
+    await deleteManagedAgent({
+      pubkey: agent.pubkey,
+      forceRemoteDelete: isDeployedRemote ? true : undefined,
+    }),
+  );
+}
 
-  return {};
+function deleted(
+  channelCleanup: ChannelCleanupReport | undefined,
+): ManagedAgentActionResult {
+  return channelCleanup ? { channelCleanup } : {};
 }
 
 /**
@@ -262,26 +302,42 @@ export async function deleteManagedAgentWithRules({
 async function deleteHostAgent(
   agent: ManagedAgent,
   deleteManagedAgent: DeleteManagedAgent,
-  skipConfirm: boolean,
+  confirm: ConfirmFn,
+  showProgress: ShowProgress,
 ): Promise<ManagedAgentActionResult> {
+  const machine = agent.hostName ?? "its machine";
+  const deployed = agent.backendAgentId !== null;
+  const done = deployed
+    ? showProgress(
+        `Asking ${machine} to remove ${agent.name} (up to ${HOST_ACK_TIMEOUT_SECONDS} s)…`,
+      )
+    : () => {};
+  let reason: string;
   try {
-    await deleteManagedAgent({ pubkey: agent.pubkey });
-    return {};
+    return deleted(await deleteManagedAgent({ pubkey: agent.pubkey }));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (!message.startsWith(HOST_UNDEPLOY_FAILED_PREFIX)) throw error;
-    const reason = message.slice(HOST_UNDEPLOY_FAILED_PREFIX.length);
-    if (
-      !skipConfirm &&
-      !window.confirm(
-        `The machine did not confirm removing this agent (${reason}). ` +
-          "Delete it here anyway? It may keep running on the machine until " +
-          "you forget the machine.",
-      )
-    ) {
-      return { cancelled: true };
-    }
-    await deleteManagedAgent({ pubkey: agent.pubkey, forceRemoteDelete: true });
-    return {};
+    reason = message.slice(HOST_UNDEPLOY_FAILED_PREFIX.length);
+  } finally {
+    done();
   }
+  // Always asked, even when the caller already confirmed the delete: that
+  // confirmation promised the machine would remove the agent.
+  if (
+    !(await confirm({
+      title: `${machine} did not confirm`,
+      description:
+        `${agent.name} could not be removed from ${machine}: ${reason} ` +
+        "Delete it here anyway? The machine may keep a copy of the agent " +
+        "and keep running it until you forget the machine.",
+      confirmLabel: "Delete anyway",
+      destructive: true,
+    }))
+  ) {
+    return { cancelled: true };
+  }
+  return deleted(
+    await deleteManagedAgent({ pubkey: agent.pubkey, forceRemoteDelete: true }),
+  );
 }

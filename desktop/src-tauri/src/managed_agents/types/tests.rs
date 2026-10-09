@@ -778,6 +778,7 @@ fn summary_fixture(
         env_vars: Default::default(),
         backend: super::BackendKind::Local,
         backend_agent_id: None,
+        host_name: None,
         provider_policy_pending: false,
         status: "running".into(),
         pid: Some(4242),

@@ -102,6 +102,13 @@ import { UserProfilePanelFrame } from "@/features/profile/ui/UserProfilePanelFra
 import { getUserProfilePanelHeaderContent } from "@/features/profile/ui/UserProfilePanelHeaderContent";
 import { UserProfileEditAgentDialog } from "@/features/profile/ui/UserProfileEditAgentDialog";
 import { useProfileEditAgentRequest } from "@/features/profile/ui/useProfileEditAgentRequest";
+import { useConfirmDialog } from "@/shared/ui/useConfirmDialog";
+import { warnAboutChannelCleanup } from "@/features/agents/lib/channelCleanupNotice";
+import {
+  deletePersonaAfterRemoteAgents,
+  partialPersonaDeleteNotice,
+  remoteAgentsOfPersona,
+} from "@/features/agents/lib/personaRemoteAgents";
 export type { ProfilePanelTab, ProfilePanelView };
 
 export function UserProfilePanel({
@@ -245,6 +252,7 @@ export function UserProfilePanel({
   const startAgentMutation = useStartManagedAgentMutation();
   const stopAgentMutation = useStopManagedAgentMutation();
   const deleteAgentMutation = useDeleteManagedAgentMutation();
+  const { confirm, confirmDialog } = useConfirmDialog();
   const startOnLaunchMutation = useSetManagedAgentStartOnAppLaunchMutation();
   const createPersonaMutation = useCreatePersonaMutation();
   const updatePersonaMutation = useUpdatePersonaMutation();
@@ -412,6 +420,7 @@ export function UserProfilePanel({
   }, [openResolvedPersonaEditor, setEditAgentOpen]);
   const { deleteManagedAgentRecord, deleteManagedAgentsForPersona } =
     useProfileAgentDeletion({
+      confirm,
       channels: channelsQuery.data,
       deleteManagedAgent: deleteAgentMutation.mutateAsync,
       managedAgent,
@@ -519,6 +528,7 @@ export function UserProfilePanel({
       if (result.cancelled) return;
 
       toast.success(`Deleted ${managedAgent.name}.`);
+      warnAboutChannelCleanup(managedAgent.name, result.channelCleanup);
       onClose();
     } catch (error) {
       toast.error(
@@ -581,6 +591,10 @@ export function UserProfilePanel({
         const deletedInstances =
           await deleteManagedAgentsForPersona(resolvedPersona);
         if (deletedInstances.cancelled) return;
+        warnAboutChannelCleanup(
+          resolvedPersona.displayName,
+          deletedInstances.channelCleanup,
+        );
 
         await setPersonaActiveMutation.mutateAsync({
           id: resolvedPersona.id,
@@ -618,7 +632,22 @@ export function UserProfilePanel({
       }
 
       try {
-        await deletePersonaMutation.mutateAsync(personaToConfirm.id);
+        const { cancelled, channelCleanup, deletedAgents } =
+          await deletePersonaAfterRemoteAgents({
+            persona: personaToConfirm,
+            managedAgents: managedAgentsQuery.data ?? [],
+            deleteAgent: deleteManagedAgentRecord,
+            deletePersona: deletePersonaMutation.mutateAsync,
+          });
+        warnAboutChannelCleanup(personaToConfirm.displayName, channelCleanup);
+        if (cancelled) {
+          const partial = partialPersonaDeleteNotice(
+            personaToConfirm,
+            deletedAgents,
+          );
+          if (partial) toast.warning(partial);
+          return;
+        }
         toast.success(`Deleted ${personaToConfirm.displayName}.`);
         setPersonaToDelete(null);
         onClose();
@@ -628,7 +657,12 @@ export function UserProfilePanel({
         );
       }
     },
-    [deletePersonaMutation.mutateAsync, onClose],
+    [
+      deleteManagedAgentRecord,
+      deletePersonaMutation.mutateAsync,
+      managedAgentsQuery.data,
+      onClose,
+    ],
   );
 
   // Count of managed-agent instances backed by the persona being deleted.
@@ -947,6 +981,7 @@ export function UserProfilePanel({
   ) : null;
   const personaDialogs = (
     <>
+      {confirmDialog}
       <UserProfilePersonaDialogs
         cardMintTarget={cardMint.target}
         createError={
@@ -955,6 +990,14 @@ export function UserProfilePanel({
             : null
         }
         instanceCount={personaDeleteInstanceCount}
+        remoteAgents={
+          personaToDelete
+            ? remoteAgentsOfPersona(
+                managedAgentsQuery.data ?? [],
+                personaToDelete.id,
+              )
+            : []
+        }
         isPending={
           createPersonaMutation.isPending ||
           updatePersonaMutation.isPending ||

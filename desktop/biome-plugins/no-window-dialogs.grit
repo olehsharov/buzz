@@ -1,0 +1,9 @@
+language js
+
+`window.$method($args)` where {
+  $method <: or {
+    `confirm`,
+    `alert`
+  },
+  register_diagnostic(span=$method, message="The Tauri dialog plugin makes window.confirm/alert async no-ops. Use useConfirmDialog from @/shared/ui/useConfirmDialog.", severity="error")
+}

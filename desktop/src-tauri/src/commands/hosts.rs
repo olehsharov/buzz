@@ -163,8 +163,25 @@ pub async fn undeploy_from_host(
     state: State<'_, AppState>,
     hosts: State<'_, HostOps>,
 ) -> Result<crate::managed_agents::ManagedAgentSummary, String> {
-    let channel = relay_channel(&state, &relay)?;
-    ops::undeploy_agent_from_host(&app, &state, &hosts, &channel, &pubkey).await?;
+    let owner_keys = state.signing_keys()?;
+    let held = hosts.hold(&pubkey).await?;
+    ops::undeploy_agent_via_its_host(
+        &app,
+        &state,
+        &hosts,
+        &held,
+        &community_relay(&relay),
+        &pubkey,
+        |route| {
+            Ok(RelayHostChannel {
+                relay_url: route.relay_url.clone(),
+                owner_keys,
+            })
+        },
+    )
+    .await
+    .map_err(ops::UndeployError::into_message)?;
+    drop(held);
     summary_for(&app, &state, &pubkey)
 }
 

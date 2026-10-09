@@ -32,6 +32,7 @@ let useAgentAvailabilityLookup,
   CommunitiesProvider;
 let deleteManagedAgentWithRules, deleteManagedAgent, relayClient, originals;
 let connection, listeners, handlers, commands, confirms, clients;
+let confirmAnswer, dialogObserver, fireEvent, useConfirmDialog;
 
 before(async () => {
   Object.assign(globalThis, {
@@ -45,6 +46,16 @@ before(async () => {
     configurable: true,
     value: dom.window.navigator,
   });
+  // The in-app confirmation dialog (Radix) needs the rest of the DOM API.
+  for (const key of Object.getOwnPropertyNames(dom.window)) {
+    if (!(key in globalThis)) {
+      try {
+        globalThis[key] = dom.window[key];
+      } catch {}
+    }
+  }
+  globalThis.Event = dom.window.Event;
+  globalThis.CustomEvent = dom.window.CustomEvent;
   dom.window.__TAURI_INTERNALS__ = {
     invoke: async (command, args) => {
       commands.push([command, args]);
@@ -53,7 +64,12 @@ before(async () => {
     },
     transformCallback: () => 1,
   };
-  ({ act, render, cleanup, waitFor } = await import("@testing-library/react"));
+  ({ act, render, cleanup, waitFor, fireEvent } = await import(
+    "@testing-library/react"
+  ));
+  ({ useConfirmDialog } = await import(
+    "../../../shared/ui/useConfirmDialog.tsx"
+  ));
   ({ createElement } = await import("react"));
   ({ QueryClient, QueryClientProvider } = await import(
     "@tanstack/react-query"
@@ -114,10 +130,62 @@ function setup() {
     ["plugin:event|listen", () => 1],
     ["plugin:event|unlisten", () => null],
   ]);
-  dom.window.confirm = (copy) => {
-    confirms.push(copy);
-    return true;
-  };
+  confirmAnswer = true;
+}
+
+/** Direct-call stand-in for the in-app dialog. */
+const testConfirm = async (request) => {
+  confirms.push(request.description);
+  return confirmAnswer;
+};
+
+/** Run a hook operation that may open the in-app dialog. Awaiting it inside
+ * `act` would deadlock: act holds the dialog's render until the callback
+ * settles, and the callback waits on the dialog. `waitFor` polls with act
+ * disabled, so the dialog renders and is answered. */
+async function runToCompletion(start) {
+  let operation;
+  act(() => {
+    operation = start();
+  });
+  let outcome;
+  operation.then(
+    (value) => {
+      outcome = { value };
+    },
+    (error) => {
+      outcome = { error };
+    },
+  );
+  await waitFor(() => assert.ok(outcome, "operation still pending"), {
+    timeout: 5000,
+  });
+  if (outcome.error) throw outcome.error;
+  return outcome.value;
+}
+
+/** Answer the real in-app dialog the hook surfaces render, recording its
+ * text, so the hook paths exercise `useConfirmDialog` end to end. */
+function answerDialogsAutomatically() {
+  dialogObserver?.disconnect();
+  dialogObserver = new dom.window.MutationObserver(() => {
+    const dialog = dom.window.document.querySelector(
+      '[data-testid="confirm-dialog"]',
+    );
+    if (!dialog || dialog.dataset.answered) return;
+    dialog.dataset.answered = "true";
+    confirms.push(dialog.textContent);
+    const button = dialog.querySelector(
+      confirmAnswer
+        ? '[data-testid="confirm-dialog-action"]'
+        : '[data-testid="confirm-dialog-cancel"]',
+    );
+    queueMicrotask(() => fireEvent.click(button));
+  });
+  dialogObserver.observe(dom.window.document.body, {
+    childList: true,
+    subtree: true,
+  });
 }
 
 function mount(
@@ -138,11 +206,13 @@ function mount(
   let current;
   function AgentsSurface() {
     current = useManagedAgentActions();
-    return null;
+    return current.confirmDialog;
   }
   function ProfileSurface() {
     const availability = useAgentAvailabilityLookup(keys);
+    const { confirm, confirmDialog } = useConfirmDialog();
     const deletion = useProfileAgentDeletion({
+      confirm,
       channels: [channel],
       managedAgents: agents,
       managedAgent: agents[0],
@@ -155,9 +225,10 @@ function mount(
         deleteManagedAgent(pubkey, forceRemoteDelete),
     });
     current = { ...availability, ...deletion };
-    return null;
+    return confirmDialog;
   }
   const Surface = owner === "agents" ? AgentsSurface : ProfileSurface;
+  answerDialogsAutomatically();
   render(
     createElement(
       QueryClientProvider,
@@ -230,17 +301,17 @@ for (const owner of ["agents", "profile"]) {
         ),
       );
       commands.length = 0;
-      await act(async () => {
-        if (owner === "agents") await surface.current().handleDelete(PK);
-        else await surface.current().deleteManagedAgentRecord(agent);
-      });
+      await runToCompletion(() =>
+        owner === "agents"
+          ? surface.current().handleDelete(PK)
+          : surface.current().deleteManagedAgentRecord(agent),
+      );
       const shouldShutdown = scenario !== "offline" && scenario !== "missing";
       assert.deepEqual(
         effects().map(([name]) => name),
         [
           ...(shouldShutdown ? ["send_channel_message"] : []),
           "delete_managed_agent",
-          "remove_channel_member",
         ],
       );
       if (shouldShutdown) {
@@ -328,11 +399,9 @@ test("unknown waits for shutdown before confirmation/delete; cancellation retain
         release = resolve;
       }),
   );
-  dom.window.confirm = (copy) => {
-    confirms.push(copy);
-    return false;
-  };
+  confirmAnswer = false;
   const operation = deleteManagedAgentWithRules({
+    confirm: testConfirm,
     agent,
     channels: [channel],
     relayAgents: directory,
@@ -354,6 +423,7 @@ test("no channel warns without claiming process state; local deletion ignores pr
   const remove = ({ pubkey, forceRemoteDelete }) =>
     deleteManagedAgent(pubkey, forceRemoteDelete);
   await deleteManagedAgentWithRules({
+    confirm: testConfirm,
     agent,
     channels: [],
     relayAgents: [],
@@ -369,6 +439,7 @@ test("no channel warns without claiming process state; local deletion ignores pr
   commands.length = 0;
   confirms.length = 0;
   await deleteManagedAgentWithRules({
+    confirm: testConfirm,
     agent: { ...agent, backend: { type: "local" } },
     channels: [],
     relayAgents: [],
@@ -408,13 +479,13 @@ test("Agents deletion rechecks availability after channel discovery, not the cli
     surface.client.invalidateQueries({ queryKey: ["presence", PK] }),
   );
   assert.deepEqual(effects(), []);
-  await act(async () => {
+  await runToCompletion(() => {
     releaseChannels({ hash: "empty", channels: [], last_messages: {} });
-    await operation;
+    return operation;
   });
   assert.deepEqual(
     effects().map(([name]) => name),
-    ["send_channel_message", "delete_managed_agent", "remove_channel_member"],
+    ["send_channel_message", "delete_managed_agent"],
   );
   assert.match(confirms[0], /availability is unknown/);
 });
@@ -430,7 +501,7 @@ test("profile persona deletion cannot infer Offline for an unqueried sibling", a
     assert.equal(surface.current().getAvailability(PK), "offline"),
   );
   assert.equal(surface.current().getAvailability(SIBLING), undefined);
-  await act(() =>
+  await runToCompletion(() =>
     surface.current().deleteManagedAgentsForPersona({ id: "persona" }),
   );
   const requests = effects().filter(
@@ -467,3 +538,54 @@ test("successful cached snapshot remains authoritative during refetch; only sett
   });
   assert.equal(surface.current().getAvailability(PK), undefined);
 });
+
+for (const owner of ["agents", "profile"]) {
+  test(`${owner} deletion leaves channels to the backend and reports any it kept`, async () => {
+    setup();
+    handlers.set("get_presence", () => ({ [PK]: "offline" }));
+    handlers.set("delete_managed_agent", () => ({
+      channels: {
+        removed: [{ id: "channel", name: "agents" }],
+        failed: [
+          {
+            channel_id: "locked",
+            channel_name: "ops",
+            error: "relay rejected event: not a member",
+          },
+        ],
+        lookup_error: null,
+      },
+    }));
+    const surface = mount(owner);
+    await waitFor(() =>
+      assert.equal(surface.current().getAvailability(PK), "offline"),
+    );
+    commands.length = 0;
+    const result = await runToCompletion(() =>
+      owner === "agents"
+        ? surface.current().handleDelete(PK)
+        : surface.current().deleteManagedAgentRecord(agent),
+    );
+    // The frontend no longer publishes removals itself.
+    assert.deepEqual(
+      effects().map(([name]) => name),
+      ["delete_managed_agent"],
+    );
+    if (owner === "agents") {
+      await waitFor(() =>
+        assert.match(
+          surface.current().actionErrorMessage ?? "",
+          /Remote is still a member of #ops \(relay rejected event: not a member\)/,
+        ),
+      );
+    } else {
+      assert.deepEqual(result.channelCleanup.failed, [
+        {
+          channelId: "locked",
+          channelName: "ops",
+          error: "relay rejected event: not a member",
+        },
+      ]);
+    }
+  });
+}

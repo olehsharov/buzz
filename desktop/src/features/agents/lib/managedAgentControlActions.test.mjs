@@ -8,6 +8,8 @@ import {
   getManagedAgentRestartLabel,
   startManagedAgentWithRules,
   respawnManagedAgentWithRules,
+  resolveManagedAgentChannelId,
+  stopManagedAgentWithRules,
 } from "./managedAgentControlActions.ts";
 
 function agent(overrides = {}) {
@@ -269,11 +271,56 @@ test("machine agents deploy, redeploy and stop like remote agents", () => {
   );
 });
 
+test("shutdown targets a channel the agent is actually a member of", () => {
+  const pubkey = "deadbeef".repeat(8);
+  // The agent's self-reported list names a channel it has since left.
+  const relayAgents = [{ pubkey, channels: ["old"], channelIds: ["left"] }];
+  const channels = [
+    { id: "other", name: "other", memberPubkeys: ["ab".repeat(32)] },
+    { id: "joined", name: "joined", memberPubkeys: [pubkey.toUpperCase()] },
+  ];
+  assert.equal(
+    resolveManagedAgentChannelId({ pubkey }, { channels, relayAgents }),
+    "joined",
+  );
+  // No membership known: the self-reported list is still the fallback.
+  assert.equal(
+    resolveManagedAgentChannelId({ pubkey }, { channels: [], relayAgents }),
+    "left",
+  );
+});
+
+test("a machine agent in no channel cannot be shut down and says why", async () => {
+  const stopped = [];
+  await assert.rejects(
+    stopManagedAgentWithRules({
+      agent: agent({ ...HOST_AGENT, name: "Infra" }),
+      channels: [],
+      relayAgents: [],
+      stopManagedAgent: async (pubkey) => stopped.push(pubkey),
+    }),
+    /Can't stop Infra: it is not a member of any channel/,
+  );
+  assert.deepEqual(stopped, [], "never routed to the local stop");
+});
+
+test("a machine agent its machine reports stopped offers Deploy, not a dead Shutdown", () => {
+  assert.equal(
+    getManagedAgentPrimaryActionLabel(
+      agent({ ...HOST_AGENT, status: "stopped" }),
+    ),
+    "Deploy",
+  );
+});
+
 test("deleting a machine agent asks the machine first, and only forces after the user agrees", async () => {
   const deleteContext = {
     channels: [],
     relayAgents: [],
     getAvailability: () => "online",
+    confirm: async () => {
+      throw new Error("no confirmation expected");
+    },
   };
   const prefixed = `${HOST_UNDEPLOY_FAILED_PREFIX}The machine did not answer in time.`;
 
@@ -286,11 +333,13 @@ test("deleting a machine agent asks the machine first, and only forces after the
   });
   assert.deepEqual(calls, [{ pubkey: "deadbeef".repeat(8) }]);
 
-  // Machine unreachable, user declines: no forced delete.
+  // Machine unreachable, user declines: no forced delete. The answer is
+  // asynchronous (an in-app dialog); a pending Promise must never count as
+  // agreement, which is how `!window.confirm()` failed in the Tauri build.
   calls = [];
-  globalThis.window = { confirm: () => false };
   const declined = await deleteManagedAgentWithRules({
     ...deleteContext,
+    confirm: async () => false,
     agent: agent(HOST_AGENT),
     deleteManagedAgent: async (input) => {
       calls.push(input);
@@ -302,9 +351,9 @@ test("deleting a machine agent asks the machine first, and only forces after the
 
   // Machine unreachable, user agrees: retried with force.
   calls = [];
-  globalThis.window = { confirm: () => true };
   await deleteManagedAgentWithRules({
     ...deleteContext,
+    confirm: async () => true,
     agent: agent(HOST_AGENT),
     deleteManagedAgent: async (input) => {
       calls.push(input);
@@ -327,5 +376,41 @@ test("deleting a machine agent asks the machine first, and only forces after the
     }),
     /agent not found/,
   );
-  delete globalThis.window;
+});
+
+test("a machine delete shows the wait, and a caller's earlier confirmation never skips the forced-delete question", async () => {
+  const progress = [];
+  const asked = [];
+  const calls = [];
+  const result = await deleteManagedAgentWithRules({
+    channels: [],
+    relayAgents: [],
+    getAvailability: () => "online",
+    // The profile panel already confirmed "Delete this agent?".
+    skipRemoteDeleteConfirm: true,
+    showProgress: (message) => {
+      progress.push(`show ${message}`);
+      return () => progress.push("hide");
+    },
+    confirm: async (request) => {
+      asked.push(request);
+      return false;
+    },
+    agent: agent({ ...HOST_AGENT, name: "Infra", hostName: "workstation" }),
+    deleteManagedAgent: async (input) => {
+      calls.push(input);
+      throw new Error(
+        `${HOST_UNDEPLOY_FAILED_PREFIX}workstation did not confirm: timed out.`,
+      );
+    },
+  });
+  assert.deepEqual(progress, [
+    "show Asking workstation to remove Infra (up to 60 s)…",
+    "hide",
+  ]);
+  assert.equal(asked.length, 1);
+  assert.equal(asked[0].title, "workstation did not confirm");
+  assert.match(asked[0].description, /may keep a copy of the agent/);
+  assert.equal(result.cancelled, true);
+  assert.equal(calls.length, 1, "declining never forces");
 });

@@ -186,6 +186,29 @@ pub fn build_managed_agent_summary<R: tauri::Runtime>(
     // green light as long as any pair anywhere is alive.
     let pair_key = workspace_pair_key(app, record);
     let pair_runtime = pair_key.as_ref().and_then(|key| runtimes.get(key));
+    let host_placement = match &record.backend {
+        BackendKind::Host { host_pubkey, .. } => {
+            let state = app.state::<crate::app_state::AppState>();
+            // An unreadable machine list degrades to the deploy receipt; it
+            // must not fail the whole agent list.
+            let hosts = match super::managed_agents_base_dir(app)
+                .and_then(|dir| crate::agent_hosts::store::load_hosts(&dir))
+            {
+                Ok(hosts) => hosts,
+                Err(error) => {
+                    tracing::warn!("reading approved machines failed: {error}");
+                    Vec::new()
+                }
+            };
+            Some(crate::agent_hosts::placement::host_placement(
+                record,
+                host_pubkey,
+                &hosts,
+                &crate::relay::relay_ws_url_with_override(&state),
+            ))
+        }
+        _ => None,
+    };
 
     let (status, pid, log_path) = if record.backend != BackendKind::Local {
         // Two-axis status model for remote agents:
@@ -203,10 +226,14 @@ pub fn build_managed_agent_summary<R: tauri::Runtime>(
         // (infrastructure still exists). This is intentional — the provider may
         // have allocated a VM/container that persists across process restarts.
         // A future provider `undeploy` operation (v2) will handle teardown.
-        let status = if record.backend_agent_id.is_some() {
-            "deployed".to_string()
-        } else {
-            "not_deployed".to_string()
+        //
+        // A paired machine reports its agents' state itself (`host.status`),
+        // so a machine agent that stopped there reads "stopped" (see
+        // agent_hosts::placement).
+        let status = match &host_placement {
+            Some(placement) => placement.status.to_string(),
+            None if record.backend_agent_id.is_some() => "deployed".to_string(),
+            None => "not_deployed".to_string(),
         };
         (status, None, String::new())
     } else {
@@ -357,6 +384,7 @@ pub fn build_managed_agent_summary<R: tauri::Runtime>(
         env_vars: record.env_vars.clone(),
         backend: record.backend.clone(),
         backend_agent_id: record.backend_agent_id.clone(),
+        host_name: host_placement.and_then(|placement| placement.host_name),
         provider_policy_pending: record.provider_policy_pending,
         status,
         pid,

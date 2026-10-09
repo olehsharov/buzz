@@ -154,6 +154,8 @@ audioadapter-buffers = "3.0"
 tempfile = "3"
 strip-ansi-escapes = "0.2"
 tracing = "0.1"
+# Writes `tracing` events to the persistent desktop log (see desktop_log.rs).
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }

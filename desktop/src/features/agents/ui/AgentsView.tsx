@@ -10,6 +10,7 @@ import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
 import { AgentDialog } from "./AgentDialog";
 import { CommunityCatalogDialog } from "./CommunityCatalogDialog";
 import { PersonaDeleteDialog } from "./PersonaDeleteDialog";
+import { remoteAgentsOfPersona } from "../lib/personaRemoteAgents";
 import { PersonaShareDialog } from "./PersonaShareDialog";
 import { AgentSnapshotExportDialog } from "./AgentSnapshotExportDialog";
 import { AgentSnapshotImportDialog } from "./AgentSnapshotImportDialog";
@@ -381,8 +382,15 @@ export function AgentsView() {
             ).length
           }
           onConfirm={(persona) => {
-            void personas.handleDelete(persona);
+            void personas.handleDelete(persona, {
+              managedAgents: agents.managedAgents,
+              deleteAgent: agents.deleteAgentForPersonaCascade,
+            });
           }}
+          remoteAgents={remoteAgentsOfPersona(
+            agents.managedAgents,
+            personas.personaToDelete.id,
+          )}
           onOpenChange={(open) => {
             if (!open) {
               personas.setPersonaToDelete(null);
@@ -699,6 +707,7 @@ export function AgentsView() {
           e.target.value = "";
         }}
       />
+      {agents.confirmDialog}
     </>
   );
 }

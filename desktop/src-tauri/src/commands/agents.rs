@@ -8,12 +8,12 @@ use crate::{
         bestie_assignment::{recover_pending_assignment_cleanup, with_agent_assignments_cleared},
         build_managed_agent_summary, current_instance_id, ensure_persona_is_active,
         find_managed_agent_mut, load_managed_agents, load_personas, load_teams,
-        managed_agents_base_dir, normalize_agent_args, resolve_provider_binary,
-        save_managed_agents, start_managed_agent_process, stop_managed_agent_process,
-        stop_managed_agent_workspace_pair, sync_managed_agent_processes, try_regenerate_nest,
-        validate_provider_config, BackendKind, CreateManagedAgentRequest,
-        CreateManagedAgentResponse, ManagedAgentRecord, ManagedAgentSummary, RelayMeshConfig,
-        DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM, DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
+        normalize_agent_args, resolve_provider_binary, save_managed_agents,
+        start_managed_agent_process, stop_managed_agent_workspace_pair,
+        sync_managed_agent_processes, try_regenerate_nest, validate_provider_config, BackendKind,
+        CreateManagedAgentRequest, CreateManagedAgentResponse, ManagedAgentRecord,
+        ManagedAgentSummary, RelayMeshConfig, DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM,
+        DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
     },
     relay::relay_ws_url_with_override,
     util::now_iso,
@@ -1269,122 +1269,8 @@ async fn deploy_host_agent<R: tauri::Runtime>(
     .await
 }
 
-/// Prefix of the delete error when the agent's machine did not confirm the
-/// undeploy. The UI offers "delete anyway" (`force_remote_delete: true`).
-pub const HOST_UNDEPLOY_FAILED_PREFIX: &str = "host-undeploy-failed: ";
-
-#[tauri::command]
-pub async fn delete_managed_agent(
-    pubkey: String,
-    force_remote_delete: Option<bool>,
-    app: AppHandle,
-    relay: crate::window_relay::WindowRelay,
-) -> Result<(), String> {
-    use tauri::Manager;
-    // A host agent is removed from its machine first, and the machine must
-    // acknowledge it. Forcing skips the machine (it may be gone for good) —
-    // the user confirmed that in the UI after this failed once.
-    {
-        let state = app.state::<AppState>();
-        let hosts = app.state::<crate::agent_hosts::HostOps>();
-        let on_host = {
-            let _store_guard = state
-                .managed_agents_store_lock
-                .lock()
-                .map_err(|error| error.to_string())?;
-            load_managed_agents(&app)?
-                .iter()
-                .find(|record| record.pubkey == pubkey)
-                .and_then(crate::agent_hosts::ops::deployed_host)
-                .is_some()
-        };
-        if on_host && !force_remote_delete.unwrap_or(false) {
-            let channel = crate::agent_hosts::channel::RelayHostChannel {
-                relay_url: relay.ws_url().to_string(),
-                owner_keys: state.signing_keys()?,
-            };
-            crate::agent_hosts::ops::undeploy_agent_from_host(
-                &app, &state, &hosts, &channel, &pubkey,
-            )
-            .await
-            .map_err(|error| format!("{HOST_UNDEPLOY_FAILED_PREFIX}{error}"))?;
-        }
-        hosts.invalidate(&pubkey)?;
-    }
-    tokio::task::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        {
-            let _store_guard = state
-                .managed_agents_store_lock
-                .lock()
-                .map_err(|error| error.to_string())?;
-            let mut records = load_managed_agents(&app)?;
-            let base_dir = managed_agents_base_dir(&app)?;
-            recover_pending_assignment_cleanup(&base_dir, |pending_pubkey| {
-                records
-                    .iter()
-                    .any(|record| record.pubkey.eq_ignore_ascii_case(pending_pubkey))
-            })?;
-            let mut runtimes = state
-                .managed_agent_processes
-                .lock()
-                .map_err(|error| error.to_string())?;
-
-            let (sync_changed, exited_pubkeys) = sync_managed_agent_processes(
-                &mut records,
-                &mut runtimes,
-                &current_instance_id(&app),
-            );
-            if sync_changed {
-                save_managed_agents(&app, &records)?;
-            }
-            for pubkey in &exited_pubkeys {
-                state.clear_agent_session_caches(pubkey);
-            }
-            // Guard: reject deletion of deployed remote agents unless explicitly forced.
-            // This turns "don't orphan remote infra" from a UI convention into a backend
-            // invariant — a buggy or compromised IPC caller cannot silently orphan a live
-            // remote deployment. The frontend sends force_remote_delete: true only after
-            // the user confirms the orphan warning.
-            if let Some(record) = records.iter().find(|r| r.pubkey == pubkey) {
-                if record.backend != BackendKind::Local
-                    && record.backend_agent_id.is_some()
-                    && !force_remote_delete.unwrap_or(false)
-                {
-                    return Err(
-                        "cannot delete a deployed remote agent without force_remote_delete: true"
-                            .to_string(),
-                    );
-                }
-            }
-
-            if !records.iter().any(|record| record.pubkey == pubkey) {
-                return Err(format!("agent {pubkey} not found"));
-            }
-            run_managed_agent_deletion(&base_dir, &pubkey, &mut records, |records| {
-                if let Some(record) = records.iter_mut().find(|record| record.pubkey == pubkey) {
-                    stop_managed_agent_process(&app, record, &mut runtimes)?;
-                }
-                state.clear_agent_session_caches(&pubkey);
-                records.retain(|record| record.pubkey != pubkey);
-                save_managed_agents(&app, records)
-            })?;
-            crate::managed_agents::delete_agent_key(&pubkey);
-            // Tombstone after confirmed removal (inside lock; every published
-            // agent tombstones). The NIP-IA kind:9035 archive request — which
-            // stops the identity appearing in member pickers and autocomplete —
-            // is enqueued in the SAME transaction, its `persona_id` derived from
-            // the retained 30177 head.
-            tombstone_managed_agent_pending(&app, &state, relay.ws_url(), &pubkey);
-        }
-        try_regenerate_nest(&app);
-        Ok(())
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking failed: {e}"))?
-}
-
-// Remote agent shutdown is handled entirely by the frontend:
+// Remote agent shutdown (provider and paired-machine agents) is handled
+// entirely by the frontend (docs/agent-hosts.md, "Stopping an agent"):
 // 1. Frontend sends "!shutdown" @mention via WebSocket (signed by user's key)
 // 2. Harness sees it, exits gracefully, sets presence to "offline"
 // 3. Desktop's existing presence polling sees "offline" — UI updates automatically
@@ -1401,6 +1287,10 @@ pub(super) use deploy::build_deploy_payload;
 use deploy::{deploy_payload_json, DeployProjections};
 #[cfg(test)]
 use deploy::{ensure_remote_provider_supported, resolve_deploy_model_provider};
+
+#[path = "agents_delete.rs"]
+mod delete;
+pub use delete::*;
 
 #[path = "agents_profile.rs"]
 mod profile;

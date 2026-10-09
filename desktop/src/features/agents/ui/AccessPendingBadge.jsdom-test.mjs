@@ -41,6 +41,15 @@ const tauriMock = {
     if (command === "start_managed_agent") {
       return Promise.resolve({ ...rawAgent, provider_policy_pending: false });
     }
+    // The media URL module polls these from import until they resolve
+    // (every 100 ms for 5 s); answering ends the poll so a late poll cannot
+    // land in the calls a test asserts on.
+    if (command === "get_relay_http_url") {
+      return Promise.resolve("http://localhost:3000");
+    }
+    if (command === "get_media_proxy_port") {
+      return Promise.resolve(3001);
+    }
     return Promise.reject(new Error(`unmocked Tauri command: ${command}`));
   },
   transformCallback() {

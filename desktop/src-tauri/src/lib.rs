@@ -8,6 +8,7 @@ mod builderlab;
 mod channel_head_cache;
 mod commands;
 mod deep_link;
+mod desktop_log;
 mod egress_guard;
 mod event_sync;
 mod events;
@@ -255,6 +256,14 @@ pub fn run() {
         .manage(popout::PopoutRegistry::default())
         .setup(move |app| {
             let app_handle = app.handle().clone();
+            match app_handle.path().app_log_dir() {
+                Ok(dir) => {
+                    if let Err(error) = desktop_log::init(&dir) {
+                        eprintln!("buzz-desktop: {error}");
+                    }
+                }
+                Err(error) => eprintln!("buzz-desktop: no log directory: {error}"),
+            }
             #[cfg(target_os = "macos")]
             {
                 tray_menu::init(&app_handle)?;

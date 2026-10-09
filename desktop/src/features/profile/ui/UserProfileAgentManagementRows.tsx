@@ -283,7 +283,7 @@ function AgentDeleteConfirmDialog({
             {isProviderAgent
               ? "Unless the agent is known to be Offline, Buzz first requests shutdown through a channel when available. A failed request cancels deletion. The remote process may still be running even after a successful request."
               : isHostAgent
-                ? "Asks the machine to stop and remove the agent, and waits for it to confirm"
+                ? "Asks the machine to stop and remove the agent, and waits up to 60 s for it to confirm. If it does not, you can still delete the agent here"
                 : "Stops any local agent process before deleting the record"}
           </li>
         </ul>

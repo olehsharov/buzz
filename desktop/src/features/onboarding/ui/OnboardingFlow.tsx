@@ -37,6 +37,8 @@ import type {
   OnboardingProfileValues,
   ProfileStepState,
 } from "./types";
+import { ABANDON_PREVIOUS_IDENTITY } from "./abandonIdentityConfirm";
+import { useConfirmDialog } from "@/shared/ui/useConfirmDialog";
 
 function isRelayMembershipDeniedError(error: unknown): boolean {
   if (!(error instanceof Error)) {
@@ -177,6 +179,7 @@ export function OnboardingFlow({
     React.useState<OnboardingProfileValues>(savedProfile);
   const [deniedPubkey, setDeniedPubkey] = React.useState<string>("");
   const [persistError, setPersistError] = React.useState<string | null>(null);
+  const { confirm, confirmDialog } = useConfirmDialog();
   const [isUploadingAvatar, setIsUploadingAvatar] = React.useState(false);
   const [isProfileAdvancePending, setIsProfileAdvancePending] =
     React.useState(false);
@@ -416,9 +419,7 @@ export function OnboardingFlow({
   // machinery (bootedLost + !identityLost) replace this flow with
   // RelaunchRequiredScreen. No navigation needed here.
   const handleLostModeBack = React.useCallback(async () => {
-    const confirmed = window.confirm(
-      "This will create a new identity and abandon your previous key. This cannot be undone. Continue?",
-    );
+    const confirmed = await confirm(ABANDON_PREVIOUS_IDENTITY);
     if (!confirmed) {
       return;
     }
@@ -432,7 +433,7 @@ export function OnboardingFlow({
           : "Failed to create a new identity. Please try again.",
       );
     }
-  }, [queryClient]);
+  }, [confirm, queryClient]);
 
   const handleKeyImportBack = React.useCallback(() => {
     if (keyImportStage === "backup-password") {
@@ -632,6 +633,7 @@ export function OnboardingFlow({
           )}
         </div>
       </OnboardingCard>
+      {confirmDialog}
       {isCommunityChangeOpen ? (
         <CommunityChangeOverlay
           onClose={() => setIsCommunityChangeOpen(false)}

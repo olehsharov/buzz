@@ -138,25 +138,43 @@ fn collect_cascade_pubkeys(agents: &[ManagedAgentRecord], persona_id: &str) -> V
         .collect()
 }
 
-/// Names of cascade agents that are provider-deployed: non-local backend with
-/// a live `backend_agent_id`.
+/// Why `delete_persona` refuses: names the template and, for each cascade
+/// agent still deployed elsewhere (non-local backend with a live
+/// `backend_agent_id`), where it runs. `machine_name` resolves a paired
+/// machine's name (`None`: no longer approved here).
 ///
-/// Pure helper used by `delete_persona`'s pre-flight: the cascade is refused
-/// while any exist, because deleting the local record would orphan the remote
-/// deployment. Mirrors `delete_managed_agent`'s `force_remote_delete` guard.
-fn collect_remote_deployed(
+/// The cascade is refused while any exist, because deleting the local
+/// record would orphan the remote deployment. Mirrors
+/// `delete_managed_agent`'s `force_remote_delete` guard; the UI removes
+/// those agents first (with the machine's acknowledgement) and retries.
+fn remote_agents_block_message(
+    template_name: &str,
     agents: &[ManagedAgentRecord],
     cascade: &std::collections::HashSet<String>,
-) -> Vec<String> {
-    agents
+    machine_name: impl Fn(&ManagedAgentRecord, &str) -> Option<String>,
+) -> Option<String> {
+    use crate::managed_agents::BackendKind;
+    let blockers: Vec<String> = agents
         .iter()
-        .filter(|a| {
-            cascade.contains(&a.pubkey)
-                && a.backend != crate::managed_agents::BackendKind::Local
-                && a.backend_agent_id.is_some()
+        .filter(|agent| cascade.contains(&agent.pubkey) && agent.backend_agent_id.is_some())
+        .filter_map(|agent| match &agent.backend {
+            BackendKind::Local => None,
+            BackendKind::Host { host_pubkey, .. } => Some(format!(
+                "{} is running on {}",
+                agent.name,
+                machine_name(agent, host_pubkey).unwrap_or_else(|| "a paired machine".into())
+            )),
+            BackendKind::Provider { id, .. } => {
+                Some(format!("{} is deployed through {id}", agent.name))
+            }
         })
-        .map(|a| a.name.clone())
-        .collect()
+        .collect();
+    (!blockers.is_empty()).then(|| {
+        format!(
+            "Can't delete the template \u{201c}{template_name}\u{201d} while its agents run elsewhere: {}. Delete those agents first.",
+            blockers.join("; ")
+        )
+    })
 }
 
 /// Remove cascade agents from `agents` and persist via the injectable `save`.
@@ -175,13 +193,91 @@ fn commit_cascade_agents(
     save(agents)
 }
 
+/// Every refusal `delete_persona` can make, checked before anything is
+/// changed (including channel memberships). Returns the agents the cascade
+/// will delete. The same checks run again under the store lock.
+fn persona_delete_preflight(
+    app: &AppHandle,
+    state: &AppState,
+    id: &str,
+    community_relay: &str,
+) -> Result<Vec<ManagedAgentRecord>, String> {
+    let _store_guard = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let personas = load_personas(app)?;
+    let persona = personas
+        .iter()
+        .find(|record| record.id == id)
+        .ok_or_else(|| format!("persona {id} not found"))?;
+    let referenced_by_team = load_teams(app)?
+        .iter()
+        .any(|team| team.persona_ids.iter().any(|persona_id| persona_id == id));
+    validate_persona_deletion(persona, referenced_by_team)?;
+    let agents = load_managed_agents(app)?;
+    let cascade: std::collections::HashSet<String> =
+        collect_cascade_pubkeys(&agents, id).into_iter().collect();
+    // Machine names only make the refusal clearer; an unreadable machine
+    // list must not turn it into a different error.
+    let hosts = match crate::managed_agents::managed_agents_base_dir(app)
+        .and_then(|dir| crate::agent_hosts::store::load_hosts(&dir))
+    {
+        Ok(hosts) => hosts,
+        Err(error) => {
+            tracing::warn!("reading approved machines failed: {error}");
+            Vec::new()
+        }
+    };
+    if let Some(message) = remote_agents_block_message(
+        &persona.display_name,
+        &agents,
+        &cascade,
+        |agent, host_pubkey| {
+            crate::agent_hosts::placement::host_placement(
+                agent,
+                host_pubkey,
+                &hosts,
+                community_relay,
+            )
+            .host_name
+        },
+    ) {
+        return Err(message);
+    }
+    Ok(agents
+        .into_iter()
+        .filter(|agent| cascade.contains(&agent.pubkey))
+        .collect())
+}
+
+/// What a completed persona delete did beyond removing the records.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct DeletePersonaOutcome {
+    /// Channels the deleted agents were removed from, and any they remain in.
+    pub channels: crate::managed_agents::channel_cleanup::ChannelCleanupReport,
+}
+
 #[tauri::command]
 pub async fn delete_persona(
     id: String,
     app: AppHandle,
     relay: crate::window_relay::WindowRelay,
-) -> Result<(), String> {
+) -> Result<DeletePersonaOutcome, String> {
     use tauri::Manager;
+    let cascade = persona_delete_preflight(&app, &app.state::<AppState>(), &id, relay.ws_url())?;
+    // Each deleted agent leaves its channels while its key still exists.
+    let mut channels = crate::managed_agents::channel_cleanup::ChannelCleanupReport::default();
+    for agent in &cascade {
+        channels.merge(
+            super::agents::remove_agent_from_its_channels(
+                &app.state::<AppState>(),
+                agent,
+                relay.ws_url(),
+            )
+            .await,
+        );
+    }
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
 
@@ -244,12 +340,13 @@ pub async fn delete_persona(
             // work while any target is provider-deployed. Nothing in
             // create_managed_agent forbids a persona-linked provider agent, so
             // this must be a runtime guard, not an assumed invariant.
-            let remote_deployed = collect_remote_deployed(&agents, &cascade);
-            if !remote_deployed.is_empty() {
-                return Err(format!(
-                    "persona {id} has provider-deployed agent instances ({}); delete those agent instances first",
-                    remote_deployed.join(", ")
-                ));
+            // (The preflight above names machines; this re-check under the
+            // lock only catches a deploy that raced it.)
+            let template_name = persona.display_name.clone();
+            if let Some(message) =
+                remote_agents_block_message(&template_name, &agents, &cascade, |_, _| None)
+            {
+                return Err(message);
             }
 
             // ── Phase 2: Stop ───────────────────────────────────────────────
@@ -317,7 +414,7 @@ pub async fn delete_persona(
 
         try_regenerate_nest(&app);
 
-        Ok(())
+        Ok(DeletePersonaOutcome { channels })
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
