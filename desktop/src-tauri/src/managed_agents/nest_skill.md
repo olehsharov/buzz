@@ -32,6 +32,8 @@ buzz agents draft-create \
 
 Use the UUID from the current Buzz `[Context]`; do not ask the user for it. Do not ask about runtime, provider, model, credentials, environment variables, or access. Desktop uses the machine's real defaults, and new agents start as **Only me**. The command sends an encrypted draft to the owner's Desktop. It does not create the agent until the owner reviews and saves the form, so report the result as “ready for review,” never “created.”
 
+Only when the user asks for the agent to run on one of their paired machines, add `--run-on host:<machine name or pubkey> --workdir <folder on that machine>` (for a compute provider: `--run-on <provider-id> --workdir <folder>`). The owner's Desktop matches the machine name against their approved machines; if it is unknown or ambiguous, the draft still opens and the owner picks Run on. To continue a Claude Code session there, also pass `--runtime claude --env BUZZ_ACP_RESUME_SESSION=<session uuid>` and set `--workdir` to the folder the session ran in. Relay any `{"warning": ...}` line the command prints to stderr.
+
 For an explicit change to an existing personal agent, use:
 
 ```bash

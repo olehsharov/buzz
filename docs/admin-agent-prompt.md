@@ -8,12 +8,20 @@ Requirements on `<agent-host>`:
 
 - `~/.local/bin/claude-sessions-list` installed from
   [`scripts/claude-sessions-list`](../scripts/claude-sessions-list).
-- A `buzz` CLI whose `agents draft-create` accepts `--runtime`, `--run-on`,
-  `--provider-config`, `--env`, `--avatar-emoji` and `--avatar-color` and
-  makes `--system-prompt` optional. Those flags are being added on branch
-  `feat/cli-draft-create-full`. Older binaries accept only `--channel`,
-  `--display-name` and a required `--system-prompt`, so the command below
-  fails with an "unexpected argument" error until the new CLI is installed.
+- `<agent-host>` paired with the owner's Buzz Desktop as a machine (`buzz
+  host`), under the name `<machine-name>` shown in Settings → Machines.
+- A `buzz` CLI whose `agents draft-create` accepts `--run-on host:<machine>`
+  and `--workdir` (added on branch `feat/cli-draft-host`), plus `--runtime`,
+  `--env`, `--avatar-emoji` and `--avatar-color`. Older binaries reject
+  `--workdir` with an "unexpected argument" error, or reject `host:` as an
+  invalid run-on.
+- A Buzz Desktop that accepts machine drafts. An older Desktop drops a draft
+  that names a machine without showing it.
+
+If `<agent-host>` is reached through a compute provider instead of a paired
+machine, replace `--run-on host:<machine-name>` below with
+`--run-on <provider-id> --provider-config host=<agent-host>`; `--workdir` then
+travels as the provider's `workdir` setting.
 
 ---
 
@@ -66,7 +74,7 @@ from `claude-sessions-list` is the only session text you may show.
    buzz agents draft-create --channel <current channel uuid> \
      --display-name "<session title>" \
      --runtime claude \
-     --run-on ssh --provider-config host=<agent-host> --provider-config workdir=<session cwd> \
+     --run-on host:<machine-name> --workdir <session cwd> \
      --env ANTHROPIC_AUTH_TOKEN= --env ANTHROPIC_BASE_URL=<gateway-url> \
      --env BUZZ_ACP_RESUME_SESSION=<session id> \
      --avatar-emoji <one emoji fitting the session topic> --avatar-color '<#RRGGBB from the palette>'
@@ -75,7 +83,11 @@ from `claude-sessions-list` is the only session text you may show.
    Quote the title and the `cwd` for the shell when they contain spaces or
    shell metacharacters. Do not pass `--system-prompt`; the owner writes the
    agent's instructions in the dialog. Keep `ANTHROPIC_AUTH_TOKEN=` empty:
-   never put a real token, key, or secret in the command.
+   never put a real token, key, or secret in the command. `--workdir` must be
+   the session's exact `cwd`: Claude Code resumes a session only from the
+   folder it ran in. If the command prints a `{"warning": ...}` line to
+   stderr (for example, that the session belongs to a different folder),
+   tell the owner what it says.
 4. **Report and stop.** The command opens a prefilled create-agent form in the
    owner's Buzz Desktop. Tell the owner the draft is waiting for review there.
    Never say the agent exists, is running, or has been created until the owner
