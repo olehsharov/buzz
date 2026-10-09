@@ -30,6 +30,18 @@ pub trait HostChannel: Send + Sync {
     ) -> BoxFuture<'a, Result<HostTelemetry, String>>;
 }
 
+impl<T: HostChannel + ?Sized> HostChannel for &T {
+    fn exchange<'a>(
+        &'a self,
+        frame: Event,
+        host: PublicKey,
+        request_id: String,
+        timeout: Duration,
+    ) -> BoxFuture<'a, Result<HostTelemetry, String>> {
+        (**self).exchange(frame, host, request_id, timeout)
+    }
+}
+
 /// Short-lived relay WebSocket per exchange, authenticated as the owner.
 pub struct RelayHostChannel {
     pub relay_url: String,

@@ -167,6 +167,7 @@ impl Fixture {
         let owner = state.signing_keys().unwrap();
         let app = tauri::test::mock_builder()
             .manage(state)
+            .manage(HostOps::default())
             .build(context)
             .unwrap();
         let agent_keys = Keys::generate();
@@ -609,3 +610,6 @@ async fn nsec_never_leaves_in_plaintext_or_lands_in_errors() {
 
 #[path = "ops_workdir_tests.rs"]
 mod workdir;
+
+#[path = "ops_route_tests.rs"]
+mod route;

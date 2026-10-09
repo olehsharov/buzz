@@ -452,7 +452,61 @@ pub async fn deploy_agent_to_host<R: Runtime>(
     }
 }
 
+/// The machine an agent is deployed on, and the relay that reaches it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostRoute {
+    pub host_pubkey: String,
+    pub host_name: String,
+    /// The relay the machine was approved on: the one it listens to.
+    pub relay_url: String,
+}
+
+/// Where to send control frames for the machine `record` is deployed on.
+///
+/// The machine only listens on the relay it was approved on, so the frame
+/// must go there, not to whichever community the invoking window shows. A
+/// machine approved in several communities is reached through the agent's
+/// own community when possible. `Ok(None)`: the agent is not deployed on a
+/// machine.
+pub fn deployed_host_route<R: Runtime>(
+    app: &AppHandle<R>,
+    ops: &HostOps,
+    record: &ManagedAgentRecord,
+    community_relay: &str,
+) -> Result<Option<HostRoute>, String> {
+    let Some(host) = deployed_host(record) else {
+        return Ok(None);
+    };
+    let _guard = ops.store_lock.lock().map_err(|e| e.to_string())?;
+    let hosts = store::load_hosts(&hosts_dir(app)?)?;
+    let agent_scope = store::scope_key(&crate::relay::effective_agent_relay_url(
+        &record.relay_url,
+        community_relay,
+    ));
+    let approvals: Vec<&AgentHostRecord> = hosts
+        .iter()
+        .filter(|candidate| candidate.pubkey.eq_ignore_ascii_case(host))
+        .collect();
+    let approval = approvals
+        .iter()
+        .find(|candidate| store::scope_key(&candidate.relay_url) == agent_scope)
+        .or_else(|| approvals.first())
+        .ok_or_else(|| {
+            "The machine this agent was deployed on is no longer approved on this computer, \
+             so it cannot be asked to remove the agent."
+                .to_string()
+        })?;
+    Ok(Some(HostRoute {
+        host_pubkey: approval.pubkey.clone(),
+        host_name: approval.name.clone(),
+        relay_url: approval.relay_url.clone(),
+    }))
+}
+
 /// Remove `agent` from the host it is deployed on, requiring the ack.
+///
+/// A failure is recorded on the agent (`last_error`) so it stays visible
+/// after the dialog that reported it is gone.
 pub async fn undeploy_agent_from_host<R: Runtime>(
     app: &AppHandle<R>,
     state: &AppState,
@@ -470,7 +524,8 @@ pub async fn undeploy_agent_from_host<R: Runtime>(
     let host = parse_host(host)?;
     let owner_keys = state.signing_keys()?;
     let request_id = frames::new_request_id();
-    send_expecting_ack(
+    tracing::info!(agent = %agent, host = %host.to_hex(), request_id = %request_id, "sending host.undeploy");
+    let outcome = send_expecting_ack(
         channel,
         &owner_keys,
         &host,
@@ -478,12 +533,53 @@ pub async fn undeploy_agent_from_host<R: Runtime>(
         frames::undeploy_frame(&request_id, agent),
         ops.ack_timeout,
     )
-    .await?;
+    .await;
+    if let Err(error) = outcome {
+        tracing::warn!(agent = %agent, request_id = %request_id, "host.undeploy failed: {error}");
+        let message = format!("Removing the agent from its machine failed: {error}");
+        match persist_if_current(app, state, ops, agent, ticket, |record| {
+            record.last_error = Some(message.clone());
+        }) {
+            Ok(()) => {}
+            Err(persist) if persist == SUPERSEDED => {}
+            Err(persist) => {
+                tracing::warn!(agent = %agent, "could not record the undeploy failure: {persist}")
+            }
+        }
+        return Err(error);
+    }
     persist_if_current(app, state, ops, agent, ticket, |record| {
         record.backend_agent_id = None;
         record.last_stopped_at = Some(now_iso());
         record.last_error = None;
     })
+}
+
+/// [`undeploy_agent_from_host`] over the relay the agent's machine listens
+/// on (see [`deployed_host_route`]). `connect` opens the channel to it.
+/// Every failure, including an unreachable route, is recorded on the agent.
+pub async fn undeploy_agent_via_its_host<R: Runtime, C: HostChannel>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    ops: &HostOps,
+    community_relay: &str,
+    agent: &str,
+    connect: impl FnOnce(&HostRoute) -> Result<C, String>,
+) -> Result<(), String> {
+    let record = load_record(app, state, agent)?;
+    let route = match deployed_host_route(app, ops, &record, community_relay) {
+        Ok(Some(route)) => route,
+        Ok(None) => return Ok(()),
+        Err(error) => {
+            tracing::warn!(agent = %agent, "no route to the agent's machine: {error}");
+            record_error(app, state, agent, &error)?;
+            return Err(error);
+        }
+    };
+    let channel = connect(&route)?;
+    undeploy_agent_from_host(app, state, ops, &channel, agent)
+        .await
+        .map_err(|error| format!("{} did not confirm: {error}", route.host_name))
 }
 
 /// Ask the host for `host.status` and fold the reply into the store.
