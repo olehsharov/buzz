@@ -866,6 +866,7 @@ pub fn run() {
             get_host_install_info,
             list_agent_hosts,
             deploy_to_host,
+            set_host_agent_workdir,
             undeploy_from_host,
             request_host_status,
             forget_host,

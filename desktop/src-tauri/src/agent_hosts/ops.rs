@@ -191,11 +191,122 @@ fn local_process_running(state: &AppState, record: &ManagedAgentRecord) -> Resul
 /// The host an agent is currently deployed on, if any.
 pub fn deployed_host(record: &ManagedAgentRecord) -> Option<&str> {
     match &record.backend {
-        BackendKind::Host { host_pubkey } if record.backend_agent_id.is_some() => {
+        BackendKind::Host { host_pubkey, .. } if record.backend_agent_id.is_some() => {
             Some(host_pubkey.as_str())
         }
         _ => None,
     }
+}
+
+/// The folder saved for an agent on a machine (`None`: the machine default).
+pub fn host_workdir(record: &ManagedAgentRecord) -> Option<&str> {
+    match &record.backend {
+        BackendKind::Host { workdir, .. } => workdir.as_deref(),
+        _ => None,
+    }
+}
+
+/// Change the folder an agent on a machine runs in.
+///
+/// One write saves the new folder and, for a deployed agent, marks it
+/// `provider_policy_pending`; then the agent is redeployed to its machine so
+/// it restarts there. A redeploy that fails keeps the saved folder and the
+/// pending mark (workspace apply retries it) and records the error on the
+/// agent. An agent that is not deployed picks the folder up on its next
+/// deploy. Saving the folder it already has does nothing.
+#[allow(clippy::too_many_arguments)]
+pub async fn set_host_agent_workdir<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    ops: &HostOps,
+    channel: &dyn HostChannel,
+    agent: &str,
+    workdir: Option<&str>,
+    community_relay: &str,
+    build_payload: impl FnOnce(&ManagedAgentRecord) -> Result<serde_json::Value, String>,
+) -> Result<(), String> {
+    let workdir = frames::normalize_host_workdir(workdir)?;
+    let redeploy_to = {
+        let _guard = state
+            .managed_agents_store_lock
+            .lock()
+            .map_err(|e| e.to_string())?;
+        let mut records = load_managed_agents(app)?;
+        let record = records
+            .iter_mut()
+            .find(|record| record.pubkey == agent)
+            .ok_or_else(|| format!("agent {agent} not found"))?;
+        crate::relay::ensure_agent_belongs_to_relay(
+            &record.name,
+            &record.relay_url,
+            community_relay,
+            community_relay,
+        )?;
+        let deployed = record.backend_agent_id.is_some();
+        let BackendKind::Host {
+            host_pubkey,
+            workdir: saved,
+        } = &mut record.backend
+        else {
+            return Err("Only an agent on a machine has a folder on that machine.".into());
+        };
+        if *saved == workdir {
+            return Ok(());
+        }
+        *saved = workdir;
+        let host_pubkey = host_pubkey.clone();
+        if deployed {
+            record.provider_policy_pending = true;
+        }
+        record.updated_at = now_iso();
+        save_managed_agents(app, &records)?;
+        deployed.then_some(host_pubkey)
+    };
+    let Some(host_pubkey) = redeploy_to else {
+        return Ok(());
+    };
+    let Err(error) = deploy_agent_to_host(
+        app,
+        state,
+        ops,
+        channel,
+        agent,
+        &host_pubkey,
+        community_relay,
+        build_payload,
+    )
+    .await
+    else {
+        return Ok(());
+    };
+    // A failure before the frame went out (payload, unapproved machine) is
+    // not recorded by the deploy; record every failure so the agent row
+    // shows it. A superseded operation has nothing to report.
+    if error != SUPERSEDED {
+        record_error(app, state, agent, &error)?;
+    }
+    Err(format!(
+        "The folder was saved, but restarting the agent in it failed: {error} Buzz retries the next time this community loads."
+    ))
+}
+
+fn record_error<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    agent: &str,
+    error: &str,
+) -> Result<(), String> {
+    let _guard = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|e| e.to_string())?;
+    let mut records = load_managed_agents(app)?;
+    let Some(record) = records.iter_mut().find(|record| record.pubkey == agent) else {
+        return Ok(());
+    };
+    record.last_error = Some(error.to_string());
+    record.updated_at = now_iso();
+    save_managed_agents(app, &records)
 }
 
 /// Deploy (or redeploy, or move) `agent` onto `host_pubkey`.
@@ -276,8 +387,17 @@ pub async fn deploy_agent_to_host<R: Runtime>(
                 .map_err(|error| format!("failed to compute NIP-OA auth tag: {error}"))?
         }
     };
+    // The saved folder travels with the agent, including on a move between
+    // machines; an agent arriving from this computer uses the default.
+    let delivered_workdir = host_workdir(&record).map(str::to_string);
     let request_id = frames::new_request_id();
-    let frame = frames::deploy_frame(&request_id, agent, &auth_tag, &payload)?;
+    let frame = frames::deploy_frame(
+        &request_id,
+        agent,
+        &auth_tag,
+        delivered_workdir.as_deref(),
+        &payload,
+    )?;
     // Only the access policy outlives the payload (it carries the agent nsec):
     // the ack acknowledges a pending policy only if it is still the saved one.
     let delivered_policy = serde_json::json!({
@@ -297,19 +417,27 @@ pub async fn deploy_agent_to_host<R: Runtime>(
 
     match outcome {
         Ok(()) => persist_if_current(app, state, ops, agent, ticket, |record| {
+            // Keep the folder saved NOW: one changed while this frame was in
+            // flight stays pending below and is delivered by its own redeploy.
+            let saved_workdir = host_workdir(record).map(str::to_string);
+            let folder_delivered = saved_workdir == delivered_workdir;
             record.backend = BackendKind::Host {
                 host_pubkey: host_hex.clone(),
+                workdir: saved_workdir,
             };
             record.backend_agent_id = Some(host_hex.clone());
             record.start_on_app_launch = false;
             record.last_started_at = Some(now_iso());
             record.last_error = None;
-            // The machine restarted the agent with this payload's policy. A
-            // newer policy saved while the frame was in flight stays pending.
-            if crate::managed_agents::access_policy::deployed_policy_matches_record(
-                record,
-                &delivered_policy,
-            ) {
+            // The machine restarted the agent with this payload's policy and
+            // folder. A newer policy or folder saved while the frame was in
+            // flight stays pending.
+            if folder_delivered
+                && crate::managed_agents::access_policy::deployed_policy_matches_record(
+                    record,
+                    &delivered_policy,
+                )
+            {
                 record.provider_policy_pending = false;
             }
         }),
@@ -456,7 +584,7 @@ pub async fn forget_host<R: Runtime>(
         load_managed_agents(app)?
             .into_iter()
             .filter(|record| {
-                matches!(&record.backend, BackendKind::Host { host_pubkey } if host_pubkey.eq_ignore_ascii_case(&host_hex))
+                matches!(&record.backend, BackendKind::Host { host_pubkey, .. } if host_pubkey.eq_ignore_ascii_case(&host_hex))
             })
             .map(|record| record.pubkey)
             .collect()

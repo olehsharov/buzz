@@ -337,3 +337,31 @@ test("item-13: no runtimes available — refuses with actionable error", () => {
     "empty runtime list must throw, not silently return null",
   );
 });
+
+test("host intent carries the machine folder only when one was given", async () => {
+  const host = "ab".repeat(32);
+  const withFolder = await buildInstanceInputForDefinition(
+    persona(),
+    gooseRuntime,
+    undefined,
+    { type: "host", hostPubkey: host, workdir: "~/code/app" },
+  );
+  assert.deepEqual(withFolder.backend, {
+    type: "host",
+    host_pubkey: host,
+    workdir: "~/code/app",
+  });
+  assert.equal(withFolder.startOnAppLaunch, false);
+  assert.equal(withFolder.spawnAfterCreate, true);
+
+  const machineDefault = await buildInstanceInputForDefinition(
+    persona(),
+    gooseRuntime,
+    undefined,
+    { type: "host", hostPubkey: host },
+  );
+  assert.deepEqual(machineDefault.backend, {
+    type: "host",
+    host_pubkey: host,
+  });
+});

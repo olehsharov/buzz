@@ -201,7 +201,16 @@ export async function handleMockHostCommand(
 
 /** Deploy bookkeeping shared by create, start and deploy_to_host mocks. */
 export function markMockAgentOnHost(agent: MockAgentLike, hostPubkey: string) {
-  agent.backend = { type: "host", host_pubkey: hostPubkey };
+  // The saved folder moves with the agent, like the real deploy.
+  const workdir =
+    agent.backend.type === "host" && typeof agent.backend.workdir === "string"
+      ? agent.backend.workdir
+      : undefined;
+  agent.backend = {
+    type: "host",
+    host_pubkey: hostPubkey,
+    ...(workdir ? { workdir } : {}),
+  };
   agent.backend_agent_id = hostPubkey;
   agent.status = "deployed";
 }

@@ -229,6 +229,7 @@ impl Fixture {
         let mut records = load_managed_agents(self.app.handle()).unwrap();
         records[0].backend = BackendKind::Host {
             host_pubkey: host.public_key().to_hex(),
+            workdir: None,
         };
         records[0].backend_agent_id = Some(host.public_key().to_hex());
         save_managed_agents(self.app.handle(), &records).unwrap();
@@ -483,6 +484,7 @@ async fn forgetting_the_host_mid_deploy_fences_out_the_late_ack() {
         let mut records = load_managed_agents(fx.app.handle()).unwrap();
         records[0].backend = BackendKind::Host {
             host_pubkey: fx.host_a.public_key().to_hex(),
+            workdir: None,
         };
         save_managed_agents(fx.app.handle(), &records).unwrap();
     }
@@ -604,3 +606,6 @@ async fn nsec_never_leaves_in_plaintext_or_lands_in_errors() {
     let debug = format!("{:?}", fake.types());
     assert!(!debug.contains(&fx.agent_nsec));
 }
+
+#[path = "ops_workdir_tests.rs"]
+mod workdir;

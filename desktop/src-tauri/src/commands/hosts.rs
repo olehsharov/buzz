@@ -119,6 +119,41 @@ pub async fn deploy_to_host(
     summary_for(&app, &state, &pubkey)
 }
 
+/// Change the folder an agent runs in on its machine (blank: the machine's
+/// default). A deployed agent is redeployed so it restarts in the new
+/// folder; when that fails the folder stays saved and the redeploy is
+/// retried the next time this community loads.
+#[tauri::command]
+pub async fn set_host_agent_workdir(
+    pubkey: String,
+    workdir: Option<String>,
+    app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
+    state: State<'_, AppState>,
+    hosts: State<'_, HostOps>,
+) -> Result<crate::managed_agents::ManagedAgentSummary, String> {
+    let channel = relay_channel(&state, &relay)?;
+    let relay = community_relay(&relay);
+    let result = ops::set_host_agent_workdir(
+        &app,
+        &state,
+        &hosts,
+        &channel,
+        &pubkey,
+        workdir.as_deref(),
+        &relay,
+        |record| super::agents::build_deploy_payload(&app, &state, record),
+    )
+    .await;
+    {
+        use tauri::Emitter;
+        // The row's folder, pending mark and error change either way.
+        let _ = app.emit("agents-data-changed", ());
+    }
+    result?;
+    summary_for(&app, &state, &pubkey)
+}
+
 /// Remove an agent from its machine (requires the machine's ack).
 #[tauri::command]
 pub async fn undeploy_from_host(

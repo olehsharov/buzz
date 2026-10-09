@@ -4,6 +4,7 @@ import * as React from "react";
 import { useBackendProvidersQuery } from "@/features/agents/hooks";
 import { AddMachineDialog } from "@/features/agents/hosts/AddMachineDialog";
 import { buildHostRunOnOptions } from "@/features/agents/hosts/hostRunOptions";
+import { HostWorkdirField } from "@/features/agents/hosts/HostWorkdirField";
 import { useAgentHostsWithPresence } from "@/features/agents/hosts/useAgentHosts";
 import { probeBackendProvider } from "@/shared/api/tauri";
 import { normalizePubkey } from "@/shared/lib/pubkey";
@@ -133,17 +134,27 @@ export function WhereToRunSection({
       />
 
       {selectedHost ? (
-        <p
-          className="rounded-2xl border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground"
-          data-testid="where-to-run-host-note"
-        >
-          Runs on{" "}
-          <span className="font-medium text-foreground">
-            {selectedHost.name}
-          </span>
-          . Buzz sends this agent&apos;s key to that machine, encrypted, when it
-          deploys, and waits for the machine to confirm.
-        </p>
+        <>
+          <p
+            className="rounded-2xl border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground"
+            data-testid="where-to-run-host-note"
+          >
+            Runs on{" "}
+            <span className="font-medium text-foreground">
+              {selectedHost.name}
+            </span>
+            . Buzz sends this agent&apos;s key to that machine, encrypted, when
+            it deploys, and waits for the machine to confirm.
+          </p>
+          <HostWorkdirField
+            disabled={isPending}
+            id="where-to-run-host-workdir"
+            machineName={selectedHost.name}
+            onChange={(hostWorkdir) => onDraftChange({ ...draft, hostWorkdir })}
+            testId="where-to-run-host-workdir"
+            value={draft.hostWorkdir ?? ""}
+          />
+        </>
       ) : null}
 
       {isProviderMode && selectedBackendProvider ? (

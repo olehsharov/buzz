@@ -90,7 +90,12 @@ export type BackendIntent =
     }
   /** An approved agent host. Same create shape as a provider: nothing local
    * is spawned, and the deploy waits for the machine's acknowledgement. */
-  | { type: "host"; hostPubkey: string };
+  | {
+      type: "host";
+      hostPubkey: string;
+      /** Folder on the machine; absent = the machine's default. */
+      workdir?: string;
+    };
 
 /**
  * The single definition→instance mapping (Phase 1B.3.5 rows 2–4). Every
@@ -135,7 +140,11 @@ export async function buildInstanceInputForDefinition(
       harnessOverride: false,
       spawnAfterCreate: true,
       startOnAppLaunch: false,
-      backend: { type: "host", host_pubkey: backendIntent.hostPubkey },
+      backend: {
+        type: "host",
+        host_pubkey: backendIntent.hostPubkey,
+        ...(backendIntent.workdir ? { workdir: backendIntent.workdir } : {}),
+      },
     };
   }
 

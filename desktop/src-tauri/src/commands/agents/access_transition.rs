@@ -82,7 +82,7 @@ pub(crate) fn plan_access_runtime_transition<T>(
             return AccessRuntimeTransition::None;
         }
         BackendKind::Provider { .. } => RemoteAccessRedeploy::Provider,
-        BackendKind::Host { host_pubkey } => RemoteAccessRedeploy::Host {
+        BackendKind::Host { host_pubkey, .. } => RemoteAccessRedeploy::Host {
             host_pubkey: host_pubkey.clone(),
             community_relay: agent_relay,
         },
@@ -155,7 +155,7 @@ pub(crate) fn pending_access_redeploys(
         .iter()
         .filter(|record| super::provider_access::needs_reconciliation_with_policy(record, false))
         .filter_map(|record| match &record.backend {
-            BackendKind::Host { host_pubkey }
+            BackendKind::Host { host_pubkey, .. }
                 if crate::relay::agent_belongs_to_relay(
                     &record.relay_url,
                     community_relay,

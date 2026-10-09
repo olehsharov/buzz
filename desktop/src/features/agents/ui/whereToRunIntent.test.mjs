@@ -173,3 +173,25 @@ test("probe resolution drops prefilled keys the schema does not declare", () => 
     config: { workdir: "/srv/agents", region: "us" },
   });
 });
+
+test("a machine folder rides the host intent, trimmed; blank means default", () => {
+  const host = "cd".repeat(32);
+  const draft = (hostWorkdir) => ({
+    ...emptyWhereToRunDraft,
+    runOn: `host:${host}`,
+    hostWorkdir,
+  });
+  assert.deepEqual(resolveBackendIntent(draft("  ~/code/app ")), {
+    type: "host",
+    hostPubkey: host,
+    workdir: "~/code/app",
+  });
+  for (const blank of [undefined, "", "   "]) {
+    assert.deepEqual(resolveBackendIntent(draft(blank)), {
+      type: "host",
+      hostPubkey: host,
+    });
+  }
+  // The folder needs no probe: a host draft is always submittable.
+  assert.equal(canSubmitWhereToRun(draft("~/x")), true);
+});

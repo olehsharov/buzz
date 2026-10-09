@@ -127,6 +127,22 @@ export async function deployToHost(
   return fromRawManagedAgent(raw);
 }
 
+/**
+ * Change the folder an agent runs in on its machine (blank: the machine's
+ * default). A deployed agent restarts there; on a failed restart the folder
+ * stays saved and the error says so.
+ */
+export async function setHostAgentWorkdir(
+  pubkey: string,
+  workdir: string | null,
+): Promise<ManagedAgent> {
+  const raw = await invokeTauri<RawManagedAgent>("set_host_agent_workdir", {
+    pubkey,
+    workdir,
+  });
+  return fromRawManagedAgent(raw);
+}
+
 export async function undeployFromHost(pubkey: string): Promise<ManagedAgent> {
   const raw = await invokeTauri<RawManagedAgent>("undeploy_from_host", {
     pubkey,

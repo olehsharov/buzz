@@ -216,27 +216,64 @@ fn deploy_frame_requires_key_relay_and_launch() {
     let full = serde_json::json!({
         "private_key_nsec": "nsec1x", "relay_url": "wss://r", "launch": {"command": "c"},
     });
-    let frame = deploy_frame("r", "a", "tag", &full).unwrap();
+    let frame = deploy_frame("r", "a", "tag", None, &full).unwrap();
     assert_eq!(frame["env"], serde_json::json!({}));
     assert!(frame["respond_to"].is_null());
     assert_eq!(frame["respond_to_allowlist"], serde_json::json!([]));
     let mut with_policy = full.clone();
     with_policy["respond_to"] = "allowlist".into();
     with_policy["respond_to_allowlist"] = serde_json::json!(["ab"]);
-    let frame = deploy_frame("r", "a", "tag", &with_policy).unwrap();
+    let frame = deploy_frame("r", "a", "tag", None, &with_policy).unwrap();
     assert_eq!(frame["respond_to"], "allowlist");
     assert_eq!(frame["respond_to_allowlist"], serde_json::json!(["ab"]));
     for missing in ["private_key_nsec", "relay_url", "launch"] {
         let mut payload = full.clone();
         payload.as_object_mut().unwrap().remove(missing);
         assert!(
-            deploy_frame("r", "a", "tag", &payload).is_err(),
+            deploy_frame("r", "a", "tag", None, &payload).is_err(),
             "{missing}"
         );
     }
     let mut empty_key = full;
     empty_key["private_key_nsec"] = "".into();
-    assert!(deploy_frame("r", "a", "tag", &empty_key).is_err());
+    assert!(deploy_frame("r", "a", "tag", None, &empty_key).is_err());
+}
+
+#[test]
+fn deploy_frame_carries_the_saved_folder_or_null() {
+    let full = serde_json::json!({
+        "private_key_nsec": "nsec1x", "relay_url": "wss://r", "launch": {"command": "c"},
+    });
+    let frame = deploy_frame("r", "a", "tag", Some("  ~/work/agent "), &full).unwrap();
+    assert_eq!(frame["workdir"], "~/work/agent");
+    for unset in [None, Some(""), Some("   ")] {
+        let frame = deploy_frame("r", "a", "tag", unset, &full).unwrap();
+        assert!(frame["workdir"].is_null(), "{unset:?}");
+    }
+}
+
+#[test]
+fn host_workdir_validation() {
+    assert_eq!(normalize_host_workdir(None), Ok(None));
+    assert_eq!(normalize_host_workdir(Some("  ")), Ok(None));
+    assert_eq!(
+        normalize_host_workdir(Some(" ~/code/app ")),
+        Ok(Some("~/code/app".into()))
+    );
+    assert_eq!(
+        normalize_host_workdir(Some("/srv/agents/one")),
+        Ok(Some("/srv/agents/one".into()))
+    );
+    assert_eq!(
+        normalize_host_workdir(Some("relative/dir")),
+        Ok(Some("relative/dir".into()))
+    );
+    let longest = "a".repeat(MAX_HOST_WORKDIR_CHARS);
+    assert_eq!(normalize_host_workdir(Some(&longest)), Ok(Some(longest)));
+    assert!(normalize_host_workdir(Some(&"a".repeat(MAX_HOST_WORKDIR_CHARS + 1))).is_err());
+    for bad in ["a\nb", "a\rb", "a\0b"] {
+        assert!(normalize_host_workdir(Some(bad)).is_err(), "{bad:?}");
+    }
 }
 
 #[test]

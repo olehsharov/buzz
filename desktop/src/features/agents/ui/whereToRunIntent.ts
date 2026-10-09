@@ -7,6 +7,8 @@ export type WhereToRunDraft = {
   runOn: "local" | string;
   providerConfig: Record<string, string>;
   probedProvider: BackendProviderProbeResult | null;
+  /** Folder on the selected machine; blank = the machine's default. */
+  hostWorkdir?: string;
 };
 
 export const emptyWhereToRunDraft: WhereToRunDraft = {
@@ -89,7 +91,12 @@ export function resolveBackendIntent(
 ): BackendIntent | null {
   if (draft.runOn === "local") return null;
   const hostPubkey = hostPubkeyFromRunOn(draft.runOn);
-  if (hostPubkey) return { type: "host", hostPubkey };
+  if (hostPubkey) {
+    const workdir = draft.hostWorkdir?.trim();
+    return workdir
+      ? { type: "host", hostPubkey, workdir }
+      : { type: "host", hostPubkey };
+  }
   return {
     type: "provider",
     id: draft.runOn,

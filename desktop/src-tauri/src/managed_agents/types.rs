@@ -12,7 +12,14 @@ pub enum BackendKind {
     },
     /// Runs on an approved agent host (`buzz host`), addressed by the host's
     /// pubkey. Deploy and undeploy go over NIP-44 observer control frames.
-    Host { host_pubkey: String },
+    Host {
+        host_pubkey: String,
+        /// Folder on the machine the agent runs in (`~` is the machine's
+        /// home). `None` lets the machine choose its default,
+        /// `~/buzz-agents/<agent_pubkey>`. Absent in records that predate it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workdir: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

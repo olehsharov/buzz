@@ -169,3 +169,16 @@ test("humanizeConfigKey handles snake_case, camelCase, and acronyms", () => {
   assert.equal(humanizeConfigKey("api_url"), "API URL");
   assert.equal(humanizeConfigKey(""), "");
 });
+
+test("host backend carries its saved folder, or null for the machine default", () => {
+  const host = "ef".repeat(32);
+  assert.deepEqual(
+    summarizeRunOn({ type: "host", host_pubkey: host, workdir: "/srv/agent" }),
+    { location: "host", hostPubkey: host, workdir: "/srv/agent" },
+  );
+  assert.deepEqual(summarizeRunOn({ type: "host", host_pubkey: host }), {
+    location: "host",
+    hostPubkey: host,
+    workdir: null,
+  });
+});

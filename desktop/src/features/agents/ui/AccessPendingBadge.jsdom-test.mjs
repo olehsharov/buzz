@@ -120,3 +120,35 @@ test("the agents row shows the pending badge only for a remote agent with a pend
     /agent\.providerPolicyPending && !isLocal \? \(\s*<AccessPendingBadge agent=\{agent\} \/>/,
   );
 });
+
+test("a machine agent's pending badge covers a folder change too", async () => {
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  const agent = fromRawManagedAgent({
+    ...rawAgent,
+    backend: { type: "host", host_pubkey: "ab".repeat(32) },
+  });
+  await act(async () => {
+    root.render(
+      React.createElement(
+        QueryClientProvider,
+        { client: new QueryClient() },
+        React.createElement(
+          TooltipProvider,
+          null,
+          React.createElement(AccessPendingBadge, { agent }),
+        ),
+      ),
+    );
+  });
+  const badge = container.querySelector('[data-testid="agent-access-pending"]');
+  assert.ok(badge?.textContent?.includes("Change pending"));
+  assert.ok(!badge?.textContent?.includes("Access change pending"));
+  assert.equal(
+    container.querySelector("button")?.getAttribute("aria-label"),
+    "Retry applying the change to Remote Scout",
+  );
+  await act(async () => root.unmount());
+  container.remove();
+});

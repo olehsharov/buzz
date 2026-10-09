@@ -9,6 +9,7 @@ import {
   ingestHostTelemetry,
   listAgentHosts,
   requestHostStatus,
+  setHostAgentWorkdir,
 } from "@/shared/api/agentHosts";
 import { relayClient } from "@/shared/api/relayClient";
 import { useIdentityQuery } from "@/shared/api/hooks";
@@ -79,6 +80,22 @@ export function useDeployToHostMutation() {
       pubkey: string;
       hostPubkey: string;
     }) => deployToHost(pubkey, hostPubkey),
+    onSettled: async () => {
+      await queryClient.invalidateQueries({ queryKey: ["managed-agents"] });
+    },
+  });
+}
+
+export function useSetHostAgentWorkdirMutation() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      pubkey,
+      workdir,
+    }: {
+      pubkey: string;
+      workdir: string | null;
+    }) => setHostAgentWorkdir(pubkey, workdir),
     onSettled: async () => {
       await queryClient.invalidateQueries({ queryKey: ["managed-agents"] });
     },

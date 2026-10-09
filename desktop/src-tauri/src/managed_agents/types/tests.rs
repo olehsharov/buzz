@@ -854,13 +854,25 @@ fn backend_kind_serde_is_stable_for_old_records_and_round_trips_host() {
     );
     let host = BackendKind::Host {
         host_pubkey: "ab".repeat(32),
+        workdir: None,
     };
     let wire = serde_json::to_value(&host).unwrap();
+    // No folder: the wire shape is unchanged from before folders existed.
     assert_eq!(
         wire,
         serde_json::json!({"type": "host", "host_pubkey": "ab".repeat(32)})
     );
     assert_eq!(serde_json::from_value::<BackendKind>(wire).unwrap(), host);
+    let with_folder = BackendKind::Host {
+        host_pubkey: "ab".repeat(32),
+        workdir: Some("~/work/agent".into()),
+    };
+    let wire = serde_json::to_value(&with_folder).unwrap();
+    assert_eq!(wire["workdir"], "~/work/agent");
+    assert_eq!(
+        serde_json::from_value::<BackendKind>(wire).unwrap(),
+        with_folder
+    );
     assert_eq!(
         serde_json::to_value(BackendKind::Local).unwrap(),
         serde_json::json!({"type": "local"})
@@ -886,7 +898,8 @@ fn backend_kind_serde_is_stable_for_old_records_and_round_trips_host() {
     assert_eq!(
         again.backend,
         BackendKind::Host {
-            host_pubkey: "cd".repeat(32)
+            host_pubkey: "cd".repeat(32),
+            workdir: None,
         }
     );
     assert_eq!(again.backend_agent_id, Some("cd".repeat(32)));

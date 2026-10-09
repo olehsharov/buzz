@@ -275,3 +275,95 @@ test("settings machines list and forget machine", async ({ page }) => {
     { hostPubkey: ALPHA },
   ]);
 });
+
+test("create on a machine sends the typed folder to the backend", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    agentHosts: HOSTS,
+    globalAgentConfig: {
+      provider: "anthropic",
+      model: "claude-opus-4-5",
+      env_vars: { ANTHROPIC_API_KEY: "sk-ant-test" },
+    },
+  });
+  const { dialog, trigger } = await openRunOnMenu(page);
+  const alpha = page
+    .getByRole("menu")
+    .getByRole("menuitemradio", { name: /alpha-box/ });
+  await alpha.focus();
+  await alpha.press("Enter");
+  await expect(trigger).toContainText("alpha-box");
+
+  const folder = dialog.getByTestId("where-to-run-host-workdir");
+  await expect(folder).toHaveAttribute(
+    "placeholder",
+    "~/buzz-agents/<agent> (default)",
+  );
+  // One label owner: the field is named by its own label.
+  await expect(dialog.getByLabel("Folder on alpha-box")).toHaveCount(1);
+  await folder.fill("  ~/code/project ");
+  await waitForAnimations(page);
+  await dialog.screenshot({ path: `${SHOTS}/06-create-host-folder.png` });
+
+  await dialog.locator("#persona-display-name").fill("Folder Agent");
+  const submit = page.getByTestId("persona-dialog-submit");
+  await expect(submit).toBeEnabled({ timeout: 10_000 });
+  await submit.click();
+  await expect
+    .poll(
+      async () => (await commandPayloads(page, "create_managed_agent")).length,
+    )
+    .toBe(1);
+  const [created] = await commandPayloads(page, "create_managed_agent");
+  expect((created as { input: { backend: unknown } }).input.backend).toEqual({
+    type: "host",
+    host_pubkey: ALPHA,
+    workdir: "~/code/project",
+  });
+});
+
+test("edit dialog shows a machine agent's folder and saves a new one", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    agentHosts: HOSTS,
+    managedAgents: [
+      {
+        pubkey: "e5".repeat(32),
+        name: "Folder Keeper",
+        status: "deployed",
+        backend: { type: "host", host_pubkey: ALPHA },
+      },
+    ],
+  });
+  await page.goto("/");
+  await page.getByTestId("open-agents-view").click();
+  await page
+    .getByRole("button", { name: "Folder Keeper agent profile" })
+    .click();
+  await page.getByTestId("user-profile-edit-agent").click();
+  const runOn = page.getByTestId("edit-agent-run-on");
+  await expect(runOn).toBeVisible({ timeout: 10_000 });
+  await expect(runOn.getByTestId("edit-agent-run-on-workdir")).toHaveText(
+    "Folder: default (~/buzz-agents/…)",
+  );
+  const save = runOn.getByTestId("edit-agent-host-workdir-submit");
+  await expect(save).toBeDisabled();
+
+  // Keyboard: Enter in the field saves.
+  const field = runOn.getByTestId("edit-agent-host-workdir");
+  await field.fill("/srv/agents/keeper");
+  await expect(save).toBeEnabled();
+  await field.press("Enter");
+
+  await expect(runOn.getByTestId("edit-agent-run-on-workdir")).toHaveText(
+    "Folder: /srv/agents/keeper",
+  );
+  expect(await commandPayloads(page, "set_host_agent_workdir")).toEqual([
+    { pubkey: "e5".repeat(32), workdir: "/srv/agents/keeper" },
+  ]);
+  await expect(save).toBeDisabled();
+  await waitForAnimations(page);
+  await runOn.screenshot({ path: `${SHOTS}/07-edit-host-folder.png` });
+});

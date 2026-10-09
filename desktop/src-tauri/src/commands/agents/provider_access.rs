@@ -324,6 +324,7 @@ mod tests {
         let mut host = record(
             BackendKind::Host {
                 host_pubkey: "ab".repeat(32),
+                workdir: None,
             },
             Some(&"ab".repeat(32)),
         );
@@ -335,6 +336,7 @@ mod tests {
     fn pending_host_agents_need_reconciliation_only_while_deployed() {
         let host = BackendKind::Host {
             host_pubkey: "ab".repeat(32),
+            workdir: None,
         };
         let mut pending = record(host.clone(), Some(&"ab".repeat(32)));
         pending.provider_policy_pending = true;

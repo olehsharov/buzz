@@ -478,7 +478,7 @@ pub async fn create_managed_agent(
     }
 
     // ── Phase 1: generate keys (sync lock) ────────────────────────────────────
-    let (agent_keys, private_key_nsec, pubkey, resolved_relay_url, input) = {
+    let (agent_keys, private_key_nsec, pubkey, resolved_relay_url, mut input) = {
         let _store_guard = state
             .managed_agents_store_lock
             .lock()
@@ -522,7 +522,14 @@ pub async fn create_managed_agent(
         // Validate via discovered candidates — not raw resolve_command.
         resolve_provider_binary(id)?;
     }
-    if let BackendKind::Host { ref host_pubkey } = input.backend {
+    if let BackendKind::Host {
+        ref host_pubkey,
+        ref mut workdir,
+    } = input.backend
+    {
+        // The folder is a path on the machine: shape-checked here, never
+        // checked against this computer's filesystem.
+        *workdir = crate::agent_hosts::frames::normalize_host_workdir(workdir.as_deref())?;
         // Only a machine approved in the active community can be targeted.
         use tauri::Manager;
         crate::agent_hosts::ops::approved_host(
@@ -900,7 +907,10 @@ pub async fn create_managed_agent(
                 Ok(()) => spawn_error,
                 Err(e) => Some(e),
             }
-        } else if let BackendKind::Host { ref host_pubkey } = input.backend {
+        } else if let BackendKind::Host {
+            ref host_pubkey, ..
+        } = input.backend
+        {
             match deploy_host_agent(&app, &state, &resolved_relay_url, &pubkey, host_pubkey).await {
                 Ok(()) => spawn_error,
                 Err(e) => Some(e),
@@ -1037,7 +1047,7 @@ pub async fn start_managed_agent(
 
         let target = if record.backend == BackendKind::Local {
             StartTarget::Local
-        } else if let BackendKind::Host { host_pubkey } = &record.backend {
+        } else if let BackendKind::Host { host_pubkey, .. } = &record.backend {
             StartTarget::Host {
                 host_pubkey: host_pubkey.clone(),
             }

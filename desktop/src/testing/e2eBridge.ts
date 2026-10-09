@@ -12228,6 +12228,25 @@ export function maybeInstallE2eTauriMocks() {
         syncMockRelayAgentsFromManagedAgents();
         return cloneManagedAgent(agent);
       }
+      case "set_host_agent_workdir": {
+        const { pubkey, workdir } = payload as {
+          pubkey: string;
+          workdir: string | null;
+        };
+        const agent = getMockManagedAgent(pubkey);
+        if (agent.backend.type !== "host") {
+          throw new Error(
+            "Only an agent on a machine has a folder on that machine.",
+          );
+        }
+        const folder = workdir?.trim();
+        agent.backend = {
+          type: "host",
+          host_pubkey: agent.backend.host_pubkey,
+          ...(folder ? { workdir: folder } : {}),
+        };
+        return cloneManagedAgent(agent);
+      }
       case "undeploy_from_host": {
         const agent = getMockManagedAgent(
           (payload as { pubkey: string }).pubkey,

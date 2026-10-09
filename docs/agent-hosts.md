@@ -215,6 +215,18 @@ relay's presence TTL is 180 s.
   - `buzz-acp` or the agent command is missing.
 
   None of these error messages contains a secret.
+- **Folder.** `workdir` is the folder the agent runs in on the machine. The
+  desktop sends the folder saved on the agent ("Folder on <machine>" when
+  creating it, or **Save folder** in its edit dialog), or `null` when none is
+  set. The host expands `~` to its own home, resolves a relative path against
+  that home, creates the folder if it is missing, and starts the agent there;
+  `null` means `~/buzz-agents/<agent_pubkey>`. The desktop only checks the
+  path's shape (at most 300 characters, no line breaks or NUL), never whether
+  it exists on the desktop's own computer. Changing the folder of a deployed
+  agent saves it and redeploys the agent to the same machine; a failed
+  redeploy keeps the new folder saved and pending, and the desktop retries it
+  the next time the community loads. Moving an agent to another machine keeps
+  its folder.
 - **Idempotency.** A deploy for an agent that is already on the host rewrites its
   config and restarts it, giving one instance and one config file. A failed
   *first* deploy leaves no config behind.

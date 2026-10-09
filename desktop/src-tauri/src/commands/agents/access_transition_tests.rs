@@ -29,6 +29,7 @@ fn provider() -> BackendKind {
 fn host() -> BackendKind {
     BackendKind::Host {
         host_pubkey: "ab".repeat(32),
+        workdir: None,
     }
 }
 

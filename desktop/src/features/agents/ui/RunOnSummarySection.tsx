@@ -18,19 +18,23 @@ import { summarizeRunOn } from "./runOnSummary";
  * this dialog already uses "Provider" for the ACP harness selector.
  *
  * Exception: an agent on an approved machine can move to another machine
- * (`HostRunOnSection`), because the machine acknowledges undeploy.
+ * and change its folder there (`HostRunOnSection`), because the machine
+ * acknowledges undeploy and redeploy.
  */
 export function RunOnSummarySection({
   agent,
 }: {
-  agent: Pick<ManagedAgent, "pubkey" | "backend">;
+  agent: Pick<ManagedAgent, "pubkey" | "backend"> &
+    Partial<Pick<ManagedAgent, "envVars">>;
 }) {
   const summary = summarizeRunOn(agent.backend);
   if (summary.location === "host") {
     return (
       <HostRunOnSection
         agentPubkey={agent.pubkey}
+        envVars={agent.envVars}
         hostPubkey={summary.hostPubkey}
+        workdir={summary.workdir}
       />
     );
   }

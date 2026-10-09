@@ -294,7 +294,13 @@ export type ManagedAgentBackend =
   | { type: "local" }
   | { type: "provider"; id: string; config: Record<string, unknown> }
   /** An approved agent host (`buzz host`). Wire field name kept as-is. */
-  | { type: "host"; host_pubkey: string };
+  | {
+      type: "host";
+      host_pubkey: string;
+      /** Folder on the machine; absent = the machine's default
+       * (`~/buzz-agents/<agent pubkey>`). */
+      workdir?: string;
+    };
 
 /** ACP conversation boundary configured on an agent definition. */
 export type AcpSessionPolicy = "channel" | "thread";

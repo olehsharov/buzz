@@ -38,15 +38,46 @@ pub fn new_request_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+/// Longest folder path accepted for an agent on a machine.
+pub const MAX_HOST_WORKDIR_CHARS: usize = 300;
+
+/// Shape-check the folder an agent runs in on its machine. Blank means the
+/// machine's default (`None`). The path belongs to the machine, so it is
+/// never checked against this computer's filesystem: `~` is the machine's
+/// home and relative paths are relative to it (`buzz host` expands both and
+/// creates the folder if missing).
+pub fn normalize_host_workdir(workdir: Option<&str>) -> Result<Option<String>, String> {
+    let Some(workdir) = workdir.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if workdir.chars().count() > MAX_HOST_WORKDIR_CHARS {
+        return Err(format!(
+            "The folder path is too long (at most {MAX_HOST_WORKDIR_CHARS} characters)."
+        ));
+    }
+    if workdir.chars().any(|c| c == '\0' || c == '\n' || c == '\r') {
+        return Err("The folder path cannot contain line breaks or NUL characters.".into());
+    }
+    Ok(Some(workdir.to_string()))
+}
+
 /// `host.deploy`, built from the desktop's standard deploy payload
 /// (`build_deploy_payload`). The result carries the agent nsec in plaintext:
 /// callers encrypt it immediately and never log or persist it.
+///
+/// `workdir` is the agent's saved folder on the machine; blank or absent
+/// sends `null`, and the machine uses `~/buzz-agents/<agent_pubkey>`.
 pub fn deploy_frame(
     request_id: &str,
     agent_pubkey: &str,
     auth_tag: &str,
+    workdir: Option<&str>,
     deploy_payload: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
+    let workdir = workdir
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let nsec = deploy_payload
         .get("private_key_nsec")
         .and_then(serde_json::Value::as_str)
@@ -82,7 +113,7 @@ pub fn deploy_frame(
         "agent_nsec": nsec,
         "auth_tag": auth_tag,
         "relay_url": relay_url,
-        "workdir": serde_json::Value::Null,
+        "workdir": workdir,
         "env": env,
         "launch": launch,
         "respond_to": respond_to,
