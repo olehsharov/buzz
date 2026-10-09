@@ -217,8 +217,17 @@ fn persona_delete_preflight(
     let agents = load_managed_agents(app)?;
     let cascade: std::collections::HashSet<String> =
         collect_cascade_pubkeys(&agents, id).into_iter().collect();
-    let hosts = crate::managed_agents::managed_agents_base_dir(app)
-        .and_then(|dir| crate::agent_hosts::store::load_hosts(&dir))?;
+    // Machine names only make the refusal clearer; an unreadable machine
+    // list must not turn it into a different error.
+    let hosts = match crate::managed_agents::managed_agents_base_dir(app)
+        .and_then(|dir| crate::agent_hosts::store::load_hosts(&dir))
+    {
+        Ok(hosts) => hosts,
+        Err(error) => {
+            tracing::warn!("reading approved machines failed: {error}");
+            Vec::new()
+        }
+    };
     let community_relay = crate::relay::relay_ws_url_with_override(state);
     if let Some(message) = remote_agents_block_message(
         &persona.display_name,

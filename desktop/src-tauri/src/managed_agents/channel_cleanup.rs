@@ -9,6 +9,8 @@
 //! reported, never silently skipped, and never blocks deleting the record.
 //! DMs are conversations, not memberships, and are left alone.
 
+use std::time::Duration;
+
 use futures_util::future::BoxFuture;
 use serde::Serialize;
 
@@ -61,11 +63,30 @@ pub trait MembershipPort: Send + Sync {
     fn leave_as_agent<'a>(&'a self, channel_id: &'a str) -> BoxFuture<'a, Result<(), String>>;
 }
 
+/// Each relay request gets this long (the HTTP client has no timeout).
+pub const RELAY_OP_TIMEOUT: Duration = Duration::from_secs(15);
+/// The whole cleanup gets this long; channels not reached by then are
+/// reported, so a slow relay cannot hold a delete indefinitely.
+pub const CLEANUP_BUDGET: Duration = Duration::from_secs(90);
+
+async fn bounded<T>(
+    operation: BoxFuture<'_, Result<T, String>>,
+    deadline: tokio::time::Instant,
+) -> Result<T, String> {
+    let limit = deadline
+        .saturating_duration_since(tokio::time::Instant::now())
+        .min(RELAY_OP_TIMEOUT);
+    tokio::time::timeout(limit, operation)
+        .await
+        .map_err(|_| "the relay did not answer in time".to_string())?
+}
+
 /// Remove the agent from every channel `port` lists. Never fails: every
 /// problem is in the report.
 pub async fn remove_agent_from_channels(port: &dyn MembershipPort) -> ChannelCleanupReport {
+    let deadline = tokio::time::Instant::now() + CLEANUP_BUDGET;
     let mut report = ChannelCleanupReport::default();
-    let channels = match port.agent_channels().await {
+    let channels = match bounded(port.agent_channels(), deadline).await {
         Ok(channels) => channels,
         Err(error) => {
             tracing::warn!("listing an agent's channels failed: {error}");
@@ -74,14 +95,22 @@ pub async fn remove_agent_from_channels(port: &dyn MembershipPort) -> ChannelCle
         }
     };
     for channel in channels {
-        let owner_error = match port.remove_as_owner(&channel.id).await {
+        if tokio::time::Instant::now() >= deadline {
+            report.failed.push(ChannelRemovalFailure {
+                channel_id: channel.id,
+                channel_name: channel.name,
+                error: "not attempted: the relay was too slow".into(),
+            });
+            continue;
+        }
+        let owner_error = match bounded(port.remove_as_owner(&channel.id), deadline).await {
             Ok(()) => {
                 report.removed.push(channel);
                 continue;
             }
             Err(error) => error,
         };
-        match port.leave_as_agent(&channel.id).await {
+        match bounded(port.leave_as_agent(&channel.id), deadline).await {
             Ok(()) => report.removed.push(channel),
             Err(leave_error) => {
                 let error =
@@ -211,6 +240,8 @@ mod tests {
         owner_refused: Vec<&'static str>,
         /// Channel ids the agent may not leave.
         leave_refused: Vec<&'static str>,
+        /// Channel ids where the relay never answers.
+        silent: Vec<&'static str>,
         calls: Mutex<Vec<String>>,
     }
 
@@ -221,6 +252,9 @@ mod tests {
         fn remove_as_owner<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), String>> {
             Box::pin(async move {
                 self.calls.lock().unwrap().push(format!("9001 {id}"));
+                if self.silent.contains(&id) {
+                    std::future::pending::<()>().await;
+                }
                 if self.owner_refused.contains(&id) {
                     Err("not a member".into())
                 } else {
@@ -231,6 +265,9 @@ mod tests {
         fn leave_as_agent<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<(), String>> {
             Box::pin(async move {
                 self.calls.lock().unwrap().push(format!("9022 {id}"));
+                if self.silent.contains(&id) {
+                    std::future::pending::<()>().await;
+                }
                 if self.leave_refused.contains(&id) {
                     Err("sole owner".into())
                 } else {
@@ -253,6 +290,7 @@ mod tests {
             channels: Ok(vec![channel("a"), channel("b"), channel("c")]),
             owner_refused: vec!["b", "c"],
             leave_refused: vec!["c"],
+            silent: vec![],
             calls: Mutex::new(Vec::new()),
         };
         let report = remove_agent_from_channels(&relay).await;
@@ -266,6 +304,31 @@ mod tests {
             *relay.calls.lock().unwrap(),
             vec!["9001 a", "9001 b", "9022 b", "9001 c", "9022 c"]
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_relay_is_bounded_and_every_channel_is_still_reported() {
+        let ids: Vec<String> = (0..20).map(|n| format!("ch{n}")).collect();
+        let leaked: &'static [String] = Box::leak(ids.into_boxed_slice());
+        let relay = ScriptedRelay {
+            channels: Ok(leaked.iter().map(|id| channel(id)).collect()),
+            owner_refused: vec![],
+            leave_refused: vec![],
+            silent: leaked.iter().map(String::as_str).collect(),
+            calls: Mutex::new(Vec::new()),
+        };
+        let started = tokio::time::Instant::now();
+        let report = remove_agent_from_channels(&relay).await;
+        assert!(started.elapsed() <= CLEANUP_BUDGET + RELAY_OP_TIMEOUT);
+        assert!(report.removed.is_empty());
+        assert_eq!(report.failed.len(), 20, "no channel goes unreported");
+        assert!(report.failed[0].error.contains("did not answer in time"));
+        assert!(report
+            .failed
+            .last()
+            .unwrap()
+            .error
+            .contains("not attempted"));
     }
 
     #[test]
@@ -295,6 +358,7 @@ mod tests {
             channels: Err("relay unreachable".into()),
             owner_refused: vec![],
             leave_refused: vec![],
+            silent: vec![],
             calls: Mutex::new(Vec::new()),
         };
         let report = remove_agent_from_channels(&relay).await;

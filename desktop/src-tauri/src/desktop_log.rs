@@ -36,17 +36,32 @@ pub fn open_log_file(dir: &Path) -> std::io::Result<(PathBuf, File)> {
 pub fn init(dir: &Path) -> Result<PathBuf, String> {
     let (path, file) = open_log_file(dir)
         .map_err(|error| format!("could not open desktop log in {}: {error}", dir.display()))?;
-    use tracing_subscriber::{layer::SubscriberExt, Layer};
+    use tracing_subscriber::{filter::LevelFilter, layer::SubscriberExt, Layer};
     // Only the desktop's own events: embedded libraries (mesh-llm) log at
     // volume and would grow the file between startup rotations.
     let own_events = tracing_subscriber::filter::Targets::new()
         .with_target(env!("CARGO_CRATE_NAME"), tracing::Level::INFO);
-    let subscriber = tracing_subscriber::registry().with(
-        tracing_subscriber::fmt::layer()
-            .with_writer(Mutex::new(file))
-            .with_ansi(false)
-            .with_filter(own_events),
-    );
+    // This subscriber is installed first, so the embedded mesh-llm runtime
+    // keeps it instead of its own stderr subscriber. Keep its warnings (and
+    // its inference progress) on stderr as before; nothing below WARN, which
+    // also keeps the WebSocket client's debug wire dumps out.
+    let stderr_events = tracing_subscriber::filter::Targets::new()
+        .with_default(tracing::Level::WARN)
+        .with_target("mesh_inference", tracing::Level::INFO)
+        .with_target("nostr_relay_pool", LevelFilter::OFF);
+    let subscriber = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(Mutex::new(file))
+                .with_ansi(false)
+                .with_filter(own_events),
+        )
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(false)
+                .with_filter(stderr_events),
+        );
     tracing::subscriber::set_global_default(subscriber)
         .map_err(|error| format!("could not install the desktop log: {error}"))?;
     tracing::info!("desktop log opened");

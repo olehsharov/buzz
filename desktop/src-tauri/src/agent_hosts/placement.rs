@@ -14,6 +14,11 @@ use crate::managed_agents::ManagedAgentRecord;
 pub const STATUS_DEPLOYED: &str = "deployed";
 pub const STATUS_STOPPED: &str = "stopped";
 pub const STATUS_NOT_DEPLOYED: &str = "not_deployed";
+/// A report must be at least this much newer than the deploy to count:
+/// unsolicited reports carry the machine's clock, which can run ahead of
+/// this one, and a report from before the deploy must not mark the fresh
+/// agent stopped.
+pub const CLOCK_SKEW_SECS: u64 = 30;
 
 /// What the summary shows for a machine agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,7 +65,9 @@ pub fn host_placement(
     let report = host
         .and_then(|host| host.status.as_ref())
         // Unknown deploy time: a report cannot be shown to be newer.
-        .filter(|report| deployed_at.is_some_and(|deployed| report.received_at >= deployed));
+        .filter(|report| {
+            deployed_at.is_some_and(|deployed| report.received_at >= deployed + CLOCK_SKEW_SECS)
+        });
     let status = match report {
         None => STATUS_DEPLOYED,
         Some(report) => match report
@@ -132,7 +139,7 @@ mod tests {
 
     #[test]
     fn the_machines_latest_report_decides_running_or_stopped() {
-        let after = DEPLOYED_AT + 10;
+        let after = DEPLOYED_AT + CLOCK_SKEW_SECS + 1;
         assert_eq!(
             status(true, Some((after, &[(AGENT, "running")]))),
             STATUS_DEPLOYED
@@ -152,6 +159,11 @@ mod tests {
     #[test]
     fn a_report_from_before_the_deploy_or_no_report_keeps_the_receipt() {
         assert_eq!(
+            status(true, Some((DEPLOYED_AT + 10, &[(AGENT, "stopped")]))),
+            STATUS_DEPLOYED,
+            "a report within clock skew of the deploy may predate it"
+        );
+        assert_eq!(
             status(true, Some((DEPLOYED_AT - 10, &[(AGENT, "stopped")]))),
             STATUS_DEPLOYED
         );
@@ -163,7 +175,10 @@ mod tests {
         let placement = host_placement(
             &record(false),
             HOST,
-            &[host(Some((DEPLOYED_AT + 10, &[(AGENT, "running")])))],
+            &[host(Some((
+                DEPLOYED_AT + CLOCK_SKEW_SECS + 1,
+                &[(AGENT, "running")],
+            )))],
             RELAY,
         );
         assert_eq!(placement.status, STATUS_NOT_DEPLOYED);
