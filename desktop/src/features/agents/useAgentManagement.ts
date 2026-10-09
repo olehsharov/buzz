@@ -27,6 +27,7 @@ import {
   buildInstanceInputForDefinition,
   type BackendIntent,
 } from "./lib/instanceInputForDefinition";
+import { useAgentHostsQuery } from "./hosts/useAgentHosts";
 import { useCreatedAgentChannelAttachment } from "./useCreatedAgentChannelAttachment";
 import { classifyAgentManagementOrigin } from "./agentManagementBuffer";
 import { useChannelsQuery } from "@/features/channels/hooks";
@@ -270,11 +271,17 @@ export function useAgentManagement() {
   const providersSettled =
     backendProvidersQuery.isSuccess || backendProvidersQuery.isError;
   const discoveredProviders = backendProvidersQuery.data;
+  // A draft that names a machine waits for the approved machines the same
+  // way, so a slow load cannot misreport a real machine as unknown.
+  const hostsQuery = useAgentHostsQuery();
+  const hostsSettled = hostsQuery.isSuccess || hostsQuery.isError;
+  const approvedHosts = hostsQuery.data ?? null;
   React.useEffect(() => {
     if (
       request?.action !== "create" ||
       runPrefill?.requestId === request.requestId ||
-      (request.request.runOn !== undefined && !providersSettled)
+      (request.request.runOn !== undefined && !providersSettled) ||
+      (request.request.runOnHost !== undefined && !hostsSettled)
     ) {
       return;
     }
@@ -283,9 +290,17 @@ export function useAgentManagement() {
       ...runDraftFromRequest(
         request.request,
         (discoveredProviders ?? []).map((provider) => provider.id),
+        approvedHosts,
       ),
     });
-  }, [discoveredProviders, providersSettled, request, runPrefill]);
+  }, [
+    approvedHosts,
+    discoveredProviders,
+    hostsSettled,
+    providersSettled,
+    request,
+    runPrefill,
+  ]);
   const createRunPrefill =
     request?.action === "create" && runPrefill?.requestId === request.requestId
       ? runPrefill
