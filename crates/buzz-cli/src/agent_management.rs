@@ -1,9 +1,10 @@
 //! Owner-reviewed agent draft requests published through Buzz observer frames.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use buzz_core::observer::{encrypt_observer_payload, OBSERVER_FRAME_TELEMETRY};
-use nostr::{Event, Keys, PublicKey};
+use nostr::{Event, FromBech32, Keys, PublicKey};
 use serde::Serialize;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -25,6 +26,18 @@ const ALLOWED_ENV_KEYS: [&str; 3] = [
 ];
 const RESUME_SESSION_ENV_KEY: &str = "BUZZ_ACP_RESUME_SESSION";
 const RESPOND_TO_VALUES: [&str; 4] = ["owner-only", "allowlist", "anyone", "nobody"];
+/// `--run-on host:<ref>` targets one of the owner's paired machines.
+const HOST_RUN_ON_PREFIX: &str = "host:";
+/// Longest machine name Desktop accepts from a machine's hello frame.
+const MAX_HOST_REFERENCE_CHARS: usize = 128;
+/// Longest machine folder Desktop accepts (mirrors its `MAX_HOST_WORKDIR_CHARS`).
+const MAX_WORKDIR_CHARS: usize = 300;
+/// Provider-config key that carries a compute provider's working directory.
+const PROVIDER_WORKDIR_KEY: &str = "workdir";
+/// Claude Code shortens longer project directory names, so they cannot be predicted.
+const MAX_CLAUDE_PROJECT_DIR_CHARS: usize = 200;
+/// Upper bound on `~/.claude/projects` entries scanned for a resumed session.
+const MAX_PROJECT_DIRS_SCANNED: usize = 10_000;
 
 /// Unvalidated `draft-create` input as received from the command line.
 ///
@@ -41,8 +54,11 @@ pub struct CreateAgentDraft {
     pub env_vars: Vec<String>,
     pub avatar_emoji: Option<String>,
     pub avatar_color: Option<String>,
+    /// A compute provider id, or `host:<pubkey|npub|name>` for a paired machine.
     pub run_on: Option<String>,
     pub provider_config: Vec<String>,
+    /// Folder the agent runs in on the chosen `run_on` target.
+    pub workdir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -72,6 +88,14 @@ struct CreateAgentRequest {
     run_on: Option<String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     provider_config: BTreeMap<String, String>,
+    /// A paired machine as a lowercase hex pubkey or its name. Desktop
+    /// resolves it against the owner's approved machines. Exclusive with
+    /// `run_on`, so a provider draft keeps the shape older Desktops accept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    run_on_host: Option<String>,
+    /// Folder on that machine; only sent with `run_on_host`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host_workdir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -135,6 +159,8 @@ pub struct BuiltDraftRequest {
     pub event: Event,
     pub request_id: String,
     pub action: &'static str,
+    /// Non-fatal problems with the draft that the agent should relay.
+    pub warnings: Vec<String>,
 }
 
 fn required(value: String, label: &str, max: usize) -> Result<String, CliError> {
@@ -233,17 +259,225 @@ fn env_vars(entries: Vec<String>) -> Result<BTreeMap<String, String>, CliError> 
     Ok(map)
 }
 
+/// Where a draft asks the agent to run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RunOn {
+    /// A compute provider id discovered by the owner's Desktop.
+    Provider(String),
+    /// A paired machine as a lowercase hex pubkey or its name. Only Desktop
+    /// knows the owner's approved machines, so it resolves the reference.
+    Host(String),
+}
+
+/// Parses `--run-on`: a provider id, or `host:<hex pubkey|npub|name>`.
+fn run_on_target(value: Option<String>) -> Result<Option<RunOn>, CliError> {
+    let Some(value) = optional(value, "run-on")? else {
+        return Ok(None);
+    };
+    match value.strip_prefix(HOST_RUN_ON_PREFIX) {
+        Some(reference) => Ok(Some(RunOn::Host(host_reference(reference)?))),
+        None => Ok(optional_id(Some(value), "run-on")?.map(RunOn::Provider)),
+    }
+}
+
+/// Normalizes a machine reference: a hex pubkey is lowercased and an npub is
+/// decoded to hex; anything else is passed through as a machine name.
+fn host_reference(reference: &str) -> Result<String, CliError> {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return Err(CliError::Usage(
+            "--run-on host: needs a machine pubkey, npub or name, e.g. host:devbox".into(),
+        ));
+    }
+    if reference.len() == 64 && reference.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Ok(reference.to_ascii_lowercase());
+    }
+    if reference.starts_with("npub1") {
+        return PublicKey::from_bech32(reference)
+            .map(|pubkey| pubkey.to_hex())
+            .map_err(|_| CliError::Usage(format!("invalid machine npub '{reference}'")));
+    }
+    if reference.chars().count() > MAX_HOST_REFERENCE_CHARS
+        || reference.chars().any(char::is_control)
+    {
+        return Err(CliError::Usage(format!(
+            "invalid machine name in --run-on: use at most {MAX_HOST_REFERENCE_CHARS} \
+             characters and no control characters"
+        )));
+    }
+    Ok(reference.to_owned())
+}
+
+/// Validates `--workdir` the way Desktop validates a machine folder.
+fn workdir(value: Option<String>) -> Result<Option<String>, CliError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(CliError::Usage("--workdir needs a folder path".into()));
+    }
+    if value.chars().count() > MAX_WORKDIR_CHARS {
+        return Err(CliError::Usage(format!(
+            "--workdir is too long (max {MAX_WORKDIR_CHARS} characters)"
+        )));
+    }
+    if value.contains(['\0', '\n', '\r']) {
+        return Err(CliError::Usage(
+            "--workdir must be one line without NUL characters".into(),
+        ));
+    }
+    Ok(Some(value.to_owned()))
+}
+
+/// The wire fields for a run target: `(runOn, runOnHost, hostWorkdir)`.
+/// A provider's `--workdir` travels as `providerConfig.workdir`, exactly as
+/// `--provider-config workdir=…` always has.
+type RunOnFields = (Option<String>, Option<String>, Option<String>);
+
+fn run_on_fields(
+    run_on: Option<RunOn>,
+    workdir: Option<String>,
+    provider_config: &mut BTreeMap<String, String>,
+) -> Result<RunOnFields, CliError> {
+    match run_on {
+        None if workdir.is_some() => Err(CliError::Usage(
+            "--workdir requires --run-on (a provider id or host:<machine>)".into(),
+        )),
+        None => Ok((None, None, None)),
+        Some(RunOn::Host(reference)) => Ok((None, Some(reference), workdir)),
+        Some(RunOn::Provider(id)) => {
+            if let Some(workdir) = workdir {
+                match provider_config.get(PROVIDER_WORKDIR_KEY) {
+                    Some(existing) if *existing != workdir => {
+                        return Err(CliError::Usage(format!(
+                            "--workdir conflicts with --provider-config \
+                             {PROVIDER_WORKDIR_KEY}={existing}; give the folder once"
+                        )));
+                    }
+                    _ => {
+                        provider_config.insert(PROVIDER_WORKDIR_KEY.to_owned(), workdir);
+                    }
+                }
+                if provider_config.len() > MAX_PROVIDER_CONFIG_ENTRIES {
+                    return Err(CliError::Usage(format!(
+                        "--provider-config accepts at most {MAX_PROVIDER_CONFIG_ENTRIES} entries, \
+                         including --workdir"
+                    )));
+                }
+            }
+            Ok((Some(id), None, None))
+        }
+    }
+}
+
+/// Claude Code stores a session under `~/.claude/projects/<cwd with every
+/// non-alphanumeric character replaced by '-'>/<session id>.jsonl`.
+fn claude_project_dir_name(folder: &str) -> String {
+    folder
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+fn expand_home(folder: &str, home: &Path) -> Option<PathBuf> {
+    let folder = if folder.len() > 1 {
+        folder.trim_end_matches('/')
+    } else {
+        folder
+    };
+    if folder == "~" {
+        return Some(home.to_path_buf());
+    }
+    if let Some(rest) = folder.strip_prefix("~/") {
+        return Some(home.join(rest));
+    }
+    Path::new(folder)
+        .is_absolute()
+        .then(|| PathBuf::from(folder))
+}
+
+/// Warnings for a draft that resumes a Claude Code session on a remote target.
+///
+/// Claude Code resumes a session only from the folder it ran in. Without a
+/// folder the agent starts in the target's default folder. With one, the
+/// check can only run when the session file is on this computer (the CLI
+/// cannot see another machine's disk): it warns when the session sits under
+/// a different project folder than `workdir`, and stays silent when the
+/// session is not here at all.
+fn resume_session_warnings(
+    session: Option<&str>,
+    remote_target: bool,
+    workdir: Option<&str>,
+    home: Option<&Path>,
+) -> Vec<String> {
+    let Some(session) = session else {
+        return Vec::new();
+    };
+    if !remote_target {
+        return Vec::new();
+    }
+    let Some(workdir) = workdir else {
+        return vec![format!(
+            "{RESUME_SESSION_ENV_KEY} is set without --workdir: the agent starts in the \
+             target's default folder, where Claude Code cannot find session {session}. \
+             Pass --workdir with the folder the session ran in."
+        )];
+    };
+    let Some(home) = home else {
+        return Vec::new();
+    };
+    let Some(folder) = expand_home(workdir, home) else {
+        return Vec::new();
+    };
+    let expected = claude_project_dir_name(&folder.to_string_lossy());
+    if expected.len() > MAX_CLAUDE_PROJECT_DIR_CHARS {
+        return Vec::new();
+    }
+    let projects = home.join(".claude").join("projects");
+    let file_name = format!("{session}.jsonl");
+    if projects.join(&expected).join(&file_name).is_file() {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(&projects) else {
+        return Vec::new();
+    };
+    let found = entries
+        .take(MAX_PROJECT_DIRS_SCANNED)
+        .filter_map(Result::ok)
+        .find(|entry| entry.path().join(&file_name).is_file());
+    match found {
+        Some(entry) => vec![format!(
+            "Session {session} is in ~/.claude/projects/{}/ on this computer, but --workdir \
+             {workdir} maps to ~/.claude/projects/{expected}/. Claude Code resumes a session \
+             only from the folder it ran in, so check --workdir.",
+            entry.file_name().to_string_lossy()
+        )],
+        None => Vec::new(),
+    }
+}
+
 fn provider_config(
     entries: Vec<String>,
-    run_on: Option<&str>,
+    run_on: Option<&RunOn>,
 ) -> Result<BTreeMap<String, String>, CliError> {
     if entries.is_empty() {
         return Ok(BTreeMap::new());
     }
-    if run_on.is_none() {
-        return Err(CliError::Usage(
-            "--provider-config requires --run-on".into(),
-        ));
+    match run_on {
+        None => {
+            return Err(CliError::Usage(
+                "--provider-config requires --run-on".into(),
+            ))
+        }
+        Some(RunOn::Host(_)) => {
+            return Err(CliError::Usage(
+                "--provider-config applies only to a compute provider; use --workdir \
+                 for the folder on a machine"
+                    .into(),
+            ))
+        }
+        Some(RunOn::Provider(_)) => {}
     }
     if entries.len() > MAX_PROVIDER_CONFIG_ENTRIES {
         return Err(CliError::Usage(format!(
@@ -335,6 +569,7 @@ fn build<T: Serialize>(
         event,
         request_id,
         action,
+        warnings: Vec::new(),
     })
 }
 
@@ -362,7 +597,21 @@ pub fn build_create(
             )));
         }
     }
-    let run_on = optional_id(draft.run_on, "run-on")?;
+    let run_on = run_on_target(draft.run_on)?;
+    let mut provider_config = provider_config(draft.provider_config, run_on.as_ref())?;
+    let (run_on, run_on_host, host_workdir) =
+        run_on_fields(run_on, workdir(draft.workdir)?, &mut provider_config)?;
+    let env_vars = env_vars(draft.env_vars)?;
+    let warnings = resume_session_warnings(
+        env_vars.get(RESUME_SESSION_ENV_KEY).map(String::as_str),
+        run_on.is_some() || run_on_host.is_some(),
+        host_workdir.as_deref().or_else(|| {
+            provider_config
+                .get(PROVIDER_WORKDIR_KEY)
+                .map(String::as_str)
+        }),
+        dirs::home_dir().as_deref(),
+    );
     let request = CreateAgentRequest {
         channel_id: channel_id.clone(),
         display_name: required(draft.display_name, "display name", MAX_NAME_CHARS)?,
@@ -370,19 +619,23 @@ pub fn build_create(
         runtime: optional_id(draft.runtime, "runtime")?,
         model: optional(draft.model, "model")?,
         respond_to,
-        env_vars: env_vars(draft.env_vars)?,
+        env_vars,
         avatar: avatar(draft.avatar_emoji, draft.avatar_color)?,
-        provider_config: provider_config(draft.provider_config, run_on.as_deref())?,
         run_on,
+        provider_config,
+        run_on_host,
+        host_workdir,
     };
-    build(
+    let mut built = build(
         keys,
         owner,
         channel_id,
         AGENT_REQUEST_KIND,
         "create",
         request,
-    )
+    )?;
+    built.warnings = warnings;
+    Ok(built)
 }
 
 pub fn build_update(
@@ -551,7 +804,241 @@ mod tests {
             avatar_color: Some("#1A2b3C".into()),
             run_on: Some("remote-host".into()),
             provider_config: vec!["host=box-7.internal".into(), "workdir=/srv/repo".into()],
+            workdir: None,
         }
+    }
+
+    fn host_draft(run_on: &str) -> CreateAgentDraft {
+        CreateAgentDraft {
+            run_on: Some(run_on.into()),
+            provider_config: Vec::new(),
+            workdir: Some("~/code/app".into()),
+            ..full_draft()
+        }
+    }
+
+    #[test]
+    fn create_carries_a_machine_target_by_name_with_its_folder() {
+        let request = decrypted_request(host_draft("host: Dev Box "));
+        assert_eq!(request["runOnHost"], "Dev Box");
+        assert_eq!(request["hostWorkdir"], "~/code/app");
+        // A machine draft never sends provider fields.
+        assert!(request.get("runOn").is_none());
+        assert!(request.get("providerConfig").is_none());
+        // The resumed session and the folder travel together.
+        assert_eq!(request["envVars"][RESUME_SESSION_ENV_KEY], RESUME);
+    }
+
+    #[test]
+    fn create_normalizes_a_machine_pubkey_or_npub_to_lowercase_hex() {
+        let machine = Keys::generate().public_key();
+        let hex = machine.to_hex();
+        let npub = nostr::ToBech32::to_bech32(&machine).unwrap();
+        for reference in [hex.to_uppercase(), npub] {
+            let request = decrypted_request(CreateAgentDraft {
+                workdir: None,
+                ..host_draft(&format!("host:{reference}"))
+            });
+            assert_eq!(request["runOnHost"], hex.as_str(), "{reference}");
+            assert!(request.get("hostWorkdir").is_none());
+        }
+    }
+
+    #[test]
+    fn create_sends_a_provider_workdir_as_provider_config() {
+        let request = decrypted_request(CreateAgentDraft {
+            provider_config: vec!["host=box-7.internal".into()],
+            workdir: Some("/srv/repo".into()),
+            ..full_draft()
+        });
+        assert_eq!(request["runOn"], "remote-host");
+        assert_eq!(
+            request["providerConfig"],
+            serde_json::json!({ "host": "box-7.internal", "workdir": "/srv/repo" })
+        );
+        assert!(request.get("runOnHost").is_none());
+        assert!(request.get("hostWorkdir").is_none());
+
+        // Giving the same folder both ways is not a conflict.
+        let request = decrypted_request(CreateAgentDraft {
+            workdir: Some("/srv/repo".into()),
+            ..full_draft()
+        });
+        assert_eq!(request["providerConfig"]["workdir"], "/srv/repo");
+    }
+
+    #[test]
+    fn create_rejects_invalid_machine_targets_and_folders() {
+        type Mutate = fn(&mut CreateAgentDraft);
+        let cases: &[(&str, Mutate, &str)] = &[
+            (
+                "empty machine",
+                |d| d.run_on = Some("host:  ".into()),
+                "needs a machine pubkey, npub or name",
+            ),
+            (
+                "bad npub",
+                |d| d.run_on = Some("host:npub1notakey".into()),
+                "invalid machine npub",
+            ),
+            (
+                "machine name too long",
+                |d| d.run_on = Some(format!("host:{}", "m".repeat(129))),
+                "invalid machine name",
+            ),
+            (
+                "machine name with a control character",
+                |d| d.run_on = Some("host:dev\u{7}box".into()),
+                "invalid machine name",
+            ),
+            (
+                "provider config on a machine",
+                |d| d.provider_config = vec!["host=x".into()],
+                "applies only to a compute provider",
+            ),
+            (
+                "workdir without run-on",
+                |d| d.run_on = None,
+                "--workdir requires --run-on",
+            ),
+            (
+                "empty workdir",
+                |d| d.workdir = Some("  ".into()),
+                "--workdir needs a folder path",
+            ),
+            (
+                "workdir too long",
+                |d| d.workdir = Some(format!("/{}", "a".repeat(300))),
+                "--workdir is too long",
+            ),
+            (
+                "workdir with a newline",
+                |d| d.workdir = Some("/srv/a\nb".into()),
+                "one line without NUL",
+            ),
+            (
+                "workdir with a carriage return",
+                |d| d.workdir = Some("/srv/a\rb".into()),
+                "one line without NUL",
+            ),
+            (
+                "workdir with NUL",
+                |d| d.workdir = Some("/srv/a\0b".into()),
+                "one line without NUL",
+            ),
+            (
+                "provider workdir conflicts with provider config",
+                |d| {
+                    d.run_on = Some("remote-host".into());
+                    d.provider_config = vec!["workdir=/srv/other".into()];
+                },
+                "--workdir conflicts with --provider-config workdir=/srv/other",
+            ),
+            (
+                "provider workdir pushes config past the cap",
+                |d| {
+                    d.run_on = Some("remote-host".into());
+                    d.provider_config = (0..20).map(|i| format!("k{i}=v")).collect();
+                },
+                "at most 20 entries, including --workdir",
+            ),
+        ];
+        for (name, mutate, expected) in cases {
+            let mut draft = host_draft("host:devbox");
+            mutate(&mut draft);
+            let error = build_create(&Keys::generate(), &Keys::generate().public_key(), draft)
+                .expect_err(name);
+            assert!(
+                matches!(error, CliError::Usage(_)),
+                "{name}: expected a usage error, got {error:?}"
+            );
+            assert!(
+                error.to_string().contains(expected),
+                "{name}: '{error}' does not contain '{expected}'"
+            );
+        }
+    }
+
+    #[test]
+    fn create_warns_when_a_remote_resume_has_no_folder() {
+        let built = build_create(
+            &Keys::generate(),
+            &Keys::generate().public_key(),
+            CreateAgentDraft {
+                workdir: None,
+                ..host_draft("host:devbox")
+            },
+        )
+        .unwrap();
+        assert_eq!(built.warnings.len(), 1, "{:?}", built.warnings);
+        assert!(built.warnings[0].contains("without --workdir"));
+        assert!(built.warnings[0].contains(RESUME));
+
+        // A local agent cannot take a folder, so there is nothing to warn about.
+        let built = build_create(
+            &Keys::generate(),
+            &Keys::generate().public_key(),
+            CreateAgentDraft {
+                run_on: None,
+                workdir: None,
+                ..host_draft("host:devbox")
+            },
+        )
+        .unwrap();
+        assert!(built.warnings.is_empty(), "{:?}", built.warnings);
+    }
+
+    fn place_session(home: &Path, project_dir: &str) {
+        let dir = home.join(".claude").join("projects").join(project_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{RESUME}.jsonl")), "{}\n").unwrap();
+    }
+
+    #[test]
+    fn resume_check_accepts_the_session_in_the_folders_project_dir() {
+        let home = tempfile::tempdir().unwrap();
+        let folder = home.path().join("code").join("my_app.v2");
+        let dir = claude_project_dir_name(&folder.to_string_lossy());
+        assert!(dir.ends_with("-code-my-app-v2"), "{dir}");
+        place_session(home.path(), &dir);
+        for workdir in [
+            folder.to_string_lossy().into_owned(),
+            format!("{}/", folder.to_string_lossy()),
+            "~/code/my_app.v2".to_owned(),
+        ] {
+            let warnings =
+                resume_session_warnings(Some(RESUME), true, Some(&workdir), Some(home.path()));
+            assert!(warnings.is_empty(), "{workdir}: {warnings:?}");
+        }
+    }
+
+    #[test]
+    fn resume_check_warns_when_the_session_belongs_to_another_folder() {
+        let home = tempfile::tempdir().unwrap();
+        place_session(home.path(), "-elsewhere-repo");
+        let warnings =
+            resume_session_warnings(Some(RESUME), true, Some("~/code/app"), Some(home.path()));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("~/.claude/projects/-elsewhere-repo/"));
+        assert!(warnings[0].contains("--workdir ~/code/app"));
+    }
+
+    #[test]
+    fn resume_check_is_silent_when_the_session_is_not_on_this_computer() {
+        let home = tempfile::tempdir().unwrap();
+        place_session(home.path(), "-unrelated");
+        std::fs::remove_file(
+            home.path()
+                .join(".claude/projects/-unrelated")
+                .join(format!("{RESUME}.jsonl")),
+        )
+        .unwrap();
+        for workdir in ["~/code/app", "/srv/app", "relative/app"] {
+            let warnings =
+                resume_session_warnings(Some(RESUME), true, Some(workdir), Some(home.path()));
+            assert!(warnings.is_empty(), "{workdir}: {warnings:?}");
+        }
+        assert!(resume_session_warnings(None, true, None, Some(home.path())).is_empty());
     }
 
     fn decrypted_request(draft: CreateAgentDraft) -> serde_json::Value {
