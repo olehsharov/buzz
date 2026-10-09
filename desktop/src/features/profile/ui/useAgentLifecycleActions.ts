@@ -7,6 +7,7 @@ import {
   startManagedAgentWithRules,
   stopManagedAgentWithRules,
 } from "@/features/agents/lib/managedAgentControlActions";
+import { showProgressToast } from "@/features/agents/lib/progressToast";
 import { agentPresenceStartBlockReason } from "@/features/agents/lib/useAgentAvailability";
 import { clearActiveTurnsForAgentOnStop } from "@/features/agents/managedAgentRuntimeHooks";
 import { isRelayRemovedError } from "@/features/agents/managedAgentRelayCleanup";
@@ -40,6 +41,7 @@ export function useAgentLifecycleActions({
     try {
       if (isManagedAgentActive(managedAgent)) {
         const result = await stopManagedAgentWithRules({
+          showProgress: showProgressToast,
           agent: managedAgent,
           channels: channels ?? [],
           relayAgents: relayAgents ?? [],

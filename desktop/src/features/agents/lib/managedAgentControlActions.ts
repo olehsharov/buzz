@@ -28,6 +28,15 @@ type ManagedAgentActionContext = ManagedAgentChannelContext & {
   getAvailability: AgentAvailabilityReader;
 };
 
+/** Show `message` until the returned function is called. */
+export type ShowProgress = (message: string) => () => void;
+
+const noProgress: ShowProgress = () => () => {};
+
+/** How long the desktop waits for a machine's acknowledgement (the hosts
+ * contract's ACK_TIMEOUT in agent_hosts/ops.rs). */
+const HOST_ACK_TIMEOUT_SECONDS = 60;
+
 export type ManagedAgentActionResult = {
   cancelled?: boolean;
   noticeMessage?: string;
@@ -153,16 +162,26 @@ export async function stopManagedAgentWithRules({
   channels,
   preferredChannelId,
   relayAgents,
+  showProgress = noProgress,
   stopManagedAgent,
 }: {
   agent: ManagedAgent;
+  /** Shows a long wait (a machine's acknowledgement). */
+  showProgress?: ShowProgress;
   stopManagedAgent: StopManagedAgent;
 } & ManagedAgentChannelContext): Promise<ManagedAgentActionResult> {
   if (agent.backend.type === "host") {
     // The backend removes the agent from its machine and waits for the
     // machine to confirm; no channel is involved. Deploy brings it back.
-    await stopManagedAgent(agent.pubkey);
     const machine = agent.hostName ?? "its machine";
+    const done = showProgress(
+      `Asking ${machine} to stop ${agent.name} (up to ${HOST_ACK_TIMEOUT_SECONDS} s)…`,
+    );
+    try {
+      await stopManagedAgent(agent.pubkey);
+    } finally {
+      done();
+    }
     return {
       noticeMessage: `Stopped ${agent.name} on ${machine}. Deploy starts it there again.`,
     };
@@ -198,21 +217,21 @@ export async function deleteManagedAgentWithRules({
   preferredChannelId,
   getAvailability,
   relayAgents,
+  showProgress = noProgress,
   skipRemoteDeleteConfirm = false,
 }: {
   agent: ManagedAgent;
   /** In-app confirmation (see `useConfirmDialog`). */
   confirm: ConfirmFn;
   deleteManagedAgent: DeleteManagedAgent;
+  /** Shows a long wait (a machine's acknowledgement). */
+  showProgress?: ShowProgress;
+  /** Skips the provider orphan warning the caller already showed. A
+   * machine that does not confirm is always asked about. */
   skipRemoteDeleteConfirm?: boolean;
 } & ManagedAgentActionContext): Promise<ManagedAgentActionResult> {
   if (agent.backend.type === "host") {
-    return deleteHostAgent(
-      agent,
-      deleteManagedAgent,
-      confirm,
-      skipRemoteDeleteConfirm,
-    );
+    return deleteHostAgent(agent, deleteManagedAgent, confirm, showProgress);
   }
   if (agent.backend.type === "provider" && agent.backendAgentId) {
     const availability = getAvailability(agent.pubkey);
@@ -286,33 +305,41 @@ async function deleteHostAgent(
   agent: ManagedAgent,
   deleteManagedAgent: DeleteManagedAgent,
   confirm: ConfirmFn,
-  skipConfirm: boolean,
+  showProgress: ShowProgress,
 ): Promise<ManagedAgentActionResult> {
+  const machine = agent.hostName ?? "its machine";
+  const deployed = agent.backendAgentId !== null;
+  const done = deployed
+    ? showProgress(
+        `Asking ${machine} to remove ${agent.name} (up to ${HOST_ACK_TIMEOUT_SECONDS} s)…`,
+      )
+    : () => {};
+  let reason: string;
   try {
     return deleted(await deleteManagedAgent({ pubkey: agent.pubkey }));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (!message.startsWith(HOST_UNDEPLOY_FAILED_PREFIX)) throw error;
-    const reason = message.slice(HOST_UNDEPLOY_FAILED_PREFIX.length);
-    if (
-      !skipConfirm &&
-      !(await confirm({
-        title: `Delete ${agent.name} anyway?`,
-        description:
-          `The machine did not confirm removing this agent (${reason}). ` +
-          "Delete it here anyway? It may keep running on the machine until " +
-          "you forget the machine.",
-        confirmLabel: "Delete anyway",
-        destructive: true,
-      }))
-    ) {
-      return { cancelled: true };
-    }
-    return deleted(
-      await deleteManagedAgent({
-        pubkey: agent.pubkey,
-        forceRemoteDelete: true,
-      }),
-    );
+    reason = message.slice(HOST_UNDEPLOY_FAILED_PREFIX.length);
+  } finally {
+    done();
   }
+  // Always asked, even when the caller already confirmed the delete: that
+  // confirmation promised the machine would remove the agent.
+  if (
+    !(await confirm({
+      title: `${machine} did not confirm`,
+      description:
+        `${agent.name} could not be removed from ${machine}: ${reason} ` +
+        "Delete it here anyway? The machine may keep a copy of the agent " +
+        "and keep running it until you forget the machine.",
+      confirmLabel: "Delete anyway",
+      destructive: true,
+    }))
+  ) {
+    return { cancelled: true };
+  }
+  return deleted(
+    await deleteManagedAgent({ pubkey: agent.pubkey, forceRemoteDelete: true }),
+  );
 }

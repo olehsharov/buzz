@@ -4,6 +4,7 @@ import {
   deleteManagedAgentWithRules,
   type ManagedAgentActionResult,
 } from "@/features/agents/lib/managedAgentControlActions";
+import { showProgressToast } from "@/features/agents/lib/progressToast";
 import {
   type ChannelCleanupReport,
   mergeChannelCleanup,
@@ -53,6 +54,7 @@ export function useProfileAgentDeletion({
   const deleteManagedAgentRecord = React.useCallback(
     (agentToDelete: ManagedAgent) =>
       deleteManagedAgentWithRules({
+        showProgress: showProgressToast,
         agent: agentToDelete,
         channels: channels ?? [],
         confirm,
@@ -67,6 +69,7 @@ export function useProfileAgentDeletion({
   const deleteManagedAgentsForPersona = React.useCallback(
     (persona: AgentPersona) =>
       deleteProfileManagedAgentsForPersona(persona, {
+        showProgress: showProgressToast,
         channels: channels ?? [],
         confirm,
         deleteManagedAgent,

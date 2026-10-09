@@ -16,6 +16,7 @@ import {
   startManagedAgentWithRules,
   stopManagedAgentWithRules,
 } from "@/features/agents/lib/managedAgentControlActions";
+import { showProgressToast } from "@/features/agents/lib/progressToast";
 import {
   clearActiveTurnsForAgentOnStop,
   useManagedAgentRuntimeAction,
@@ -191,6 +192,7 @@ export function useMembersSidebarActions({
 
       if (isManagedAgentActive(agent)) {
         await stopManagedAgentWithRules({
+          showProgress: showProgressToast,
           agent,
           ...EMPTY_AGENT_CONTEXT,
           preferredChannelId: channelId,
@@ -248,6 +250,7 @@ export function useMembersSidebarActions({
     await runBulkAgentAction({
       action: async (agent) => {
         const result = await stopManagedAgentWithRules({
+          showProgress: showProgressToast,
           agent,
           ...EMPTY_AGENT_CONTEXT,
           preferredChannelId: channelId,

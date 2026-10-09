@@ -358,3 +358,40 @@ test("deleting a machine agent asks the machine first, and only forces after the
     /agent not found/,
   );
 });
+
+test("a machine delete shows the wait, and a caller's earlier confirmation never skips the forced-delete question", async () => {
+  const progress = [];
+  const asked = [];
+  const calls = [];
+  const result = await deleteManagedAgentWithRules({
+    channels: [],
+    relayAgents: [],
+    getAvailability: () => "online",
+    // The profile panel already confirmed "Delete this agent?".
+    skipRemoteDeleteConfirm: true,
+    showProgress: (message) => {
+      progress.push(`show ${message}`);
+      return () => progress.push("hide");
+    },
+    confirm: async (request) => {
+      asked.push(request);
+      return false;
+    },
+    agent: agent({ ...HOST_AGENT, name: "Infra", hostName: "workstation" }),
+    deleteManagedAgent: async (input) => {
+      calls.push(input);
+      throw new Error(
+        `${HOST_UNDEPLOY_FAILED_PREFIX}workstation did not confirm: timed out.`,
+      );
+    },
+  });
+  assert.deepEqual(progress, [
+    "show Asking workstation to remove Infra (up to 60 s)…",
+    "hide",
+  ]);
+  assert.equal(asked.length, 1);
+  assert.equal(asked[0].title, "workstation did not confirm");
+  assert.match(asked[0].description, /may keep a copy of the agent/);
+  assert.equal(result.cancelled, true);
+  assert.equal(calls.length, 1, "declining never forces");
+});
