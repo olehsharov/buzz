@@ -104,6 +104,10 @@ import { UserProfileEditAgentDialog } from "@/features/profile/ui/UserProfileEdi
 import { useProfileEditAgentRequest } from "@/features/profile/ui/useProfileEditAgentRequest";
 import { useConfirmDialog } from "@/shared/ui/useConfirmDialog";
 import { warnAboutChannelCleanup } from "@/features/agents/lib/channelCleanupNotice";
+import {
+  deletePersonaAfterRemoteAgents,
+  remoteAgentsOfPersona,
+} from "@/features/agents/lib/personaRemoteAgents";
 export type { ProfilePanelTab, ProfilePanelView };
 
 export function UserProfilePanel({
@@ -627,9 +631,14 @@ export function UserProfilePanel({
       }
 
       try {
-        const channelCleanup = await deletePersonaMutation.mutateAsync(
-          personaToConfirm.id,
-        );
+        const { cancelled, channelCleanup } =
+          await deletePersonaAfterRemoteAgents({
+            persona: personaToConfirm,
+            managedAgents: managedAgentsQuery.data ?? [],
+            deleteAgent: deleteManagedAgentRecord,
+            deletePersona: deletePersonaMutation.mutateAsync,
+          });
+        if (cancelled) return;
         toast.success(`Deleted ${personaToConfirm.displayName}.`);
         warnAboutChannelCleanup(personaToConfirm.displayName, channelCleanup);
         setPersonaToDelete(null);
@@ -640,7 +649,12 @@ export function UserProfilePanel({
         );
       }
     },
-    [deletePersonaMutation.mutateAsync, onClose],
+    [
+      deleteManagedAgentRecord,
+      deletePersonaMutation.mutateAsync,
+      managedAgentsQuery.data,
+      onClose,
+    ],
   );
 
   // Count of managed-agent instances backed by the persona being deleted.
@@ -968,6 +982,14 @@ export function UserProfilePanel({
             : null
         }
         instanceCount={personaDeleteInstanceCount}
+        remoteAgents={
+          personaToDelete
+            ? remoteAgentsOfPersona(
+                managedAgentsQuery.data ?? [],
+                personaToDelete.id,
+              )
+            : []
+        }
         isPending={
           createPersonaMutation.isPending ||
           updatePersonaMutation.isPending ||

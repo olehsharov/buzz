@@ -49,6 +49,7 @@ export function UserProfilePersonaDialogs({
   cardMintTarget,
   createError,
   instanceCount,
+  remoteAgents,
   isPending,
   linkedAgentPubkey,
   personaDialogState,
@@ -71,6 +72,7 @@ export function UserProfilePersonaDialogs({
   createError: Error | null;
   /** Number of managed-agent instances backed by the persona being deleted. */
   instanceCount: number;
+  remoteAgents: readonly ManagedAgent[];
   isPending: boolean;
   linkedAgentPubkey: string | null;
   personaDialogState: PersonaDialogState | null;
@@ -119,6 +121,7 @@ export function UserProfilePersonaDialogs({
       />
       <PersonaDeleteDialog
         instanceCount={instanceCount}
+        remoteAgents={remoteAgents}
         onConfirm={onConfirmDelete}
         onOpenChange={(open) => {
           if (!open) {

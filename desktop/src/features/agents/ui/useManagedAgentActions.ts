@@ -307,6 +307,22 @@ export function useManagedAgentActions() {
     }
   }
 
+  /** Delete one agent as part of an already-confirmed persona delete. A
+   * machine that does not confirm still asks before deleting locally. */
+  async function deleteAgentForPersonaCascade(agent: ManagedAgent) {
+    const channels = await getChannelsForAction();
+    return deleteManagedAgentWithRules({
+      showProgress: showProgressToast,
+      agent,
+      channels,
+      confirm,
+      deleteManagedAgent: deleteMutation.mutateAsync,
+      getAvailability,
+      relayAgents: relayAgentsQuery.data ?? [],
+      skipRemoteDeleteConfirm: true,
+    });
+  }
+
   async function handleDelete(pubkey: string) {
     clearFeedback();
     try {
@@ -467,6 +483,7 @@ export function useManagedAgentActions() {
     handleStartPersona,
     handleStop,
     handleDelete,
+    deleteAgentForPersonaCascade,
     handleToggleStartOnAppLaunch,
     handleAddedToChannel,
     handleBulkStopRunning,

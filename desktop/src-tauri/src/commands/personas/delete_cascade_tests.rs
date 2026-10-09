@@ -6,7 +6,7 @@
 //! helper that identifies the agents to cascade-delete, using plain
 //! in-memory data structures (no `AppHandle` required).
 
-use super::{collect_cascade_pubkeys, collect_remote_deployed, commit_cascade_agents};
+use super::{collect_cascade_pubkeys, commit_cascade_agents, remote_agents_block_message};
 use crate::managed_agents::{BackendKind, ManagedAgentRecord, RespondTo};
 use std::collections::BTreeMap;
 use std::collections::HashSet;
@@ -199,11 +199,56 @@ fn remote_deployed_cascade_target_blocks_delete() {
         .collect();
     assert_eq!(cascade.len(), 3, "all three agents are cascade targets");
 
-    let blockers = collect_remote_deployed(&agents, &cascade);
+    let message = remote_agents_block_message("Ops Template", &agents, &cascade, |_, _| None);
 
     assert_eq!(
-        blockers,
-        vec!["Deployed Agent".to_string()],
+        message.as_deref(),
+        Some(
+            "Can't delete the template \u{201c}Ops Template\u{201d} while its agents run \
+             elsewhere: Deployed Agent is deployed through blox. Delete those agents first."
+        ),
         "only the deployed provider agent blocks the cascade"
+    );
+}
+
+/// A machine agent blocks the cascade too, and the message says which
+/// machine it runs on (never the template's or the agent's key).
+#[test]
+fn machine_agent_blocker_names_its_machine() {
+    let host = "ab".repeat(32);
+    let mut on_machine = make_agent("pk-machine", Some(PERSONA_ID), None);
+    on_machine.name = "Infra".to_string();
+    on_machine.backend = BackendKind::Host {
+        host_pubkey: host.clone(),
+        workdir: None,
+    };
+    on_machine.backend_agent_id = Some(host.clone());
+    let agents = vec![on_machine];
+    let cascade: HashSet<String> = collect_cascade_pubkeys(&agents, PERSONA_ID)
+        .into_iter()
+        .collect();
+
+    let message = remote_agents_block_message("Ops Template", &agents, &cascade, |_, pubkey| {
+        (pubkey == host).then(|| "workstation".to_string())
+    })
+    .unwrap();
+    assert!(
+        message.contains("Infra is running on workstation"),
+        "{message}"
+    );
+    assert!(
+        message.contains("\u{201c}Ops Template\u{201d}"),
+        "{message}"
+    );
+    assert!(
+        !message.contains(PERSONA_ID) && !message.contains(&host),
+        "{message}"
+    );
+
+    let unnamed =
+        remote_agents_block_message("Ops Template", &agents, &cascade, |_, _| None).unwrap();
+    assert!(
+        unnamed.contains("Infra is running on a paired machine"),
+        "{unnamed}"
     );
 }

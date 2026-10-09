@@ -138,25 +138,43 @@ fn collect_cascade_pubkeys(agents: &[ManagedAgentRecord], persona_id: &str) -> V
         .collect()
 }
 
-/// Names of cascade agents that are provider-deployed: non-local backend with
-/// a live `backend_agent_id`.
+/// Why `delete_persona` refuses: names the template and, for each cascade
+/// agent still deployed elsewhere (non-local backend with a live
+/// `backend_agent_id`), where it runs. `machine_name` resolves a paired
+/// machine's name (`None`: no longer approved here).
 ///
-/// Pure helper used by `delete_persona`'s pre-flight: the cascade is refused
-/// while any exist, because deleting the local record would orphan the remote
-/// deployment. Mirrors `delete_managed_agent`'s `force_remote_delete` guard.
-fn collect_remote_deployed(
+/// The cascade is refused while any exist, because deleting the local
+/// record would orphan the remote deployment. Mirrors
+/// `delete_managed_agent`'s `force_remote_delete` guard; the UI removes
+/// those agents first (with the machine's acknowledgement) and retries.
+fn remote_agents_block_message(
+    template_name: &str,
     agents: &[ManagedAgentRecord],
     cascade: &std::collections::HashSet<String>,
-) -> Vec<String> {
-    agents
+    machine_name: impl Fn(&ManagedAgentRecord, &str) -> Option<String>,
+) -> Option<String> {
+    use crate::managed_agents::BackendKind;
+    let blockers: Vec<String> = agents
         .iter()
-        .filter(|a| {
-            cascade.contains(&a.pubkey)
-                && a.backend != crate::managed_agents::BackendKind::Local
-                && a.backend_agent_id.is_some()
+        .filter(|agent| cascade.contains(&agent.pubkey) && agent.backend_agent_id.is_some())
+        .filter_map(|agent| match &agent.backend {
+            BackendKind::Local => None,
+            BackendKind::Host { host_pubkey, .. } => Some(format!(
+                "{} is running on {}",
+                agent.name,
+                machine_name(agent, host_pubkey).unwrap_or_else(|| "a paired machine".into())
+            )),
+            BackendKind::Provider { id, .. } => {
+                Some(format!("{} is deployed through {id}", agent.name))
+            }
         })
-        .map(|a| a.name.clone())
-        .collect()
+        .collect();
+    (!blockers.is_empty()).then(|| {
+        format!(
+            "Can't delete the template \u{201c}{template_name}\u{201d} while its agents run elsewhere: {}. Delete those agents first.",
+            blockers.join("; ")
+        )
+    })
 }
 
 /// Remove cascade agents from `agents` and persist via the injectable `save`.
@@ -199,12 +217,24 @@ fn persona_delete_preflight(
     let agents = load_managed_agents(app)?;
     let cascade: std::collections::HashSet<String> =
         collect_cascade_pubkeys(&agents, id).into_iter().collect();
-    let remote_deployed = collect_remote_deployed(&agents, &cascade);
-    if !remote_deployed.is_empty() {
-        return Err(format!(
-            "persona {id} has provider-deployed agent instances ({}); delete those agent instances first",
-            remote_deployed.join(", ")
-        ));
+    let hosts = crate::managed_agents::managed_agents_base_dir(app)
+        .and_then(|dir| crate::agent_hosts::store::load_hosts(&dir))?;
+    let community_relay = crate::relay::relay_ws_url_with_override(state);
+    if let Some(message) = remote_agents_block_message(
+        &persona.display_name,
+        &agents,
+        &cascade,
+        |agent, host_pubkey| {
+            crate::agent_hosts::placement::host_placement(
+                agent,
+                host_pubkey,
+                &hosts,
+                &community_relay,
+            )
+            .host_name
+        },
+    ) {
+        return Err(message);
     }
     Ok(agents
         .into_iter()
@@ -301,12 +331,13 @@ pub async fn delete_persona(
             // work while any target is provider-deployed. Nothing in
             // create_managed_agent forbids a persona-linked provider agent, so
             // this must be a runtime guard, not an assumed invariant.
-            let remote_deployed = collect_remote_deployed(&agents, &cascade);
-            if !remote_deployed.is_empty() {
-                return Err(format!(
-                    "persona {id} has provider-deployed agent instances ({}); delete those agent instances first",
-                    remote_deployed.join(", ")
-                ));
+            // (The preflight above names machines; this re-check under the
+            // lock only catches a deploy that raced it.)
+            let template_name = persona.display_name.clone();
+            if let Some(message) =
+                remote_agents_block_message(&template_name, &agents, &cascade, |_, _| None)
+            {
+                return Err(message);
             }
 
             // ── Phase 2: Stop ───────────────────────────────────────────────

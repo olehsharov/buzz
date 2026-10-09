@@ -65,6 +65,8 @@ import {
   type BackendIntent,
 } from "../lib/instanceInputForDefinition";
 import { warnAboutChannelCleanup } from "../lib/channelCleanupNotice";
+import type { ManagedAgentActionResult } from "../lib/managedAgentControlActions";
+import { deletePersonaAfterRemoteAgents } from "../lib/personaRemoteAgents";
 
 type PersonaFeedbackSurface = "catalog" | "library";
 
@@ -281,12 +283,25 @@ export function usePersonaActions() {
     }
   }
 
-  async function handleDelete(persona: AgentPersona) {
+  /** Delete `persona`; its agents deployed elsewhere are removed from there
+   * first through `deleteAgent` (the confirmed persona dialog covers them). */
+  async function handleDelete(
+    persona: AgentPersona,
+    cascade: {
+      managedAgents: readonly ManagedAgent[];
+      deleteAgent: (agent: ManagedAgent) => Promise<ManagedAgentActionResult>;
+    },
+  ) {
     clearFeedback("library");
     try {
-      const channelCleanup = await deletePersonaMutation.mutateAsync(
-        persona.id,
-      );
+      const { cancelled, channelCleanup } =
+        await deletePersonaAfterRemoteAgents({
+          persona,
+          managedAgents: cascade.managedAgents,
+          deleteAgent: cascade.deleteAgent,
+          deletePersona: deletePersonaMutation.mutateAsync,
+        });
+      if (cancelled) return;
       setPersonaNoticeMessage(`Deleted ${persona.displayName}.`);
       warnAboutChannelCleanup(persona.displayName, channelCleanup);
       setPersonaToDelete(null);
