@@ -8,6 +8,7 @@ import {
   getManagedAgentRestartLabel,
   startManagedAgentWithRules,
   respawnManagedAgentWithRules,
+  stopManagedAgentWithRules,
 } from "./managedAgentControlActions.ts";
 
 function agent(overrides = {}) {
@@ -264,6 +265,30 @@ test("machine agents deploy, redeploy and stop like remote agents", () => {
   assert.equal(
     getManagedAgentPrimaryActionLabel(
       agent({ ...HOST_AGENT, status: "not_deployed", backendAgentId: null }),
+    ),
+    "Deploy",
+  );
+});
+
+test("a machine agent stops on its machine even when it is in no channel", async () => {
+  const stopped = [];
+  const result = await stopManagedAgentWithRules({
+    agent: agent({ ...HOST_AGENT, name: "Infra", hostName: "workstation" }),
+    channels: [],
+    relayAgents: [],
+    stopManagedAgent: async (pubkey) => stopped.push(pubkey),
+  });
+  assert.deepEqual(stopped, ["deadbeef".repeat(8)]);
+  assert.equal(
+    result.noticeMessage,
+    "Stopped Infra on workstation. Deploy starts it there again.",
+  );
+});
+
+test("a machine agent its machine reports stopped offers Deploy, not a dead Shutdown", () => {
+  assert.equal(
+    getManagedAgentPrimaryActionLabel(
+      agent({ ...HOST_AGENT, status: "stopped" }),
     ),
     "Deploy",
   );

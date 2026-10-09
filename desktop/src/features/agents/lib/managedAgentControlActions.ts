@@ -16,7 +16,7 @@ type StartManagedAgent = (pubkey: string) => Promise<unknown>;
 type StopManagedAgent = (pubkey: string) => Promise<unknown>;
 type DeleteManagedAgent = (
   input: DeleteManagedAgentInput,
-) => Promise<ChannelCleanupReport | void>;
+) => Promise<ChannelCleanupReport | undefined>;
 
 type ManagedAgentChannelContext = {
   channels: readonly Channel[];
@@ -36,7 +36,8 @@ export type ManagedAgentActionResult = {
 };
 
 /** Agents that run somewhere else: a provider deployment or an approved
- * machine. Both deploy instead of starting, and stop via `!shutdown`. */
+ * machine. Both deploy instead of starting. A provider agent stops via
+ * `!shutdown` in a channel; a machine agent is removed from its machine. */
 export function isRemoteManagedAgent(agent: Pick<ManagedAgent, "backend">) {
   return agent.backend.type === "provider" || agent.backend.type === "host";
 }
@@ -157,6 +158,15 @@ export async function stopManagedAgentWithRules({
   agent: ManagedAgent;
   stopManagedAgent: StopManagedAgent;
 } & ManagedAgentChannelContext): Promise<ManagedAgentActionResult> {
+  if (agent.backend.type === "host") {
+    // The backend removes the agent from its machine and waits for the
+    // machine to confirm; no channel is involved. Deploy brings it back.
+    await stopManagedAgent(agent.pubkey);
+    const machine = agent.hostName ?? "its machine";
+    return {
+      noticeMessage: `Stopped ${agent.name} on ${machine}. Deploy starts it there again.`,
+    };
+  }
   if (isRemoteManagedAgent(agent)) {
     const channelId = resolveManagedAgentChannelId(agent, {
       channels,
@@ -261,7 +271,7 @@ export async function deleteManagedAgentWithRules({
 }
 
 function deleted(
-  channelCleanup: ChannelCleanupReport | void,
+  channelCleanup: ChannelCleanupReport | undefined,
 ): ManagedAgentActionResult {
   return channelCleanup ? { channelCleanup } : {};
 }

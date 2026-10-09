@@ -605,6 +605,8 @@ pub struct ManagedAgentSummary {
     pub env_vars: BTreeMap<String, String>,
     pub backend: BackendKind,
     pub backend_agent_id: Option<String>,
+    /// The approved machine a paired-machine agent is placed on.
+    pub host_name: Option<String>,
     /// The saved access policy has not yet been delivered by a successful
     /// redeploy of this provider or paired-machine agent, which still runs
     /// with its previous access. Retried on community load and by Deploy.

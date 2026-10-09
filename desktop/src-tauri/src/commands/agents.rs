@@ -1179,8 +1179,35 @@ pub async fn start_managed_agent(
 pub async fn stop_managed_agent(
     pubkey: String,
     app: AppHandle,
+    relay: crate::window_relay::WindowRelay,
 ) -> Result<ManagedAgentSummary, String> {
     use tauri::Manager;
+    // An agent on a paired machine stops by being removed from that machine,
+    // which the machine acknowledges; Deploy puts it back with the same
+    // configuration and folder. No channel message is involved, so an agent
+    // that is in no channel can still be stopped.
+    if matches!(
+        managed_agent_record(&app, &pubkey)?.backend,
+        BackendKind::Host { .. }
+    ) {
+        let state = app.state::<AppState>();
+        let owner_keys = state.signing_keys()?;
+        crate::agent_hosts::ops::undeploy_agent_via_its_host(
+            &app,
+            &state,
+            &app.state::<crate::agent_hosts::HostOps>(),
+            relay.ws_url(),
+            &pubkey,
+            |route| {
+                Ok(crate::agent_hosts::channel::RelayHostChannel {
+                    relay_url: route.relay_url.clone(),
+                    owner_keys,
+                })
+            },
+        )
+        .await?;
+        return super::hosts::summary_for(&app, &state, &pubkey);
+    }
     tokio::task::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let _store_guard = state
@@ -1269,7 +1296,8 @@ async fn deploy_host_agent<R: tauri::Runtime>(
     .await
 }
 
-// Remote agent shutdown is handled entirely by the frontend:
+// Provider agent shutdown is handled entirely by the frontend (paired-machine
+// agents stop through `stop_managed_agent`, which removes them from the machine):
 // 1. Frontend sends "!shutdown" @mention via WebSocket (signed by user's key)
 // 2. Harness sees it, exits gracefully, sets presence to "offline"
 // 3. Desktop's existing presence polling sees "offline" — UI updates automatically

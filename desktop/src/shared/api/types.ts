@@ -370,6 +370,8 @@ export type ManagedAgent = {
   autoRestartOnConfigChange: boolean;
   backend: ManagedAgentBackend;
   backendAgentId: string | null;
+  /** Name of the approved machine a paired-machine agent is placed on. */
+  hostName?: string | null;
   /**
    * The saved access policy has not yet been delivered by a successful
    * redeploy of this provider or paired-machine agent, which still runs with

@@ -25,6 +25,65 @@ fn summary_mirrors_provider_policy_pending() {
     }
 }
 
+// ── machine agents read their machine's report ─────────────────────────
+
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn summary_of_a_machine_agent_follows_the_machines_report() {
+    let test = crate::managed_agents::admission_test_support::app_with_keyless_agent();
+    let handle = test.app.handle();
+    let host = "ab".repeat(32);
+    let mut record = crate::managed_agents::load_managed_agents(handle).unwrap()[0].clone();
+    record.backend = crate::managed_agents::BackendKind::Host {
+        host_pubkey: host.clone(),
+        workdir: None,
+    };
+    record.backend_agent_id = Some(host.clone());
+    record.last_started_at = Some("2026-01-01T00:00:00Z".into());
+    let dir = crate::managed_agents::managed_agents_base_dir(handle).unwrap();
+    let report = |state: &str| {
+        crate::agent_hosts::store::save_hosts(
+            &dir,
+            &[crate::agent_hosts::store::AgentHostRecord {
+                pubkey: host.clone(),
+                name: "workstation".into(),
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                relay_url: record.relay_url.clone(),
+                added_at: "2026-01-01T00:00:00Z".into(),
+                status: Some(crate::agent_hosts::store::HostStatusSnapshot {
+                    agents: vec![crate::agent_hosts::frames::HostAgentState {
+                        agent_pubkey: record.pubkey.clone(),
+                        state: state.into(),
+                        since: None,
+                    }],
+                    // After the deploy.
+                    received_at: 1_767_225_700,
+                    ..Default::default()
+                }),
+            }],
+        )
+        .unwrap();
+    };
+    let summarize = |record: &crate::managed_agents::ManagedAgentRecord| {
+        super::build_managed_agent_summary(
+            handle,
+            record,
+            &std::collections::HashMap::new(),
+            &[],
+            &[],
+            &crate::managed_agents::GlobalAgentConfig::default(),
+        )
+        .unwrap()
+    };
+    report("stopped");
+    let summary = summarize(&record);
+    assert_eq!(summary.status, "stopped");
+    assert_eq!(summary.host_name.as_deref(), Some("workstation"));
+    report("running");
+    assert_eq!(summarize(&record).status, "deployed");
+}
+
 // ── desktop binary name tests ───────────────────────────────────────────
 
 #[test]

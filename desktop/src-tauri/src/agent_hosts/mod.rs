@@ -5,6 +5,7 @@
 pub(crate) mod channel;
 pub(crate) mod frames;
 pub(crate) mod ops;
+pub(crate) mod placement;
 pub(crate) mod store;
 
 pub(crate) use ops::HostOps;
