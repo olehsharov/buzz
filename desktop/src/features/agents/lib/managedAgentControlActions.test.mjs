@@ -8,6 +8,7 @@ import {
   getManagedAgentRestartLabel,
   startManagedAgentWithRules,
   respawnManagedAgentWithRules,
+  resolveManagedAgentChannelId,
   stopManagedAgentWithRules,
 } from "./managedAgentControlActions.ts";
 
@@ -270,19 +271,37 @@ test("machine agents deploy, redeploy and stop like remote agents", () => {
   );
 });
 
-test("a machine agent stops on its machine even when it is in no channel", async () => {
-  const stopped = [];
-  const result = await stopManagedAgentWithRules({
-    agent: agent({ ...HOST_AGENT, name: "Infra", hostName: "workstation" }),
-    channels: [],
-    relayAgents: [],
-    stopManagedAgent: async (pubkey) => stopped.push(pubkey),
-  });
-  assert.deepEqual(stopped, ["deadbeef".repeat(8)]);
+test("shutdown targets a channel the agent is actually a member of", () => {
+  const pubkey = "deadbeef".repeat(8);
+  // The agent's self-reported list names a channel it has since left.
+  const relayAgents = [{ pubkey, channels: ["old"], channelIds: ["left"] }];
+  const channels = [
+    { id: "other", name: "other", memberPubkeys: ["ab".repeat(32)] },
+    { id: "joined", name: "joined", memberPubkeys: [pubkey.toUpperCase()] },
+  ];
   assert.equal(
-    result.noticeMessage,
-    "Stopped Infra on workstation. Deploy starts it there again.",
+    resolveManagedAgentChannelId({ pubkey }, { channels, relayAgents }),
+    "joined",
   );
+  // No membership known: the self-reported list is still the fallback.
+  assert.equal(
+    resolveManagedAgentChannelId({ pubkey }, { channels: [], relayAgents }),
+    "left",
+  );
+});
+
+test("a machine agent in no channel cannot be shut down and says why", async () => {
+  const stopped = [];
+  await assert.rejects(
+    stopManagedAgentWithRules({
+      agent: agent({ ...HOST_AGENT, name: "Infra" }),
+      channels: [],
+      relayAgents: [],
+      stopManagedAgent: async (pubkey) => stopped.push(pubkey),
+    }),
+    /Can't stop Infra: it is not a member of any channel/,
+  );
+  assert.deepEqual(stopped, [], "never routed to the local stop");
 });
 
 test("a machine agent its machine reports stopped offers Deploy, not a dead Shutdown", () => {

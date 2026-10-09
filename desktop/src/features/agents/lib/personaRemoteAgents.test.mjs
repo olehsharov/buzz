@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   deletePersonaAfterRemoteAgents,
+  partialPersonaDeleteNotice,
   remoteAgentLocation,
   remoteAgentsOfPersona,
 } from "./personaRemoteAgents.ts";
@@ -93,6 +94,32 @@ test("a declined machine delete leaves the persona and the rest untouched", asyn
       throw new Error("must not delete the persona");
     },
   });
-  assert.deepEqual(result, { cancelled: true });
+  assert.equal(result.cancelled, true);
+  assert.deepEqual(result.deletedAgents, []);
+  assert.equal(partialPersonaDeleteNotice(PERSONA, result.deletedAgents), null);
   assert.deepEqual(order, ["Infra"]);
+});
+
+test("a cascade stopped part-way says which agents are already gone", async () => {
+  const result = await deletePersonaAfterRemoteAgents({
+    persona: PERSONA,
+    managedAgents: AGENTS,
+    deleteAgent: async (row) =>
+      row.name === "Infra"
+        ? { channelCleanup: cleanup(row.name) }
+        : { cancelled: true },
+    deletePersona: async () => {
+      throw new Error("must not delete the persona");
+    },
+  });
+  assert.equal(result.cancelled, true);
+  assert.deepEqual(result.deletedAgents, ["Infra"]);
+  assert.deepEqual(
+    result.channelCleanup.removed.map((channel) => channel.id),
+    ["Infra"],
+  );
+  assert.equal(
+    partialPersonaDeleteNotice(PERSONA, result.deletedAgents),
+    "Deleted Infra, but kept Ops Template and its other agents because an agent was not removed from where it runs.",
+  );
 });

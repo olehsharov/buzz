@@ -45,13 +45,38 @@ export async function deletePersonaAfterRemoteAgents({
   managedAgents: readonly ManagedAgent[];
   deleteAgent: (agent: ManagedAgent) => Promise<ManagedAgentActionResult>;
   deletePersona: (id: string) => Promise<ChannelCleanupReport>;
-}): Promise<{ cancelled?: boolean; channelCleanup?: ChannelCleanupReport }> {
+}): Promise<{
+  cancelled?: boolean;
+  channelCleanup?: ChannelCleanupReport;
+  /** When the cascade stopped early: the agents already deleted. */
+  deletedAgents?: string[];
+}> {
   const reports: (ChannelCleanupReport | undefined)[] = [];
+  const deletedAgents: string[] = [];
   for (const agent of remoteAgentsOfPersona(managedAgents, persona.id)) {
     const result = await deleteAgent(agent);
-    if (result.cancelled) return { cancelled: true };
+    if (result.cancelled) {
+      return {
+        cancelled: true,
+        channelCleanup: mergeChannelCleanup(reports),
+        deletedAgents,
+      };
+    }
     reports.push(result.channelCleanup);
+    deletedAgents.push(agent.name);
   }
   reports.push(await deletePersona(persona.id));
   return { channelCleanup: mergeChannelCleanup(reports) };
+}
+
+/** The notice for a cascade the user stopped part-way, or null. */
+export function partialPersonaDeleteNotice(
+  persona: AgentPersona,
+  deletedAgents: readonly string[] | undefined,
+): string | null {
+  if (!deletedAgents || deletedAgents.length === 0) return null;
+  return (
+    `Deleted ${deletedAgents.join(", ")}, but kept ${persona.displayName} ` +
+    "and its other agents because an agent was not removed from where it runs."
+  );
 }

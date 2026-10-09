@@ -66,7 +66,10 @@ import {
 } from "../lib/instanceInputForDefinition";
 import { warnAboutChannelCleanup } from "../lib/channelCleanupNotice";
 import type { ManagedAgentActionResult } from "../lib/managedAgentControlActions";
-import { deletePersonaAfterRemoteAgents } from "../lib/personaRemoteAgents";
+import {
+  deletePersonaAfterRemoteAgents,
+  partialPersonaDeleteNotice,
+} from "../lib/personaRemoteAgents";
 
 type PersonaFeedbackSurface = "catalog" | "library";
 
@@ -294,16 +297,20 @@ export function usePersonaActions() {
   ) {
     clearFeedback("library");
     try {
-      const { cancelled, channelCleanup } =
+      const { cancelled, channelCleanup, deletedAgents } =
         await deletePersonaAfterRemoteAgents({
           persona,
           managedAgents: cascade.managedAgents,
           deleteAgent: cascade.deleteAgent,
           deletePersona: deletePersonaMutation.mutateAsync,
         });
-      if (cancelled) return;
-      setPersonaNoticeMessage(`Deleted ${persona.displayName}.`);
       warnAboutChannelCleanup(persona.displayName, channelCleanup);
+      if (cancelled) {
+        const partial = partialPersonaDeleteNotice(persona, deletedAgents);
+        if (partial) setPersonaErrorMessage(partial);
+        return;
+      }
+      setPersonaNoticeMessage(`Deleted ${persona.displayName}.`);
       setPersonaToDelete(null);
     } catch (error) {
       setPersonaErrorMessage(

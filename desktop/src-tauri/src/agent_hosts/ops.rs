@@ -503,10 +503,13 @@ pub fn deployed_host_route<R: Runtime>(
     }))
 }
 
-/// Remove `agent` from the host it is deployed on, requiring the ack.
+/// Remove `agent` from the host it is deployed on, requiring the ack: takes
+/// the agent's lock and runs the production undeploy. Production callers
+/// hold the lock themselves and use [`undeploy_agent_via_its_host`].
 ///
 /// A failure is recorded on the agent (`last_error`) so it stays visible
 /// after the dialog that reported it is gone.
+#[cfg(test)]
 pub async fn undeploy_agent_from_host<R: Runtime>(
     app: &AppHandle<R>,
     state: &AppState,
@@ -514,15 +517,58 @@ pub async fn undeploy_agent_from_host<R: Runtime>(
     channel: &dyn HostChannel,
     agent: &str,
 ) -> Result<(), String> {
-    let lock = ops.agent_lock(agent)?;
-    let _serial = lock.lock().await;
-    let ticket = ops.begin(agent)?;
-    let record = load_record(app, state, agent)?;
+    let held = ops.hold(agent).await?;
+    undeploy_held(app, state, ops, &held, channel, agent)
+        .await
+        .map_err(UndeployError::into_message)
+}
+
+/// Why removing an agent from its machine failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UndeployError {
+    /// The machine could not be reached, is no longer approved, or did not
+    /// confirm. Deleting locally anyway is the user's way out.
+    Machine(String),
+    /// Something on this computer failed (the store, a newer operation);
+    /// the machine is not the problem and a forced delete would not help.
+    Local(String),
+}
+
+impl UndeployError {
+    pub fn into_message(self) -> String {
+        match self {
+            Self::Machine(message) | Self::Local(message) => message,
+        }
+    }
+}
+
+/// Proof that the caller holds an agent's operation lock (see
+/// [`HostOps::hold`]).
+pub type AgentHold = tokio::sync::OwnedMutexGuard<()>;
+
+impl HostOps {
+    /// Hold `agent`'s operation lock (deploy, undeploy, delete) until the
+    /// returned guard drops; a deploy started meanwhile waits for it.
+    pub(crate) async fn hold(&self, agent: &str) -> Result<AgentHold, String> {
+        Ok(self.agent_lock(agent)?.lock_owned().await)
+    }
+}
+
+async fn undeploy_held<R: Runtime>(
+    app: &AppHandle<R>,
+    state: &AppState,
+    ops: &HostOps,
+    _held: &AgentHold,
+    channel: &dyn HostChannel,
+    agent: &str,
+) -> Result<(), UndeployError> {
+    let ticket = ops.begin(agent).map_err(UndeployError::Local)?;
+    let record = load_record(app, state, agent).map_err(UndeployError::Local)?;
     let Some(host) = deployed_host(&record) else {
         return Ok(());
     };
-    let host = parse_host(host)?;
-    let owner_keys = state.signing_keys()?;
+    let host = parse_host(host).map_err(UndeployError::Local)?;
+    let owner_keys = state.signing_keys().map_err(UndeployError::Local)?;
     let request_id = frames::new_request_id();
     tracing::info!(agent = %agent, host = %host.to_hex(), request_id = %request_id, "sending host.undeploy");
     let outcome = send_expecting_ack(
@@ -546,40 +592,49 @@ pub async fn undeploy_agent_from_host<R: Runtime>(
                 tracing::warn!(agent = %agent, "could not record the undeploy failure: {persist}")
             }
         }
-        return Err(error);
+        return Err(UndeployError::Machine(error));
     }
+    // The machine confirmed; a failure from here on is local.
     persist_if_current(app, state, ops, agent, ticket, |record| {
         record.backend_agent_id = None;
         record.last_stopped_at = Some(now_iso());
         record.last_error = None;
     })
+    .map_err(UndeployError::Local)
 }
 
 /// [`undeploy_agent_from_host`] over the relay the agent's machine listens
-/// on (see [`deployed_host_route`]). `connect` opens the channel to it.
-/// Every failure, including an unreachable route, is recorded on the agent.
+/// on (see [`deployed_host_route`]), for a caller already holding the
+/// agent's lock. `connect` opens the channel to that relay. Every machine
+/// failure, including an unreachable route, is recorded on the agent.
 pub async fn undeploy_agent_via_its_host<R: Runtime, C: HostChannel>(
     app: &AppHandle<R>,
     state: &AppState,
     ops: &HostOps,
+    held: &AgentHold,
     community_relay: &str,
     agent: &str,
     connect: impl FnOnce(&HostRoute) -> Result<C, String>,
-) -> Result<(), String> {
-    let record = load_record(app, state, agent)?;
+) -> Result<(), UndeployError> {
+    let record = load_record(app, state, agent).map_err(UndeployError::Local)?;
     let route = match deployed_host_route(app, ops, &record, community_relay) {
         Ok(Some(route)) => route,
         Ok(None) => return Ok(()),
         Err(error) => {
             tracing::warn!(agent = %agent, "no route to the agent's machine: {error}");
-            record_error(app, state, agent, &error)?;
-            return Err(error);
+            record_error(app, state, agent, &error).map_err(UndeployError::Local)?;
+            return Err(UndeployError::Machine(error));
         }
     };
-    let channel = connect(&route)?;
-    undeploy_agent_from_host(app, state, ops, &channel, agent)
+    let channel = connect(&route).map_err(UndeployError::Local)?;
+    undeploy_held(app, state, ops, held, &channel, agent)
         .await
-        .map_err(|error| format!("{} did not confirm: {error}", route.host_name))
+        .map_err(|error| match error {
+            UndeployError::Machine(error) => {
+                UndeployError::Machine(format!("{} did not confirm: {error}", route.host_name))
+            }
+            local => local,
+        })
 }
 
 /// Ask the host for `host.status` and fold the reply into the store.

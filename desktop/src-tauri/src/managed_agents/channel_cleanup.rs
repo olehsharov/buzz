@@ -136,38 +136,78 @@ pub struct RelayMembership<'a> {
     pub agent_auth_tag: Option<String>,
 }
 
-impl RelayMembership<'_> {
-    async fn list(&self) -> Result<Vec<AgentChannel>, String> {
-        let memberships = crate::relay::query_relay_at_with_keys(
-            self.state,
-            &self.api_base,
-            &[serde_json::json!({"kinds": [39002], "#p": [self.agent_pubkey]})],
-            &self.agent_keys,
-            self.agent_auth_tag.as_deref(),
-        )
-        .await?;
-        let ids: Vec<String> = memberships
-            .iter()
-            .filter_map(|event| {
-                event
-                    .tags
-                    .iter()
-                    .find(|tag| tag.kind().to_string() == "d")
-                    .and_then(|tag| tag.content())
-                    .map(str::to_string)
-            })
-            .collect();
-        if ids.is_empty() {
-            return Ok(Vec::new());
+/// Page size for membership and metadata queries (the relay serves 100 rows
+/// when a filter names no limit, at most 1000).
+pub const MEMBERSHIP_PAGE_SIZE: usize = 500;
+
+fn d_tag(event: &nostr::Event) -> Option<String> {
+    event
+        .tags
+        .iter()
+        .find(|tag| tag.kind().to_string() == "d")
+        .and_then(|tag| tag.content())
+        .map(str::to_string)
+}
+
+/// Every event matching `filter`, page by page on the relay's composite
+/// `(until, before_id)` cursor (as `get_channels` pages its directory), so a
+/// long membership list is never silently cut at one page.
+pub async fn query_all_pages<F, Fut>(
+    mut filter: serde_json::Value,
+    mut query: F,
+) -> Result<Vec<nostr::Event>, String>
+where
+    F: FnMut(serde_json::Value) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<nostr::Event>, String>>,
+{
+    filter["limit"] = serde_json::json!(MEMBERSHIP_PAGE_SIZE);
+    let mut all = Vec::new();
+    loop {
+        let page = query(filter.clone()).await?;
+        let full = page.len() >= MEMBERSHIP_PAGE_SIZE;
+        if let Some(last) = page.last().filter(|_| full) {
+            filter["until"] = serde_json::json!(last.created_at.as_secs());
+            filter["before_id"] = serde_json::json!(last.id.to_hex());
         }
-        let metadata = crate::relay::query_relay_at_with_keys(
+        all.extend(page);
+        if !full {
+            return Ok(all);
+        }
+    }
+}
+
+impl RelayMembership<'_> {
+    async fn query(&self, filter: serde_json::Value) -> Result<Vec<nostr::Event>, String> {
+        crate::relay::query_relay_at_with_keys(
             self.state,
             &self.api_base,
-            &[serde_json::json!({"kinds": [39000], "#d": ids})],
+            &[filter],
             &self.agent_keys,
             self.agent_auth_tag.as_deref(),
         )
+        .await
+    }
+
+    async fn list(&self) -> Result<Vec<AgentChannel>, String> {
+        let memberships = query_all_pages(
+            serde_json::json!({"kinds": [39002], "#p": [self.agent_pubkey]}),
+            |filter| self.query(filter),
+        )
         .await?;
+        let mut ids: Vec<String> = memberships.iter().filter_map(d_tag).collect();
+        ids.sort();
+        ids.dedup();
+        let mut metadata = Vec::new();
+        for chunk in ids.chunks(MEMBERSHIP_PAGE_SIZE) {
+            metadata.extend(
+                self.query(serde_json::json!({
+                    "kinds": [39000],
+                    "#d": chunk,
+                    "limit": MEMBERSHIP_PAGE_SIZE,
+                }))
+                .await?,
+            );
+        }
         Ok(ids
             .into_iter()
             .filter_map(|id| {
@@ -304,6 +344,40 @@ mod tests {
             *relay.calls.lock().unwrap(),
             vec!["9001 a", "9001 b", "9022 b", "9001 c", "9022 c"]
         );
+    }
+
+    #[tokio::test]
+    async fn memberships_are_read_past_the_first_page() {
+        let keys = nostr::Keys::generate();
+        let event = |n: usize| {
+            nostr::EventBuilder::new(nostr::Kind::Custom(39002), "")
+                .tags([nostr::Tag::identifier(format!("ch{n}"))])
+                .sign_with_keys(&keys)
+                .unwrap()
+        };
+        let pages = [
+            (0..MEMBERSHIP_PAGE_SIZE).map(event).collect::<Vec<_>>(),
+            (0..3).map(|n| event(MEMBERSHIP_PAGE_SIZE + n)).collect(),
+        ];
+        let seen = Mutex::new(Vec::new());
+        let all = query_all_pages(serde_json::json!({"kinds": [39002]}), |filter| {
+            let page_index = {
+                let mut seen = seen.lock().unwrap();
+                seen.push(filter);
+                seen.len() - 1
+            };
+            let page = pages[page_index].clone();
+            async move { Ok(page) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(all.len(), MEMBERSHIP_PAGE_SIZE + 3);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0]["limit"], MEMBERSHIP_PAGE_SIZE);
+        let last = pages[0].last().unwrap();
+        assert_eq!(seen[1]["until"], last.created_at.as_secs());
+        assert_eq!(seen[1]["before_id"], last.id.to_hex());
     }
 
     #[tokio::test(start_paused = true)]

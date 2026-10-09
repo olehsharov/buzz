@@ -200,6 +200,7 @@ fn persona_delete_preflight(
     app: &AppHandle,
     state: &AppState,
     id: &str,
+    community_relay: &str,
 ) -> Result<Vec<ManagedAgentRecord>, String> {
     let _store_guard = state
         .managed_agents_store_lock
@@ -228,7 +229,6 @@ fn persona_delete_preflight(
             Vec::new()
         }
     };
-    let community_relay = crate::relay::relay_ws_url_with_override(state);
     if let Some(message) = remote_agents_block_message(
         &persona.display_name,
         &agents,
@@ -238,7 +238,7 @@ fn persona_delete_preflight(
                 agent,
                 host_pubkey,
                 &hosts,
-                &community_relay,
+                community_relay,
             )
             .host_name
         },
@@ -265,7 +265,7 @@ pub async fn delete_persona(
     relay: crate::window_relay::WindowRelay,
 ) -> Result<DeletePersonaOutcome, String> {
     use tauri::Manager;
-    let cascade = persona_delete_preflight(&app, &app.state::<AppState>(), &id)?;
+    let cascade = persona_delete_preflight(&app, &app.state::<AppState>(), &id, relay.ws_url())?;
     // Each deleted agent leaves its channels while its key still exists.
     let mut channels = crate::managed_agents::channel_cleanup::ChannelCleanupReport::default();
     for agent in &cascade {

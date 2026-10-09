@@ -45,8 +45,7 @@ export type ManagedAgentActionResult = {
 };
 
 /** Agents that run somewhere else: a provider deployment or an approved
- * machine. Both deploy instead of starting. A provider agent stops via
- * `!shutdown` in a channel; a machine agent is removed from its machine. */
+ * machine. Both deploy instead of starting, and stop via `!shutdown`. */
 export function isRemoteManagedAgent(agent: Pick<ManagedAgent, "backend">) {
   return agent.backend.type === "provider" || agent.backend.type === "host";
 }
@@ -93,6 +92,18 @@ export function resolveManagedAgentChannelId(
 ) {
   if (context.preferredChannelId) {
     return context.preferredChannelId;
+  }
+
+  // A channel whose member list (kind:39002) holds the agent: it is actually
+  // in it, unlike the agent's self-reported list, which can be stale.
+  const member = context.channels.find((channel) =>
+    channel.memberPubkeys?.some(
+      (memberPubkey) =>
+        normalizePubkey(memberPubkey) === normalizePubkey(agent.pubkey),
+    ),
+  );
+  if (member) {
+    return member.id;
   }
 
   const relayAgent = context.relayAgents.find(
@@ -162,38 +173,25 @@ export async function stopManagedAgentWithRules({
   channels,
   preferredChannelId,
   relayAgents,
-  showProgress = noProgress,
   stopManagedAgent,
 }: {
   agent: ManagedAgent;
-  /** Shows a long wait (a machine's acknowledgement). */
-  showProgress?: ShowProgress;
   stopManagedAgent: StopManagedAgent;
 } & ManagedAgentChannelContext): Promise<ManagedAgentActionResult> {
-  if (agent.backend.type === "host") {
-    // The backend removes the agent from its machine and waits for the
-    // machine to confirm; no channel is involved. Deploy brings it back.
-    const machine = agent.hostName ?? "its machine";
-    const done = showProgress(
-      `Asking ${machine} to stop ${agent.name} (up to ${HOST_ACK_TIMEOUT_SECONDS} s)…`,
-    );
-    try {
-      await stopManagedAgent(agent.pubkey);
-    } finally {
-      done();
-    }
-    return {
-      noticeMessage: `Stopped ${agent.name} on ${machine}. Deploy starts it there again.`,
-    };
-  }
   if (isRemoteManagedAgent(agent)) {
+    // Provider and paired-machine agents stop on `!shutdown` sent through a
+    // channel they are in (docs/agent-hosts.md, "Stopping an agent").
     const channelId = resolveManagedAgentChannelId(agent, {
       channels,
       preferredChannelId,
       relayAgents,
     });
     if (!channelId) {
-      throw new Error("Cannot stop: agent is not in any channel");
+      throw new Error(
+        `Can't stop ${agent.name}: it is not a member of any channel, and the ` +
+          "stop request is sent through a channel. Add it to a channel, or " +
+          "delete it.",
+      );
     }
 
     await sendChannelMessage(channelId, "!shutdown", undefined, undefined, [

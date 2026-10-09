@@ -45,7 +45,12 @@ test("the confirm action resolves true and shows the request", async () => {
   assert.equal(dialog.getAttribute("role"), "alertdialog");
   assert.match(dialog.textContent, /Delete Example\?/);
   assert.match(dialog.textContent, /This cannot be undone\./);
-  assert.match(dialog.textContent, /Removes it from #general/);
+  // The affected items are part of what assistive tech announces.
+  const description = document.getElementById(
+    dialog.getAttribute("aria-describedby"),
+  );
+  assert.match(description.textContent, /This cannot be undone\./);
+  assert.match(description.textContent, /Removes it from #general/);
   act(() => fireEvent.click(byTestId("confirm-dialog-action")));
   assert.equal(await answer, true);
   await waitFor(() => assert.equal(byTestId("confirm-dialog"), null));

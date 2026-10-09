@@ -106,6 +106,7 @@ import { useConfirmDialog } from "@/shared/ui/useConfirmDialog";
 import { warnAboutChannelCleanup } from "@/features/agents/lib/channelCleanupNotice";
 import {
   deletePersonaAfterRemoteAgents,
+  partialPersonaDeleteNotice,
   remoteAgentsOfPersona,
 } from "@/features/agents/lib/personaRemoteAgents";
 export type { ProfilePanelTab, ProfilePanelView };
@@ -631,16 +632,23 @@ export function UserProfilePanel({
       }
 
       try {
-        const { cancelled, channelCleanup } =
+        const { cancelled, channelCleanup, deletedAgents } =
           await deletePersonaAfterRemoteAgents({
             persona: personaToConfirm,
             managedAgents: managedAgentsQuery.data ?? [],
             deleteAgent: deleteManagedAgentRecord,
             deletePersona: deletePersonaMutation.mutateAsync,
           });
-        if (cancelled) return;
-        toast.success(`Deleted ${personaToConfirm.displayName}.`);
         warnAboutChannelCleanup(personaToConfirm.displayName, channelCleanup);
+        if (cancelled) {
+          const partial = partialPersonaDeleteNotice(
+            personaToConfirm,
+            deletedAgents,
+          );
+          if (partial) toast.warning(partial);
+          return;
+        }
+        toast.success(`Deleted ${personaToConfirm.displayName}.`);
         setPersonaToDelete(null);
         onClose();
       } catch (error) {

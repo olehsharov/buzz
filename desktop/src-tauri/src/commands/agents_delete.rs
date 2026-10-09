@@ -25,10 +25,14 @@ const REMOTE_DELETE_NEEDS_FORCE: &str =
     "cannot delete a deployed remote agent without force_remote_delete: true";
 
 /// Ask the machine an agent runs on to remove it, over the relay that
-/// machine listens on. Not deployed on a machine: nothing to do. Failures
-/// carry [`HOST_UNDEPLOY_FAILED_PREFIX`] and are recorded on the agent.
+/// machine listens on. Not deployed on a machine: nothing to do. Only a
+/// machine failure (unreachable, unapproved, no confirmation) carries
+/// [`HOST_UNDEPLOY_FAILED_PREFIX`], the UI's cue to offer a local-only
+/// delete; it is also recorded on the agent. A local failure is returned
+/// as is: forcing would not fix it.
 pub(crate) async fn undeploy_before_delete<R: tauri::Runtime, C>(
     app: &AppHandle<R>,
+    held: &crate::agent_hosts::ops::AgentHold,
     community_relay: &str,
     pubkey: &str,
     connect: impl FnOnce(&crate::agent_hosts::ops::HostRoute) -> Result<C, String>,
@@ -36,18 +40,23 @@ pub(crate) async fn undeploy_before_delete<R: tauri::Runtime, C>(
 where
     C: crate::agent_hosts::channel::HostChannel,
 {
+    use crate::agent_hosts::ops::UndeployError;
     let state = app.state::<AppState>();
     let hosts = app.state::<crate::agent_hosts::HostOps>();
     crate::agent_hosts::ops::undeploy_agent_via_its_host(
         app,
         &state,
         &hosts,
+        held,
         community_relay,
         pubkey,
         connect,
     )
     .await
-    .map_err(|error| format!("{HOST_UNDEPLOY_FAILED_PREFIX}{error}"))
+    .map_err(|error| match error {
+        UndeployError::Machine(error) => format!("{HOST_UNDEPLOY_FAILED_PREFIX}{error}"),
+        UndeployError::Local(error) => error,
+    })
 }
 
 /// What a completed delete did beyond removing the record.
@@ -134,13 +143,20 @@ async fn delete_managed_agent_inner(
     app: &AppHandle,
     relay: &crate::window_relay::WindowRelay,
 ) -> Result<DeleteManagedAgentOutcome, String> {
+    // Held for the whole delete: a deploy (another window, a pending
+    // redeploy on community load) waits, then finds no agent, instead of
+    // landing between the machine's removal and the record's.
+    let held = app
+        .state::<crate::agent_hosts::HostOps>()
+        .hold(pubkey)
+        .await?;
     let record = managed_agent_record(app, pubkey)?;
     // A host agent is removed from its machine first, and the machine must
     // acknowledge it. Forcing skips the machine (it may be gone for good) —
     // the user confirmed that in the UI after this failed once.
     if !force && crate::agent_hosts::ops::deployed_host(&record).is_some() {
         let owner_keys = app.state::<AppState>().signing_keys()?;
-        undeploy_before_delete(app, relay.ws_url(), pubkey, |route| {
+        undeploy_before_delete(app, &held, relay.ws_url(), pubkey, |route| {
             Ok(crate::agent_hosts::channel::RelayHostChannel {
                 relay_url: route.relay_url.clone(),
                 owner_keys,
@@ -155,16 +171,20 @@ async fn delete_managed_agent_inner(
     if record.backend != BackendKind::Local && record.backend_agent_id.is_some() && !force {
         return Err(REMOTE_DELETE_NEEDS_FORCE.to_string());
     }
+    // Fence out any machine operation still in flight before anything else
+    // changes.
+    app.state::<crate::agent_hosts::HostOps>()
+        .invalidate(pubkey)?;
     // Leave every channel while the agent's key still exists. A channel that
     // cannot be cleared is reported back; it never blocks the delete.
     let channels =
         remove_agent_from_its_channels(&app.state::<AppState>(), &record, relay.ws_url()).await;
-    app.state::<crate::agent_hosts::HostOps>()
-        .invalidate(pubkey)?;
     let app = app.clone();
     let pubkey = pubkey.to_string();
     let community_relay = relay.ws_url().to_string();
     tokio::task::spawn_blocking(move || {
+        // Released only once the record is gone.
+        let _held = held;
         let state = app.state::<AppState>();
         {
             let _store_guard = state

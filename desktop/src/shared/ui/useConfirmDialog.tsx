@@ -75,17 +75,22 @@ export function useConfirmDialog(): {
         <AlertDialogContent data-testid="confirm-dialog">
           <AlertDialogHeader>
             <AlertDialogTitle>{pending.title}</AlertDialogTitle>
-            <AlertDialogDescription>
-              {pending.description}
+            {/* A div, so the details list is part of the accessible
+                description (aria-describedby) without nesting a list in a
+                paragraph. */}
+            <AlertDialogDescription asChild>
+              <div className="space-y-2">
+                <p>{pending.description}</p>
+                {pending.details && pending.details.length > 0 ? (
+                  <ul className="list-disc space-y-1.5 pl-5">
+                    {pending.details.map((detail) => (
+                      <li key={detail}>{detail}</li>
+                    ))}
+                  </ul>
+                ) : null}
+              </div>
             </AlertDialogDescription>
           </AlertDialogHeader>
-          {pending.details && pending.details.length > 0 ? (
-            <ul className="list-disc space-y-1.5 pl-5 text-sm text-muted-foreground">
-              {pending.details.map((detail) => (
-                <li key={detail}>{detail}</li>
-              ))}
-            </ul>
-          ) : null}
           <AlertDialogFooter>
             <AlertDialogCancel asChild>
               <Button

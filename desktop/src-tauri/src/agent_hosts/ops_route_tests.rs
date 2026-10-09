@@ -46,6 +46,7 @@ async fn undeploy_targets_the_relay_the_machine_was_approved_on() {
         fx.app.handle(),
         &state,
         &ops,
+        &ops.hold(&fx.agent()).await.unwrap(),
         OTHER_COMMUNITY,
         &fx.agent(),
         |route| {
@@ -87,7 +88,8 @@ async fn a_silent_machine_keeps_the_agent_and_records_why() {
 
     // The production delete seam: the error carries the prefix the UI keys
     // its "delete anyway" offer on, and names the machine.
-    let error = undeploy_before_delete(fx.app.handle(), RELAY, &fx.agent(), |_| Ok(&fake))
+    let held = fx.app.state::<HostOps>().hold(&fx.agent()).await.unwrap();
+    let error = undeploy_before_delete(fx.app.handle(), &held, RELAY, &fx.agent(), |_| Ok(&fake))
         .await
         .unwrap_err();
     assert!(error.starts_with(HOST_UNDEPLOY_FAILED_PREFIX), "{error}");
@@ -115,7 +117,8 @@ async fn a_forgotten_machine_fails_fast_and_is_recorded() {
         store::save_hosts(&dir, &hosts).unwrap();
     }
     let fake = fx.fake(vec![]);
-    let error = undeploy_before_delete(fx.app.handle(), RELAY, &fx.agent(), |_| Ok(&fake))
+    let held = fx.app.state::<HostOps>().hold(&fx.agent()).await.unwrap();
+    let error = undeploy_before_delete(fx.app.handle(), &held, RELAY, &fx.agent(), |_| Ok(&fake))
         .await
         .unwrap_err();
     assert!(error.starts_with(HOST_UNDEPLOY_FAILED_PREFIX), "{error}");
@@ -126,4 +129,49 @@ async fn a_forgotten_machine_fails_fast_and_is_recorded() {
         .last_error
         .unwrap_or_default()
         .contains("no longer approved"));
+}
+
+#[tokio::test]
+async fn a_local_failure_after_the_machine_confirmed_is_not_a_machine_failure() {
+    let fx = Fixture::new();
+    fx.place_on(&fx.host_a);
+    let ops = fx.app.state::<HostOps>();
+    let (release, gate) = oneshot::channel();
+    let fake = fx.fake(vec![Reply::Gated(gate)]);
+    let agent = fx.agent();
+    let held = ops.hold(&agent).await.unwrap();
+    let undeploy = undeploy_before_delete(fx.app.handle(), &held, RELAY, &agent, |_| Ok(&fake));
+    tokio::pin!(undeploy);
+    tokio::select! {
+        _ = &mut undeploy => panic!("finished before the machine answered"),
+        _ = fake.frame_arrived.notified() => {}
+    }
+    // A newer operation supersedes this one while the ack is in flight.
+    ops.invalidate(&fx.agent()).unwrap();
+    release.send(()).unwrap();
+    let error = undeploy.await.unwrap_err();
+    assert_eq!(
+        error, SUPERSEDED,
+        "no forced-delete offer for a local failure"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_deploy_waits_while_a_delete_holds_the_agent() {
+    let fx = Fixture::new();
+    let ops = HostOps::default();
+    let fake = fx.fake(vec![Reply::AckOk]);
+    let held = ops.hold(&fx.agent()).await.unwrap();
+    let deploy = fx.deploy(&ops, &fake, &fx.host_a);
+    tokio::pin!(deploy);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_secs(120), &mut deploy)
+            .await
+            .is_err(),
+        "the deploy must not run while the agent is held"
+    );
+    assert!(fake.types().is_empty());
+    drop(held);
+    deploy.await.unwrap();
+    assert_eq!(fake.types()[0].1, "host.deploy");
 }

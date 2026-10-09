@@ -288,7 +288,6 @@ export function useManagedAgentActions() {
       if (!agent) return;
       const channels = await getChannelsForAction();
       const result = await stopManagedAgentWithRules({
-        showProgress: showProgressToast,
         agent,
         channels,
         relayAgents: relayAgentsQuery.data ?? [],
@@ -428,7 +427,6 @@ export function useManagedAgentActions() {
       "stop",
       async (a) => {
         await stopManagedAgentWithRules({
-          showProgress: showProgressToast,
           agent: a,
           channels: channelsQuery.data ?? [],
           relayAgents: relayAgentsQuery.data ?? [],
