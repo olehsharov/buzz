@@ -306,6 +306,17 @@ impl RespondToArg {
 #[derive(Subcommand)]
 pub enum AgentsCmd {
     /// Open a prefilled create-agent form in the owner's Buzz Desktop
+    #[command(after_help = "Examples:\n  \
+buzz agents draft-create --channel <UUID> --display-name \"Repo helper\" \\\n    \
+--run-on host:devbox --workdir ~/code/app\n  \
+buzz agents draft-create --channel <UUID> --display-name \"Resumed session\" --runtime claude \\\n    \
+--run-on host:devbox --workdir /home/me/code/app --env BUZZ_ACP_RESUME_SESSION=<session-uuid>\n  \
+buzz agents draft-create --channel <UUID> --display-name \"Builder\" \\\n    \
+--run-on my-ssh-host --provider-config host=build-1 --workdir /srv/app\n\n\
+The owner reviews and saves every draft in Buzz Desktop. When BUZZ_ACP_RESUME_SESSION \
+is set, pass --workdir with the folder the session ran in; if the session file is on \
+this computer under a different ~/.claude/projects folder, a {\"warning\": ...} line \
+is printed to stderr.")]
     DraftCreate {
         /// Current channel UUID; the new agent is added here after save
         #[arg(long)]
@@ -335,13 +346,23 @@ pub enum AgentsCmd {
         /// Avatar background color as #RRGGBB; requires --avatar-emoji
         #[arg(long)]
         avatar_color: Option<String>,
-        /// Compute provider id to run the agent on, e.g. my-ssh-host
-        #[arg(long)]
+        /// Where the agent runs: a compute provider id (e.g. my-ssh-host), or
+        /// host:<machine> for one of the owner's paired machines, where <machine> is
+        /// its hex pubkey, npub, or name (e.g. host:devbox). Desktop resolves the
+        /// machine against the owner's approved machines; an unknown or ambiguous
+        /// name leaves Run on for the owner to choose
+        #[arg(long, value_name = "PROVIDER|host:MACHINE")]
         run_on: Option<String>,
-        /// Provider setting key=value (repeatable, max 20), e.g. host=... or workdir=...;
-        /// requires --run-on
+        /// Provider setting key=value (repeatable, max 20), e.g. host=...;
+        /// requires a provider --run-on (not host:)
         #[arg(long, value_name = "KEY=VALUE")]
         provider_config: Vec<String>,
+        /// Folder the agent runs in on the --run-on target (max 300 characters; ~ is
+        /// that target's home). For a machine it fills "Folder on <machine>"; for a
+        /// provider it is sent as provider config workdir. To resume a Claude Code
+        /// session, use the folder the session ran in
+        #[arg(long, value_name = "PATH")]
+        workdir: Option<String>,
     },
     /// Open a prefilled edit-agent form in the owner's Buzz Desktop
     DraftUpdate {
@@ -2828,5 +2849,31 @@ mod tests {
             .is_err(),
             "--visibility chartreuse on update must be rejected at parse time"
         );
+    }
+
+    #[test]
+    fn agents_draft_create_parses_a_machine_target_and_folder() {
+        let cli = Cli::try_parse_from([
+            "buzz",
+            "agents",
+            "draft-create",
+            "--channel",
+            "11111111-1111-4111-8111-111111111111",
+            "--display-name",
+            "Repo helper",
+            "--run-on",
+            "host:devbox",
+            "--workdir",
+            "~/code/app",
+        ])
+        .expect("draft-create accepts --run-on host:<name> and --workdir");
+        let Cmd::Agents(AgentsCmd::DraftCreate {
+            run_on, workdir, ..
+        }) = cli.command
+        else {
+            panic!("expected agents draft-create");
+        };
+        assert_eq!(run_on.as_deref(), Some("host:devbox"));
+        assert_eq!(workdir.as_deref(), Some("~/code/app"));
     }
 }

@@ -5,7 +5,10 @@ import type {
   RespondToMode,
   UpdatePersonaInput,
 } from "@/shared/api/types";
-import type { WhereToRunDraft } from "./ui/whereToRunIntent";
+import type { AgentHost } from "@/shared/api/agentHosts";
+import { parsePubkeyInput } from "@/shared/lib/nostrUtils";
+import { normalizePubkey } from "@/shared/lib/pubkey";
+import { hostRunOnValue, type WhereToRunDraft } from "./ui/whereToRunIntent";
 
 export const AGENT_MANAGEMENT_REQUEST = "agent_management_request" as const;
 
@@ -27,8 +30,16 @@ export type AgentDraftCreateFields = {
   respondTo?: DraftRespondTo;
   envVars?: Record<string, string>;
   avatar?: { emoji: string; color: string };
+  /** A compute provider id; exclusive with `runOnHost`. */
   runOn?: string;
   providerConfig?: Record<string, string>;
+  /**
+   * One of the owner's paired machines, as a hex pubkey, npub, or machine
+   * name. Resolved against approved machines in {@link runDraftFromRequest}.
+   */
+  runOnHost?: string;
+  /** Folder on that machine; only valid with `runOnHost`. */
+  hostWorkdir?: string;
 };
 
 export type AgentManagementCreateRequest = {
@@ -84,6 +95,8 @@ const CREATE_REQUEST_KEYS = [
   "avatar",
   "runOn",
   "providerConfig",
+  "runOnHost",
+  "hostWorkdir",
 ] as const;
 
 /** Env keys an agent may draft; any other key rejects the whole request. */
@@ -103,6 +116,14 @@ const MAX_ID_CHARS = 64;
 const MAX_VALUE_CHARS = 300;
 const MAX_PROVIDER_CONFIG_ENTRIES = 20;
 const MAX_EMOJI_BYTES = 16;
+/** Longest machine name a machine's hello frame may carry. */
+const MAX_HOST_REFERENCE_CHARS = 128;
+/** Mirrors the backend's `MAX_HOST_WORKDIR_CHARS`. */
+const MAX_HOST_WORKDIR_CHARS = 300;
+// biome-ignore lint/suspicious/noControlCharactersInRegex: rejecting control characters is the point
+const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f-\u009f]/u;
+// biome-ignore lint/suspicious/noControlCharactersInRegex: NUL and line breaks are invalid in a folder path
+const INVALID_WORKDIR_CHARACTER_PATTERN = /[\u0000\n\r]/u;
 
 /** Length in Unicode code points, matching Rust's `str::chars().count()`. */
 function charCount(value: string) {
@@ -118,6 +139,22 @@ function isDraftId(value: unknown): value is string {
     typeof value === "string" &&
     value.length <= MAX_ID_CHARS &&
     DRAFT_ID_PATTERN.test(value)
+  );
+}
+
+function isHostReference(value: unknown): value is string {
+  return (
+    isText(value) &&
+    charCount(value) <= MAX_HOST_REFERENCE_CHARS &&
+    !CONTROL_CHARACTER_PATTERN.test(value)
+  );
+}
+
+function isHostWorkdir(value: unknown): value is string {
+  return (
+    isText(value) &&
+    charCount(value) <= MAX_HOST_WORKDIR_CHARS &&
+    !INVALID_WORKDIR_CHARACTER_PATTERN.test(value)
   );
 }
 
@@ -219,7 +256,24 @@ function parseCreateFields(
     model,
     respondTo,
     runOn,
+    runOnHost,
+    hostWorkdir,
   } = request;
+  // A machine target is exclusive with a provider, and a machine folder needs
+  // a machine.
+  const host =
+    runOnHost === undefined
+      ? undefined
+      : isHostReference(runOnHost) && runOn === undefined
+        ? runOnHost.trim()
+        : null;
+  const hostFolder =
+    hostWorkdir === undefined
+      ? undefined
+      : isHostWorkdir(hostWorkdir) && host !== undefined
+        ? hostWorkdir.trim()
+        : null;
+  if (host === null || hostFolder === null) return null;
   if (
     !isText(channelId) ||
     !isText(displayName) ||
@@ -258,6 +312,8 @@ function parseCreateFields(
     ...(avatar !== undefined ? { avatar } : {}),
     ...(runOn !== undefined ? { runOn } : {}),
     ...(providerConfig !== undefined ? { providerConfig } : {}),
+    ...(host !== undefined ? { runOnHost: host } : {}),
+    ...(hostFolder !== undefined ? { hostWorkdir: hostFolder } : {}),
   };
 }
 
@@ -374,20 +430,100 @@ export function createInputFromRequest(
   };
 }
 
+type DraftHost = Pick<AgentHost, "pubkey" | "name">;
+
+export type DraftHostResolution =
+  | { status: "found"; host: DraftHost }
+  | { status: "ambiguous"; count: number }
+  | { status: "unknown" };
+
+/**
+ * Find the approved machine a draft names: a hex pubkey or npub matches the
+ * machine's key; anything else matches machine names case-insensitively.
+ * More than one machine with that name is ambiguous, never a guess.
+ */
+export function resolveDraftHost(
+  reference: string,
+  hosts: readonly DraftHost[],
+): DraftHostResolution {
+  const pubkey = parsePubkeyInput(reference);
+  if (pubkey) {
+    const host = hosts.find(
+      (entry) => normalizePubkey(entry.pubkey) === pubkey,
+    );
+    return host ? { status: "found", host } : { status: "unknown" };
+  }
+  const name = reference.trim().toLowerCase();
+  const matches = hosts.filter(
+    (entry) => entry.name.trim().toLowerCase() === name,
+  );
+  if (matches.length === 1) return { status: "found", host: matches[0] };
+  return matches.length > 1
+    ? { status: "ambiguous", count: matches.length }
+    : { status: "unknown" };
+}
+
+/**
+ * Run on draft for a machine target. A machine that cannot be resolved
+ * leaves Run on unset (Create stays blocked until the owner picks one) and
+ * says what the draft asked for, so the request is never silently dropped
+ * or sent somewhere else.
+ */
+function hostRunDraft(
+  reference: string,
+  workdir: string | undefined,
+  approvedHosts: readonly DraftHost[] | null,
+): { draft: WhereToRunDraft; notice: string } {
+  const folder = workdir ? ` in “${workdir}”` : "";
+  const resolution =
+    approvedHosts === null ? null : resolveDraftHost(reference, approvedHosts);
+  if (resolution?.status === "found") {
+    return {
+      draft: {
+        runOn: hostRunOnValue(resolution.host.pubkey),
+        providerConfig: {},
+        probedProvider: null,
+        ...(workdir ? { hostWorkdir: workdir } : {}),
+      },
+      notice: `This draft asks to run on your machine “${resolution.host.name}”${folder}. Review Run on under Advanced: Buzz sends the agent's key to that machine.`,
+    };
+  }
+  const reason =
+    resolution === null
+      ? "Buzz could not load your machines"
+      : resolution.status === "ambiguous"
+        ? `${resolution.count} of your machines have that name`
+        : "it is not one of your approved machines";
+  return {
+    // Unset: no option matches, so the owner must choose before Create.
+    draft: { runOn: "", providerConfig: {}, probedProvider: null },
+    notice: `This draft asks to run on the machine “${reference}”${folder}, but ${reason}. Choose Run on under Advanced before creating.`,
+  };
+}
+
 /**
  * Initial "Run on" draft for an agent's create request. A `runOn` that is not
  * a provider discovered on this computer falls back to local with a notice,
  * so the owner never faces a silently unsubmittable or mis-targeted form.
+ * A `runOnHost` resolves against `approvedHosts` (null when they could not
+ * be loaded); see {@link hostRunDraft}.
  */
 export function runDraftFromRequest(
-  fields: Pick<AgentDraftCreateFields, "runOn" | "providerConfig">,
+  fields: Pick<
+    AgentDraftCreateFields,
+    "runOn" | "providerConfig" | "runOnHost" | "hostWorkdir"
+  >,
   discoveredProviderIds: readonly string[],
+  approvedHosts: readonly DraftHost[] | null,
 ): { draft: WhereToRunDraft; notice: string | null } {
   const local: WhereToRunDraft = {
     runOn: "local",
     providerConfig: {},
     probedProvider: null,
   };
+  if (fields.runOnHost !== undefined) {
+    return hostRunDraft(fields.runOnHost, fields.hostWorkdir, approvedHosts);
+  }
   if (fields.runOn === undefined) return { draft: local, notice: null };
   if (!discoveredProviderIds.includes(fields.runOn)) {
     return {

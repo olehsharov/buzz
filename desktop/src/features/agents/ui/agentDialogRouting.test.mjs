@@ -7,6 +7,7 @@ import { AgentDefinitionDialog } from "./AgentDefinitionDialog.tsx";
 import { AgentInstanceEditDialog } from "./AgentInstanceEditDialog.tsx";
 import { AgentRunLocationProvider } from "./AgentRunLocationContext.tsx";
 import { WhereToRunSection } from "./WhereToRunSection.tsx";
+import { runDraftFromRequest } from "../agentManagement.ts";
 
 // ── Phase 1B.3c routing pinning ─────────────────────────────────────────────
 //
@@ -223,4 +224,52 @@ test("the create router starts on this computer without a drafted run draft", ()
     });
     assert.equal(form.props.createSubmitBlocked, false);
   }
+});
+
+test("a machine draft seeds Run on and Folder and submits them as the backend", async () => {
+  const host = { pubkey: "a1".repeat(32), name: "Devbox" };
+  const { draft: initialRunDraft, notice } = runDraftFromRequest(
+    { runOnHost: "devbox", hostWorkdir: "~/code/app" },
+    [],
+    [host],
+  );
+  const submitted = [];
+  const Router = AgentDialog(createArmProps()).type;
+  const tree = renderFirstPass(
+    Router,
+    createArmProps({
+      initialRunDraft,
+      reviewNotices: [notice],
+      onSubmitDefinition: async (...args) => {
+        submitted.push(args);
+        return true;
+      },
+    }),
+  );
+
+  assert.equal(tree.props.runLocation, "remote");
+  const form = tree.props.children;
+  assert.equal(
+    form.props.createRunSection.props.draft.hostWorkdir,
+    "~/code/app",
+  );
+  assert.equal(form.props.createSubmitBlocked, false);
+  await form.props.onSubmit({ displayName: "Resumed session" });
+  assert.deepEqual(submitted[0][2], {
+    type: "host",
+    hostPubkey: host.pubkey,
+    workdir: "~/code/app",
+  });
+});
+
+test("an unresolved machine draft blocks Create until Run on is chosen", () => {
+  const { draft: initialRunDraft } = runDraftFromRequest(
+    { runOnHost: "laptop", hostWorkdir: "~/code/app" },
+    [],
+    [],
+  );
+  const Router = AgentDialog(createArmProps()).type;
+  const tree = renderFirstPass(Router, createArmProps({ initialRunDraft }));
+  assert.equal(tree.props.runLocation, null);
+  assert.equal(tree.props.children.props.createSubmitBlocked, true);
 });

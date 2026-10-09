@@ -281,7 +281,7 @@ test("a draft without access or runtime choices needs no notices", () => {
 });
 
 test("runDraftFromRequest starts local when the draft names no provider", () => {
-  assert.deepEqual(runDraftFromRequest({}, ["blox"]), {
+  assert.deepEqual(runDraftFromRequest({}, ["blox"], []), {
     draft: { runOn: "local", providerConfig: {}, probedProvider: null },
     notice: null,
   });
@@ -291,6 +291,7 @@ test("runDraftFromRequest selects a discovered provider with its config", () => 
   const { draft, notice } = runDraftFromRequest(
     { runOn: "blox", providerConfig: { workdir: "/srv/agents" } },
     ["kubernetes", "blox"],
+    [],
   );
   assert.deepEqual(draft, {
     runOn: "blox",
@@ -307,6 +308,7 @@ test("runDraftFromRequest falls back to local, visibly, for an unknown provider"
   const { draft, notice } = runDraftFromRequest(
     { runOn: "blox", providerConfig: { workdir: "/srv/agents" } },
     ["kubernetes"],
+    [],
   );
   assert.deepEqual(draft, {
     runOn: "local",

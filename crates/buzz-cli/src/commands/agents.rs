@@ -23,6 +23,7 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
             avatar_color,
             run_on,
             provider_config,
+            workdir,
         } => {
             let owner = require_owner(client)?;
             let built = build_create(
@@ -40,8 +41,12 @@ pub async fn dispatch(command: AgentsCmd, client: &BuzzClient) -> Result<(), Cli
                     avatar_color,
                     run_on,
                     provider_config,
+                    workdir,
                 },
             )?;
+            for warning in &built.warnings {
+                eprintln!("{}", json!({ "warning": warning }));
+            }
             let response = client.publish_ephemeral_event(built.event).await?;
             let mut output: serde_json::Value = serde_json::from_str(&response)
                 .map_err(|e| CliError::Other(format!("invalid relay response: {e}")))?;
