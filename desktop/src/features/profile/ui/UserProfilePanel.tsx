@@ -103,6 +103,7 @@ import { getUserProfilePanelHeaderContent } from "@/features/profile/ui/UserProf
 import { UserProfileEditAgentDialog } from "@/features/profile/ui/UserProfileEditAgentDialog";
 import { useProfileEditAgentRequest } from "@/features/profile/ui/useProfileEditAgentRequest";
 import { useConfirmDialog } from "@/shared/ui/useConfirmDialog";
+import { warnAboutChannelCleanup } from "@/features/agents/lib/channelCleanupNotice";
 export type { ProfilePanelTab, ProfilePanelView };
 
 export function UserProfilePanel({
@@ -522,6 +523,7 @@ export function UserProfilePanel({
       if (result.cancelled) return;
 
       toast.success(`Deleted ${managedAgent.name}.`);
+      warnAboutChannelCleanup(managedAgent.name, result.channelCleanup);
       onClose();
     } catch (error) {
       toast.error(
@@ -584,6 +586,10 @@ export function UserProfilePanel({
         const deletedInstances =
           await deleteManagedAgentsForPersona(resolvedPersona);
         if (deletedInstances.cancelled) return;
+        warnAboutChannelCleanup(
+          resolvedPersona.displayName,
+          deletedInstances.channelCleanup,
+        );
 
         await setPersonaActiveMutation.mutateAsync({
           id: resolvedPersona.id,
@@ -621,8 +627,11 @@ export function UserProfilePanel({
       }
 
       try {
-        await deletePersonaMutation.mutateAsync(personaToConfirm.id);
+        const channelCleanup = await deletePersonaMutation.mutateAsync(
+          personaToConfirm.id,
+        );
         toast.success(`Deleted ${personaToConfirm.displayName}.`);
+        warnAboutChannelCleanup(personaToConfirm.displayName, channelCleanup);
         setPersonaToDelete(null);
         onClose();
       } catch (error) {

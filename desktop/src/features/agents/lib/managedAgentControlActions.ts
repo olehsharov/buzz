@@ -1,5 +1,6 @@
 import { captureRelayRemovals } from "@/features/agents/managedAgentRelayCleanup";
 import { HOST_UNDEPLOY_FAILED_PREFIX } from "@/shared/api/agentHosts";
+import type { ChannelCleanupReport } from "@/shared/api/channelCleanup";
 import { sendChannelMessage } from "@/shared/api/tauri";
 import type { Channel, ManagedAgent, RelayAgent } from "@/shared/api/types";
 import type { ConfirmFn } from "@/shared/ui/useConfirmDialog";
@@ -13,7 +14,9 @@ type DeleteManagedAgentInput = {
 
 type StartManagedAgent = (pubkey: string) => Promise<unknown>;
 type StopManagedAgent = (pubkey: string) => Promise<unknown>;
-type DeleteManagedAgent = (input: DeleteManagedAgentInput) => Promise<unknown>;
+type DeleteManagedAgent = (
+  input: DeleteManagedAgentInput,
+) => Promise<ChannelCleanupReport | void>;
 
 type ManagedAgentChannelContext = {
   channels: readonly Channel[];
@@ -28,6 +31,8 @@ type ManagedAgentActionContext = ManagedAgentChannelContext & {
 export type ManagedAgentActionResult = {
   cancelled?: boolean;
   noticeMessage?: string;
+  /** Set by a completed delete: the channels the agent left or kept. */
+  channelCleanup?: ChannelCleanupReport;
 };
 
 /** Agents that run somewhere else: a provider deployment or an approved
@@ -247,12 +252,18 @@ export async function deleteManagedAgentWithRules({
 
   const isDeployedRemote =
     agent.backend.type === "provider" && agent.backendAgentId;
-  await deleteManagedAgent({
-    pubkey: agent.pubkey,
-    forceRemoteDelete: isDeployedRemote ? true : undefined,
-  });
+  return deleted(
+    await deleteManagedAgent({
+      pubkey: agent.pubkey,
+      forceRemoteDelete: isDeployedRemote ? true : undefined,
+    }),
+  );
+}
 
-  return {};
+function deleted(
+  channelCleanup: ChannelCleanupReport | void,
+): ManagedAgentActionResult {
+  return channelCleanup ? { channelCleanup } : {};
 }
 
 /**
@@ -268,8 +279,7 @@ async function deleteHostAgent(
   skipConfirm: boolean,
 ): Promise<ManagedAgentActionResult> {
   try {
-    await deleteManagedAgent({ pubkey: agent.pubkey });
-    return {};
+    return deleted(await deleteManagedAgent({ pubkey: agent.pubkey }));
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     if (!message.startsWith(HOST_UNDEPLOY_FAILED_PREFIX)) throw error;
@@ -288,7 +298,11 @@ async function deleteHostAgent(
     ) {
       return { cancelled: true };
     }
-    await deleteManagedAgent({ pubkey: agent.pubkey, forceRemoteDelete: true });
-    return {};
+    return deleted(
+      await deleteManagedAgent({
+        pubkey: agent.pubkey,
+        forceRemoteDelete: true,
+      }),
+    );
   }
 }

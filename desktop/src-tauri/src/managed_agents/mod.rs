@@ -14,6 +14,7 @@ pub(crate) use agent_description::{effective_agent_description, record_effective
 pub(crate) mod admission_test_support;
 mod backend;
 pub(crate) mod bestie_assignment;
+pub(crate) mod channel_cleanup;
 pub(crate) mod claude_config;
 pub(crate) mod community_scope;
 pub(crate) mod config_bridge;

@@ -1,7 +1,6 @@
 import { isRelayRemovedError } from "@/features/agents/managedAgentRelayCleanup";
 import { useCommunities } from "@/features/communities/useCommunities";
 import * as React from "react";
-import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import {
@@ -22,9 +21,8 @@ import {
 } from "../lib/useAgentAvailability";
 import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
 import { useChannelsQuery } from "@/features/channels/hooks";
-import { invalidateChannelMembersRosters } from "@/features/channels/rosterFreshness";
 import type { AgentPersona, Channel, ManagedAgent } from "@/shared/api/types";
-import { removeChannelMember } from "@/shared/api/tauri";
+import { describeChannelCleanupProblem } from "@/shared/api/channelCleanup";
 import { useConfirmDialog } from "@/shared/ui/useConfirmDialog";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import {
@@ -42,7 +40,6 @@ import {
 } from "../lib/instanceInputForDefinition";
 
 export function useManagedAgentActions() {
-  const queryClient = useQueryClient();
   const relayUrl = useCommunities().activeCommunity?.relayUrl;
   const { globalConfig } = useGlobalAgentConfig();
   const relayAgentsQuery = useRelayAgentsQuery();
@@ -308,25 +305,6 @@ export function useManagedAgentActions() {
     }
   }
 
-  function getAgentChannelIds(pubkey: string): string[] {
-    const normalized = normalizePubkey(pubkey);
-    const relayAgent = (relayAgentsQuery.data ?? []).find(
-      (ra) => normalizePubkey(ra.pubkey) === normalized,
-    );
-    return relayAgent?.channelIds ?? [];
-  }
-
-  async function removeAgentFromAllChannels(pubkey: string) {
-    const channelIds = getAgentChannelIds(pubkey);
-    if (channelIds.length === 0) return;
-    await Promise.allSettled(
-      channelIds.map((channelId) => removeChannelMember(channelId, pubkey)),
-    );
-    // Direct writes bypass the member mutations' invalidation; without this,
-    // the deleted agent stays in cached rosters for the freshness window.
-    await invalidateChannelMembersRosters(queryClient, channelIds);
-  }
-
   async function handleDelete(pubkey: string) {
     clearFeedback();
     try {
@@ -342,7 +320,12 @@ export function useManagedAgentActions() {
         relayAgents: relayAgentsQuery.data ?? [],
       });
       if (result.cancelled) return;
-      await removeAgentFromAllChannels(pubkey);
+      // The backend removed the agent from its channels; anything it could
+      // not remove must be visible, not swallowed.
+      const channelProblem = result.channelCleanup
+        ? describeChannelCleanupProblem(agent.name, result.channelCleanup)
+        : null;
+      if (channelProblem) setActionErrorMessage(channelProblem);
       if (logAgentPubkey === pubkey) {
         setLogAgentPubkey(null);
       }

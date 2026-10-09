@@ -312,7 +312,6 @@ for (const owner of ["agents", "profile"]) {
         [
           ...(shouldShutdown ? ["send_channel_message"] : []),
           "delete_managed_agent",
-          "remove_channel_member",
         ],
       );
       if (shouldShutdown) {
@@ -486,7 +485,7 @@ test("Agents deletion rechecks availability after channel discovery, not the cli
   });
   assert.deepEqual(
     effects().map(([name]) => name),
-    ["send_channel_message", "delete_managed_agent", "remove_channel_member"],
+    ["send_channel_message", "delete_managed_agent"],
   );
   assert.match(confirms[0], /availability is unknown/);
 });
@@ -539,3 +538,54 @@ test("successful cached snapshot remains authoritative during refetch; only sett
   });
   assert.equal(surface.current().getAvailability(PK), undefined);
 });
+
+for (const owner of ["agents", "profile"]) {
+  test(`${owner} deletion leaves channels to the backend and reports any it kept`, async () => {
+    setup();
+    handlers.set("get_presence", () => ({ [PK]: "offline" }));
+    handlers.set("delete_managed_agent", () => ({
+      channels: {
+        removed: [{ id: "channel", name: "agents" }],
+        failed: [
+          {
+            channel_id: "locked",
+            channel_name: "ops",
+            error: "relay rejected event: not a member",
+          },
+        ],
+        lookup_error: null,
+      },
+    }));
+    const surface = mount(owner);
+    await waitFor(() =>
+      assert.equal(surface.current().getAvailability(PK), "offline"),
+    );
+    commands.length = 0;
+    const result = await runToCompletion(() =>
+      owner === "agents"
+        ? surface.current().handleDelete(PK)
+        : surface.current().deleteManagedAgentRecord(agent),
+    );
+    // The frontend no longer publishes removals itself.
+    assert.deepEqual(
+      effects().map(([name]) => name),
+      ["delete_managed_agent"],
+    );
+    if (owner === "agents") {
+      await waitFor(() =>
+        assert.match(
+          surface.current().actionErrorMessage ?? "",
+          /Remote is still a member of #ops \(relay rejected event: not a member\)/,
+        ),
+      );
+    } else {
+      assert.deepEqual(result.channelCleanup.failed, [
+        {
+          channelId: "locked",
+          channelName: "ops",
+          error: "relay rejected event: not a member",
+        },
+      ]);
+    }
+  });
+}

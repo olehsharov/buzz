@@ -1,31 +1,27 @@
 import * as React from "react";
-import { useQueryClient } from "@tanstack/react-query";
 
 import {
   deleteManagedAgentWithRules,
   type ManagedAgentActionResult,
 } from "@/features/agents/lib/managedAgentControlActions";
-import { invalidateChannelMembersRosters } from "@/features/channels/rosterFreshness";
-import { removeChannelMember } from "@/shared/api/tauri";
+import {
+  type ChannelCleanupReport,
+  mergeChannelCleanup,
+} from "@/shared/api/channelCleanup";
 import type {
   AgentPersona,
   Channel,
   ManagedAgent,
   RelayAgent,
 } from "@/shared/api/types";
-import { getRelayAgentChannelIds } from "@/features/profile/ui/UserProfilePanelUtils";
 
 type DeleteManagedAgentRulesContext = Omit<
   Parameters<typeof deleteManagedAgentWithRules>[0],
   "agent"
 >;
 
-type DeleteProfileManagedAgentContext = DeleteManagedAgentRulesContext & {
-  removeAgentFromAllChannels: (pubkey: string) => Promise<void>;
-};
-
 type DeleteProfileManagedAgentsForPersonaContext =
-  DeleteProfileManagedAgentContext & {
+  DeleteManagedAgentRulesContext & {
     managedAgents: readonly ManagedAgent[];
     selectedAgent?: ManagedAgent;
   };
@@ -40,6 +36,11 @@ type UseProfileAgentDeletionInput = {
   relayAgents?: readonly RelayAgent[];
 };
 
+/**
+ * Profile-panel agent deletion. The backend removes each deleted agent from
+ * every channel it is in; the result carries what it could not remove so
+ * the caller can say so.
+ */
 export function useProfileAgentDeletion({
   confirm,
   channels,
@@ -49,55 +50,18 @@ export function useProfileAgentDeletion({
   getAvailability,
   relayAgents,
 }: UseProfileAgentDeletionInput) {
-  const queryClient = useQueryClient();
-  const removeAgentFromAllChannels = React.useCallback(
-    async (agentPubkey: string) => {
-      const normalizedPubkey = agentPubkey.toLowerCase();
-      const channelIds = new Set(
-        getRelayAgentChannelIds(relayAgents, agentPubkey),
-      );
-      for (const channel of channels ?? []) {
-        if (
-          channel.memberPubkeys.some(
-            (memberPubkey) => memberPubkey.toLowerCase() === normalizedPubkey,
-          )
-        ) {
-          channelIds.add(channel.id);
-        }
-      }
-      if (channelIds.size === 0) return;
-      await Promise.allSettled(
-        [...channelIds].map((channelId) =>
-          removeChannelMember(channelId, agentPubkey),
-        ),
-      );
-      // Direct writes bypass the member mutations' invalidation; without
-      // this, the deleted agent stays in cached rosters for the freshness
-      // window.
-      await invalidateChannelMembersRosters(queryClient, channelIds);
-    },
-    [channels, queryClient, relayAgents],
-  );
-
   const deleteManagedAgentRecord = React.useCallback(
     (agentToDelete: ManagedAgent) =>
-      deleteProfileManagedAgent(agentToDelete, {
+      deleteManagedAgentWithRules({
+        agent: agentToDelete,
         channels: channels ?? [],
         confirm,
         deleteManagedAgent,
         getAvailability,
         relayAgents: relayAgents ?? [],
-        removeAgentFromAllChannels,
         skipRemoteDeleteConfirm: true,
       }),
-    [
-      channels,
-      confirm,
-      deleteManagedAgent,
-      getAvailability,
-      relayAgents,
-      removeAgentFromAllChannels,
-    ],
+    [channels, confirm, deleteManagedAgent, getAvailability, relayAgents],
   );
 
   const deleteManagedAgentsForPersona = React.useCallback(
@@ -109,7 +73,6 @@ export function useProfileAgentDeletion({
         managedAgents: managedAgents ?? [],
         getAvailability,
         relayAgents: relayAgents ?? [],
-        removeAgentFromAllChannels,
         selectedAgent: managedAgent,
       }),
     [
@@ -120,30 +83,13 @@ export function useProfileAgentDeletion({
       managedAgents,
       getAvailability,
       relayAgents,
-      removeAgentFromAllChannels,
     ],
   );
 
   return {
     deleteManagedAgentRecord,
     deleteManagedAgentsForPersona,
-    removeAgentFromAllChannels,
   };
-}
-
-export async function deleteProfileManagedAgent(
-  agent: ManagedAgent,
-  context: DeleteProfileManagedAgentContext,
-): Promise<ManagedAgentActionResult> {
-  const { removeAgentFromAllChannels, ...deleteContext } = context;
-  const result = await deleteManagedAgentWithRules({
-    agent,
-    ...deleteContext,
-  });
-  if (result.cancelled) return result;
-
-  await removeAgentFromAllChannels(agent.pubkey);
-  return result;
 }
 
 export async function deleteProfileManagedAgentsForPersona(
@@ -163,10 +109,16 @@ export async function deleteProfileManagedAgentsForPersona(
     agentsByPubkey.set(selectedAgent.pubkey, selectedAgent);
   }
 
+  const reports: (ChannelCleanupReport | undefined)[] = [];
   for (const agent of agentsByPubkey.values()) {
-    const result = await deleteProfileManagedAgent(agent, deleteContext);
+    const result = await deleteManagedAgentWithRules({
+      agent,
+      ...deleteContext,
+    });
     if (result.cancelled) return result;
+    reports.push(result.channelCleanup);
   }
 
-  return {};
+  const channelCleanup = mergeChannelCleanup(reports);
+  return channelCleanup ? { channelCleanup } : {};
 }

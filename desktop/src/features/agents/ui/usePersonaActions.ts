@@ -64,6 +64,7 @@ import {
   buildInstanceInputForDefinition,
   type BackendIntent,
 } from "../lib/instanceInputForDefinition";
+import { warnAboutChannelCleanup } from "../lib/channelCleanupNotice";
 
 type PersonaFeedbackSurface = "catalog" | "library";
 
@@ -283,8 +284,11 @@ export function usePersonaActions() {
   async function handleDelete(persona: AgentPersona) {
     clearFeedback("library");
     try {
-      await deletePersonaMutation.mutateAsync(persona.id);
+      const channelCleanup = await deletePersonaMutation.mutateAsync(
+        persona.id,
+      );
       setPersonaNoticeMessage(`Deleted ${persona.displayName}.`);
+      warnAboutChannelCleanup(persona.displayName, channelCleanup);
       setPersonaToDelete(null);
     } catch (error) {
       setPersonaErrorMessage(

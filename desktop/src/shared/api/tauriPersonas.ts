@@ -1,3 +1,9 @@
+import { beginChannelMembershipWrite } from "@/shared/api/channelMembershipWrites";
+import {
+  type ChannelCleanupReport,
+  fromRawChannelCleanup,
+  type RawChannelCleanupReport,
+} from "@/shared/api/channelCleanup";
 import { invokeTauri } from "@/shared/api/tauri";
 import type {
   AgentPersona,
@@ -185,8 +191,16 @@ function fromRawPublicationResult(
   };
 }
 
-export async function deletePersona(id: string): Promise<void> {
-  await invokeTauri("delete_persona", { id });
+/** Delete a persona and its agents. Each agent is first removed from every
+ * channel it is a member of; the report says which channels kept one. */
+export async function deletePersona(id: string): Promise<ChannelCleanupReport> {
+  const record = beginChannelMembershipWrite();
+  const outcome = await invokeTauri<{
+    channels?: RawChannelCleanupReport;
+  } | null>("delete_persona", { id });
+  const channels = fromRawChannelCleanup(outcome?.channels);
+  for (const channel of channels.removed) record(channel.id);
+  return channels;
 }
 
 export async function setPersonaActive(

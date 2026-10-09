@@ -1,6 +1,11 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { beginChannelMembershipWrite } from "@/shared/api/channelMembershipWrites";
 import {
+  type ChannelCleanupReport,
+  fromRawChannelCleanup,
+  type RawChannelCleanupReport,
+} from "@/shared/api/channelCleanup";
+import {
   fromRawInstallRuntimeResult,
   type RawInstallRuntimeResult,
 } from "@/shared/api/installTypes";
@@ -798,14 +803,22 @@ export async function createManagedAgent(input: CreateManagedAgentInput) {
   };
 }
 
+/** Delete an agent. The backend first removes it from every channel it is a
+ * member of; the report says which channels it could not leave. */
 export async function deleteManagedAgent(
   pubkey: string,
   forceRemoteDelete?: boolean,
-): Promise<void> {
-  await invokeTauri("delete_managed_agent", {
+): Promise<ChannelCleanupReport> {
+  const record = beginChannelMembershipWrite();
+  const outcome = await invokeTauri<{
+    channels?: RawChannelCleanupReport;
+  } | null>("delete_managed_agent", {
     pubkey,
     forceRemoteDelete: forceRemoteDelete ?? null,
   });
+  const channels = fromRawChannelCleanup(outcome?.channels);
+  for (const channel of channels.removed) record(channel.id);
+  return channels;
 }
 
 export async function getManagedAgentLog(pubkey: string, lineCount?: number) {
