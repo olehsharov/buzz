@@ -25,6 +25,7 @@ import { useChannelsQuery } from "@/features/channels/hooks";
 import { invalidateChannelMembersRosters } from "@/features/channels/rosterFreshness";
 import type { AgentPersona, Channel, ManagedAgent } from "@/shared/api/types";
 import { removeChannelMember } from "@/shared/api/tauri";
+import { useConfirmDialog } from "@/shared/ui/useConfirmDialog";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import {
   deleteManagedAgentWithRules,
@@ -51,6 +52,7 @@ export function useManagedAgentActions() {
   const startMutation = useStartManagedAgentMutation();
   const stopMutation = useStopManagedAgentMutation();
   const deleteMutation = useDeleteManagedAgentMutation();
+  const { confirm, confirmDialog } = useConfirmDialog();
   const createAgentMutation = useCreateManagedAgentMutation();
   const availableRuntimesQuery = useAvailableAcpRuntimes();
   const startOnLaunchMutation = useSetManagedAgentStartOnAppLaunchMutation();
@@ -334,6 +336,7 @@ export function useManagedAgentActions() {
       const result = await deleteManagedAgentWithRules({
         agent,
         channels,
+        confirm,
         deleteManagedAgent: deleteMutation.mutateAsync,
         getAvailability,
         relayAgents: relayAgentsQuery.data ?? [],
@@ -399,9 +402,11 @@ export function useManagedAgentActions() {
     action: (agent: ManagedAgent) => Promise<unknown>,
   ): Promise<boolean> {
     if (targets.length === 0) return false;
-    const confirmed = window.confirm(
-      `${confirmLabel} ${targets.length} agent${targets.length === 1 ? "" : "s"}?`,
-    );
+    const confirmed = await confirm({
+      title: `${confirmLabel} ${targets.length} agent${targets.length === 1 ? "" : "s"}?`,
+      description: targets.map((agent) => agent.name).join(", "),
+      confirmLabel,
+    });
     if (!confirmed) return false;
     clearFeedback();
     const results = await Promise.allSettled(targets.map(action));
@@ -446,6 +451,7 @@ export function useManagedAgentActions() {
       : null;
 
   return {
+    confirmDialog,
     relayAgentsQuery,
     managedAgentsQuery,
     managedAgentLogQuery,

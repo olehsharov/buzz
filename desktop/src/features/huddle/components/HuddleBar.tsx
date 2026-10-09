@@ -36,6 +36,8 @@ import { MicControls, SpeakerControls } from "./MicControls";
 import { HuddleParticipantsControl } from "./ParticipantList";
 import { beginChannelMembershipWrite } from "@/shared/api/channelMembershipWrites";
 import { truncateNpub } from "@/shared/lib/pubkey";
+import { useConfirmDialog } from "@/shared/ui/useConfirmDialog";
+import { REMOVE_AGENT_FROM_HUDDLE } from "./removeAgentConfirm";
 
 // Mirrors HuddleState in src-tauri/src/huddle/mod.rs.
 type HuddleState = {
@@ -182,6 +184,7 @@ export function HuddleBar({
 
   const isPttMode = voiceInputMode === "push_to_talk";
   const [state, setState] = React.useState<HuddleState | null>(null);
+  const { confirm, confirmDialog } = useConfirmDialog();
   const [renderedState, setRenderedState] = React.useState<HuddleState | null>(
     null,
   );
@@ -715,10 +718,7 @@ export function HuddleBar({
                 pubkey: currentPubkey,
               }}
               onRemoveAgent={async (pubkey) => {
-                const confirmed = window.confirm(
-                  "Remove this agent from the huddle?",
-                );
-                if (!confirmed) return;
+                if (!(await confirm(REMOVE_AGENT_FROM_HUDDLE))) return;
                 const record = beginChannelMembershipWrite();
                 try {
                   await invoke("remove_agent_from_huddle", {
@@ -894,6 +894,7 @@ export function HuddleBar({
           modelStatus.tts !== "ready" &&
           `, TTS model ${modelStatus.tts}`}
       </output>
+      {confirmDialog}
     </div>
   );
 }

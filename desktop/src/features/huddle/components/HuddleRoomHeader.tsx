@@ -5,10 +5,12 @@ import * as React from "react";
 import { useProfileQuery, useSelfProfileCache } from "@/features/profile/hooks";
 import { beginChannelMembershipWrite } from "@/shared/api/channelMembershipWrites";
 import { useIdentityQuery } from "@/shared/api/hooks";
+import { useConfirmDialog } from "@/shared/ui/useConfirmDialog";
 import { useHuddle, useHuddleLevels } from "../HuddleContext";
 import { useHuddleParticipantRoster } from "../hooks/useHuddleParticipantRoster";
 import type { HuddleAgentVoiceSettings } from "./AgentVoiceMenu";
 import { HuddleParticipantsControl } from "./ParticipantList";
+import { REMOVE_AGENT_FROM_HUDDLE } from "./removeAgentConfirm";
 
 type HuddleRosterState = {
   phase:
@@ -38,6 +40,7 @@ export function HuddleRoomHeader() {
   const profileQuery = useProfileQuery();
   const selfProfileCache = useSelfProfileCache();
   const [state, setState] = React.useState<HuddleRosterState | null>(null);
+  const { confirm, confirmDialog } = useConfirmDialog();
   const currentPubkey = identityQuery.data?.pubkey ?? null;
   const lifecycleParticipants = useHuddleParticipantRoster({
     parentChannelId: state?.parent_channel_id ?? null,
@@ -56,7 +59,7 @@ export function HuddleRoomHeader() {
   }, [currentPubkey, isMuted, micConnected, micLevel, speakerLevels]);
   const handleRemoveAgent = React.useCallback(
     async (pubkey: string) => {
-      if (!window.confirm("Remove this agent from the huddle?")) return;
+      if (!(await confirm(REMOVE_AGENT_FROM_HUDDLE))) return;
       const record = beginChannelMembershipWrite();
       try {
         await invoke("remove_agent_from_huddle", {
@@ -82,7 +85,7 @@ export function HuddleRoomHeader() {
         console.error("Failed to remove agent from huddle:", error);
       }
     },
-    [state?.ephemeral_channel_id],
+    [confirm, state?.ephemeral_channel_id],
   );
 
   React.useEffect(() => {
@@ -137,6 +140,7 @@ export function HuddleRoomHeader() {
           pubkey: currentPubkey,
         }}
       />
+      {confirmDialog}
     </header>
   );
 }

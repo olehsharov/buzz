@@ -42,6 +42,8 @@ import {
 import { SetupStep } from "./SetupStep";
 import type { HarnessConnectionMethod } from "./harnessConnectionOptions";
 import type { DefaultConfigDraft } from "./types";
+import { ABANDON_PREVIOUS_IDENTITY } from "./abandonIdentityConfirm";
+import { useConfirmDialog } from "@/shared/ui/useConfirmDialog";
 
 export type MachineOnboardingPage =
   | "identity"
@@ -79,6 +81,7 @@ export function MachineOnboardingFlow({
     React.useState<OnboardingTransitionDirection>("forward");
   const [error, setError] = React.useState<string | null>(null);
   const [isPending, setIsPending] = React.useState(false);
+  const { confirm, confirmDialog } = useConfirmDialog();
   const [identityWasImported, setIdentityWasImported] = React.useState(false);
   const [keyImportStage, setKeyImportStage] =
     React.useState<NostrKeyImportStage>("key-entry");
@@ -187,9 +190,7 @@ export function MachineOnboardingFlow({
   }, [continueWithRecoveredIdentity, queryClient]);
 
   const replaceLostIdentity = React.useCallback(async () => {
-    const confirmed = window.confirm(
-      "This will create a new identity and abandon your previous key. This cannot be undone. Continue?",
-    );
+    const confirmed = await confirm(ABANDON_PREVIOUS_IDENTITY);
     if (!confirmed) return;
 
     setIsPending(true);
@@ -211,7 +212,7 @@ export function MachineOnboardingFlow({
     } finally {
       setIsPending(false);
     }
-  }, [queryClient]);
+  }, [confirm, queryClient]);
 
   const importExistingIdentity = React.useCallback(
     async (nsec: string, password?: string) => {
@@ -649,6 +650,7 @@ export function MachineOnboardingFlow({
           readyRuntimeIds={readyRuntimeIds}
         />
       )}
+      {confirmDialog}
     </OnboardingCard>
   );
 }

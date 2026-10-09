@@ -274,6 +274,9 @@ test("deleting a machine agent asks the machine first, and only forces after the
     channels: [],
     relayAgents: [],
     getAvailability: () => "online",
+    confirm: async () => {
+      throw new Error("no confirmation expected");
+    },
   };
   const prefixed = `${HOST_UNDEPLOY_FAILED_PREFIX}The machine did not answer in time.`;
 
@@ -286,11 +289,13 @@ test("deleting a machine agent asks the machine first, and only forces after the
   });
   assert.deepEqual(calls, [{ pubkey: "deadbeef".repeat(8) }]);
 
-  // Machine unreachable, user declines: no forced delete.
+  // Machine unreachable, user declines: no forced delete. The answer is
+  // asynchronous (an in-app dialog); a pending Promise must never count as
+  // agreement, which is how `!window.confirm()` failed in the Tauri build.
   calls = [];
-  globalThis.window = { confirm: () => false };
   const declined = await deleteManagedAgentWithRules({
     ...deleteContext,
+    confirm: async () => false,
     agent: agent(HOST_AGENT),
     deleteManagedAgent: async (input) => {
       calls.push(input);
@@ -302,9 +307,9 @@ test("deleting a machine agent asks the machine first, and only forces after the
 
   // Machine unreachable, user agrees: retried with force.
   calls = [];
-  globalThis.window = { confirm: () => true };
   await deleteManagedAgentWithRules({
     ...deleteContext,
+    confirm: async () => true,
     agent: agent(HOST_AGENT),
     deleteManagedAgent: async (input) => {
       calls.push(input);
@@ -327,5 +332,4 @@ test("deleting a machine agent asks the machine first, and only forces after the
     }),
     /agent not found/,
   );
-  delete globalThis.window;
 });

@@ -102,6 +102,7 @@ import { UserProfilePanelFrame } from "@/features/profile/ui/UserProfilePanelFra
 import { getUserProfilePanelHeaderContent } from "@/features/profile/ui/UserProfilePanelHeaderContent";
 import { UserProfileEditAgentDialog } from "@/features/profile/ui/UserProfileEditAgentDialog";
 import { useProfileEditAgentRequest } from "@/features/profile/ui/useProfileEditAgentRequest";
+import { useConfirmDialog } from "@/shared/ui/useConfirmDialog";
 export type { ProfilePanelTab, ProfilePanelView };
 
 export function UserProfilePanel({
@@ -245,6 +246,7 @@ export function UserProfilePanel({
   const startAgentMutation = useStartManagedAgentMutation();
   const stopAgentMutation = useStopManagedAgentMutation();
   const deleteAgentMutation = useDeleteManagedAgentMutation();
+  const { confirm, confirmDialog } = useConfirmDialog();
   const startOnLaunchMutation = useSetManagedAgentStartOnAppLaunchMutation();
   const createPersonaMutation = useCreatePersonaMutation();
   const updatePersonaMutation = useUpdatePersonaMutation();
@@ -412,6 +414,7 @@ export function UserProfilePanel({
   }, [openResolvedPersonaEditor, setEditAgentOpen]);
   const { deleteManagedAgentRecord, deleteManagedAgentsForPersona } =
     useProfileAgentDeletion({
+      confirm,
       channels: channelsQuery.data,
       deleteManagedAgent: deleteAgentMutation.mutateAsync,
       managedAgent,
@@ -947,6 +950,7 @@ export function UserProfilePanel({
   ) : null;
   const personaDialogs = (
     <>
+      {confirmDialog}
       <UserProfilePersonaDialogs
         cardMintTarget={cardMint.target}
         createError={

@@ -31,6 +31,7 @@ type DeleteProfileManagedAgentsForPersonaContext =
   };
 
 type UseProfileAgentDeletionInput = {
+  confirm: DeleteManagedAgentRulesContext["confirm"];
   channels?: readonly Channel[];
   deleteManagedAgent: DeleteManagedAgentRulesContext["deleteManagedAgent"];
   managedAgent?: ManagedAgent;
@@ -40,6 +41,7 @@ type UseProfileAgentDeletionInput = {
 };
 
 export function useProfileAgentDeletion({
+  confirm,
   channels,
   deleteManagedAgent,
   managedAgent,
@@ -81,6 +83,7 @@ export function useProfileAgentDeletion({
     (agentToDelete: ManagedAgent) =>
       deleteProfileManagedAgent(agentToDelete, {
         channels: channels ?? [],
+        confirm,
         deleteManagedAgent,
         getAvailability,
         relayAgents: relayAgents ?? [],
@@ -89,6 +92,7 @@ export function useProfileAgentDeletion({
       }),
     [
       channels,
+      confirm,
       deleteManagedAgent,
       getAvailability,
       relayAgents,
@@ -100,6 +104,7 @@ export function useProfileAgentDeletion({
     (persona: AgentPersona) =>
       deleteProfileManagedAgentsForPersona(persona, {
         channels: channels ?? [],
+        confirm,
         deleteManagedAgent,
         managedAgents: managedAgents ?? [],
         getAvailability,
@@ -109,6 +114,7 @@ export function useProfileAgentDeletion({
       }),
     [
       channels,
+      confirm,
       deleteManagedAgent,
       managedAgent,
       managedAgents,

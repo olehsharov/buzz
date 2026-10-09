@@ -699,6 +699,7 @@ export function AgentsView() {
           e.target.value = "";
         }}
       />
+      {agents.confirmDialog}
     </>
   );
 }
