@@ -92,6 +92,7 @@ import { buildRuntimeModelProviderPayload } from "./agentDefinitionSubmitPayload
 import { AgentDefinitionDialogFooter } from "./AgentDefinitionDialogFooter";
 import { AgentDefinitionDialogShell } from "./AgentDefinitionDialogShell";
 import { AddCustomHarnessDialog } from "./AddCustomHarnessDialog";
+import { HostDeployError } from "../hosts/HostRepairNotice";
 import {
   ADD_CUSTOM_HARNESS_OPTION,
   runtimeDropdownAction,
@@ -1005,7 +1006,11 @@ export function AgentDefinitionDialog({
         </div>
 
         {error ? (
-          <p className="text-sm text-destructive">{error.message}</p>
+          <HostDeployError
+            className="text-sm text-destructive"
+            message={error.message}
+            testId="agent-definition-error"
+          />
         ) : null}
       </div>
     </form>

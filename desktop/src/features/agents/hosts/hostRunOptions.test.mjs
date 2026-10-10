@@ -5,11 +5,13 @@ import {
   buildHostRunOnOptions,
   describeHost,
   describeHostClaude,
+  describeHostSetupProblem,
   excludeMachineAgents,
   formatHostLastSeen,
   hostAcceptsDeploys,
   hostAvailability,
   hostForAgent,
+  isHostToolMissingError,
 } from "./hostRunOptions.ts";
 import {
   canSubmitWhereToRun,
@@ -147,4 +149,66 @@ test("claude state: unknown sign-in is not shown as ready", () => {
     describeHostClaude(status(true, false)),
     "Claude: not signed in",
   );
+});
+
+const READY = {
+  claude: { installed: true, authOk: null },
+  tools: { node: true, claudeAgentAcp: true, buzzAcp: true },
+};
+
+test("setup problem: a machine missing the Claude adapter says so before a deploy", () => {
+  const noAdapter = {
+    ...READY,
+    tools: { ...READY.tools, claudeAgentAcp: false },
+  };
+  assert.equal(
+    describeHostSetupProblem(noAdapter),
+    "Missing Claude adapter — re-run the install snippet",
+  );
+  assert.equal(
+    describeHostSetupProblem({
+      claude: { installed: false, authOk: null },
+      tools: { node: false, claudeAgentAcp: false, buzzAcp: true },
+    }),
+    "Missing Claude adapter, Claude Code, Node.js — re-run the install snippet",
+  );
+  assert.equal(describeHostSetupProblem(READY), null);
+  // Not reported yet: nothing to go on, so no warning.
+  assert.equal(describeHostSetupProblem(null), null);
+
+  // The Run-on picker carries it on the machine's option, still pickable.
+  const [option] = buildHostRunOnOptions(
+    [host(A, "alpha", { status: { ...noAdapter, receivedAt: NOW / 1000 } })],
+    { [A]: "online" },
+    true,
+    NOW,
+  );
+  assert.equal(
+    option.description,
+    "Linux · x86_64 · Online · Missing Claude adapter — re-run the install snippet",
+  );
+  assert.equal(option.disabled, false);
+  const [ready] = buildHostRunOnOptions(
+    [host(A, "alpha", { status: { ...READY, receivedAt: NOW / 1000 } })],
+    { [A]: "online" },
+    true,
+    NOW,
+  );
+  assert.equal(ready.description, "Linux · x86_64 · Online");
+});
+
+test("deploy refusals for a missing tool are recognised", () => {
+  assert.equal(
+    isHostToolMissingError(
+      'The machine refused: agent command "claude-agent-acp" is not installed on this host (searched: /home/u/.local/bin); re-run the install snippet from Buzz desktop (Settings → Machines) on this machine',
+    ),
+    true,
+  );
+  assert.equal(
+    isHostToolMissingError(
+      "The machine refused: buzz-acp is not installed on this host",
+    ),
+    true,
+  );
+  assert.equal(isHostToolMissingError("The machine did not answer."), false);
 });

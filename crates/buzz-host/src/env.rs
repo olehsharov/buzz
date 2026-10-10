@@ -137,8 +137,8 @@ pub fn build_agent_record(
         // A desktop path is meaningless here; resolve by name.
         let name = command.rsplit('/').next().unwrap_or(command);
         if crate::tools::which(name, path).is_none() {
-            return Err(HostError::Invalid(format!(
-                "agent command {name:?} is not installed on this host"
+            return Err(HostError::Invalid(crate::tools::not_installed_message(
+                name, path,
             )));
         }
         env.insert("BUZZ_ACP_AGENT_COMMAND".into(), name.to_string());
@@ -299,6 +299,21 @@ pub(crate) mod tests {
         assert!(
             missing.is_err(),
             "missing buzz-acp / agent command is refused"
+        );
+
+        // A missing agent command says where it looked and how to fix it.
+        let mut no_adapter = deploy_request(&agent, &owner, "r");
+        if let Some(l) = no_adapter.launch.as_mut() {
+            l.command = Some("/usr/local/bin/claude-agent-acp".into());
+        }
+        let err = build_agent_record(&no_adapter, &owner_hex, home, &path)
+            .expect_err("missing adapter")
+            .to_string();
+        assert!(
+            err.contains("\"claude-agent-acp\" is not installed on this host")
+                && err.contains(&format!("(searched: {path})"))
+                && err.contains("re-run the install snippet from Buzz desktop"),
+            "{err}"
         );
     }
 }

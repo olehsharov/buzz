@@ -34,6 +34,8 @@ pub mod connection;
 pub mod error;
 /// WebSocket message handlers for NIP-01 client commands.
 pub mod handlers;
+/// `/host/install.sh` served with the relay's own base URL.
+pub mod host_installer;
 /// Stateless HMAC-signed relay invite tokens (mint/verify).
 pub mod invite_token;
 /// Fixed-schema evidence for the relay's earliest startup steps.

@@ -406,7 +406,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         let admin_index = admin_web_dir.as_ref().map(|dir| dir.join("index.html"));
         let admin_files = admin_web_dir.map(ServeDir::new);
         let web_index = web_dir.as_ref().map(|dir| dir.join("index.html"));
-        let web_files = web_dir.map(ServeDir::new);
+        let web_files = web_dir.clone().map(ServeDir::new);
         let serve_git_web_gui = state.config.serve_git_web_gui;
         let fallback_state = state.clone();
         let spa_fallback = tower::service_fn(move |req: axum::extract::Request| {
@@ -414,6 +414,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             let admin_files = admin_files.clone();
             let web_index = web_index.clone();
             let web_files = web_files.clone();
+            let web_dir = web_dir.clone();
             let state = fallback_state.clone();
             async move {
                 let path = req.uri().path();
@@ -433,7 +434,18 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                     return Ok(with_admin_csp(StatusCode::NOT_FOUND.into_response()));
                 }
 
-                if let (Some(index), Some(files)) = (web_index, web_files) {
+                if let (Some(index), Some(files), Some(dir)) = (web_index, web_files, web_dir) {
+                    if path == crate::host_installer::INSTALLER_PATH
+                        && matches!(
+                            *req.method(),
+                            axum::http::Method::GET | axum::http::Method::HEAD
+                        )
+                    {
+                        let relay_url = &state.config.relay_url;
+                        return Ok(
+                            crate::host_installer::serve(&dir, req.headers(), relay_url).await
+                        );
+                    }
                     if is_public_static_path(path) {
                         return files.oneshot(req).await.map(IntoResponse::into_response);
                     }
@@ -1929,7 +1941,7 @@ mod tests {
         write_bundle(web_dir.path());
         let host_dir = web_dir.path().join("host");
         std::fs::create_dir_all(&host_dir).expect("host dir");
-        let script = "#!/usr/bin/env bash\necho install\n";
+        let script = "#!/usr/bin/env bash\nBASE='__BUZZ_HOST_BASE__'\n";
         let tarball: &[u8] = &[0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad];
         std::fs::write(host_dir.join("install.sh"), script).expect("install.sh");
         std::fs::write(
@@ -1970,7 +1982,14 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body");
-        assert_eq!(&body[..], script.as_bytes());
+        // Served with this relay's own base filled in, so `curl | bash`
+        // needs no --base.
+        let body = String::from_utf8(body.to_vec()).expect("utf-8");
+        assert!(
+            body.starts_with("#!/usr/bin/env bash\nBASE='http")
+                && body.ends_with("://public.example/host'\n"),
+            "{body}"
+        );
 
         let response = spa_response(
             state.clone(),

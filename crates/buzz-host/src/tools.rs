@@ -7,13 +7,28 @@ use std::path::{Path, PathBuf};
 
 use crate::protocol::{ClaudeStatus, ToolsStatus};
 
+/// Per-user install dirs searched first, relative to `$HOME`.
+/// `.local/share/node/bin` is where the host installer puts Node and its
+/// global npm packages (`claude-agent-acp`, `claude`).
+pub const USER_TOOL_DIRS: &[&str] = &[
+    ".local/bin",
+    ".local/share/node/bin",
+    ".npm-global/bin",
+    ".cargo/bin",
+    ".bun/bin",
+];
+
+/// What to do when a tool the host needs is missing.
+pub const INSTALL_FIX: &str =
+    "re-run the install snippet from Buzz desktop (Settings → Machines) on this machine";
+
 /// The search `PATH` for agents and tool checks: the user's install dirs,
 /// the directory of the running binary, then the inherited `PATH`, then
 /// system defaults. Duplicates are removed, order is preserved.
 pub fn agent_path() -> String {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Ok(home) = crate::store::home_dir() {
-        for rel in [".local/bin", ".npm-global/bin", ".cargo/bin", ".bun/bin"] {
+        for rel in USER_TOOL_DIRS {
             dirs.push(home.join(rel));
         }
     }
@@ -80,6 +95,19 @@ fn is_executable(p: &Path) -> bool {
 #[cfg(not(unix))]
 fn is_executable(p: &Path) -> bool {
     p.is_file()
+}
+
+/// The refusal for a tool missing from `path`: the directories searched and
+/// how to fix it.
+pub fn not_installed_message(name: &str, path: &str) -> String {
+    let searched: Vec<String> = std::env::split_paths(path)
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .filter(|dir| !dir.is_empty())
+        .collect();
+    format!(
+        "agent command {name:?} is not installed on this host (searched: {}); {INSTALL_FIX}",
+        searched.join(", ")
+    )
 }
 
 /// Current tool availability.
@@ -163,5 +191,31 @@ mod tests {
         assert_eq!(which("tool", &path), Some(exe));
         assert_eq!(which("plain", &path), None);
         assert_eq!(which("missing", &path), None);
+    }
+
+    /// The installer puts Node's global bins (claude-agent-acp, claude) in
+    /// `~/.local/share/node/bin`; the daemon must find them there even when
+    /// the `~/.local/bin` links are missing.
+    #[cfg(unix)]
+    #[test]
+    fn agent_path_searches_the_installer_node_bin() {
+        let home = crate::store::home_dir().expect("HOME");
+        let path = agent_path();
+        let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+        for rel in [".local/bin", ".local/share/node/bin"] {
+            assert!(dirs.contains(&home.join(rel)), "{rel} missing from {path}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn not_installed_names_the_dirs_searched_and_the_fix() {
+        let message = not_installed_message("claude-agent-acp", "/a/bin:/b/node/bin");
+        assert_eq!(
+            message,
+            "agent command \"claude-agent-acp\" is not installed on this host \
+             (searched: /a/bin, /b/node/bin); re-run the install snippet from Buzz \
+             desktop (Settings → Machines) on this machine"
+        );
     }
 }
