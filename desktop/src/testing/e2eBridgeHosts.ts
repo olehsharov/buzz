@@ -15,6 +15,8 @@ export type MockAgentHostConfig = {
   online?: boolean;
   /** Seconds since the last status frame (drives "last seen"). */
   lastSeenSecsAgo?: number;
+  /** The machine reports no claude-agent-acp (needs lastSeenSecsAgo). */
+  missingClaudeAdapter?: boolean;
 };
 
 type RawHost = {
@@ -74,7 +76,11 @@ function toRaw(config: MockAgentHostConfig, relayUrl: string): RawHost {
             version: "0.1.0",
             agents: [],
             claude: { installed: true, auth_ok: true },
-            tools: { node: true, claude_agent_acp: true, buzz_acp: true },
+            tools: {
+              node: true,
+              claude_agent_acp: !config.missingClaudeAdapter,
+              buzz_acp: true,
+            },
             received_at: now - config.lastSeenSecsAgo,
           },
   };
@@ -113,14 +119,14 @@ export async function handleMockHostCommand(
     case "get_host_install_info": {
       // Mirrors commands/hosts.rs: the installer is served by the community
       // relay itself, under /host on the relay's http(s) origin.
-      const uri = String(args.pairingUri ?? "");
+      const uri = args.pairingUri ? String(args.pairingUri) : "";
       const base = `${new URL(ctx.relayUrl.replace(/^ws/, "http")).origin}/host`;
+      const pair = uri ? ` --uri '${uri}'` : "";
       return {
         handled: true,
         value: {
           base_url: base,
-          command: `curl -fsSL '${base}/install.sh' | bash -s -- --base '${base}' --uri '${uri}'`,
-          up_command: `buzz host up --uri '${uri}'`,
+          command: `curl -fsSL '${base}/install.sh' | bash -s -- --base '${base}'${pair}`,
           session_ttl_secs: 130,
         },
       };

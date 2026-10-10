@@ -161,9 +161,8 @@ test("add machine: install command, code, approve sends the grant", async ({
   );
   await expect(install).not.toContainText("--relay");
   await expect(install).not.toContainText("example.invalid");
-  await expect(dialog.getByTestId("add-machine-up-command")).toHaveText(
-    /^buzz host up --uri 'nostrpair:\/\/[^']+'$/,
-  );
+  // Exactly one line to paste: no second "already installed" command.
+  await expect(dialog.getByTestId("add-machine-up-command")).toHaveCount(0);
   // The commands carry the URI of the session this dialog started.
   const [pairingUri] = (await commandPayloads(page, "get_host_install_info"))
     .map((payload) => (payload as { pairingUri?: string }).pairingUri)
@@ -224,6 +223,50 @@ test("add machine: install command, code, approve sends the grant", async ({
   await expect(
     page.getByRole("menu").getByRole("menuitemradio", { name: /charlie-vm/ }),
   ).toBeVisible();
+});
+
+test("a machine missing the Claude adapter says so, with the snippet, before any deploy", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    agentHosts: [
+      { ...HOSTS[0], lastSeenSecsAgo: 5, missingClaudeAdapter: true },
+      { ...HOSTS[1], online: true, lastSeenSecsAgo: 5 },
+    ],
+  });
+  const { dialog, menu } = await openRunOnMenu(page);
+  const alpha = menu.getByRole("menuitemradio", { name: /alpha-box/ });
+  await expect(alpha).toContainText(
+    "Missing Claude adapter — re-run the install snippet",
+  );
+  await expect(
+    menu.getByRole("menuitemradio", { name: /bravo-mac/ }),
+  ).not.toContainText("Missing");
+  await alpha.click();
+  const notice = dialog.getByTestId("where-to-run-host-setup");
+  await expect(notice).toContainText(
+    "Missing Claude adapter — re-run the install snippet",
+  );
+  // The repair line: the install snippet without a pairing code.
+  await expect(
+    notice.getByTestId("where-to-run-host-setup-command"),
+  ).toHaveText(
+    /^curl -fsSL 'https?:\/\/[^/']+\/host\/install\.sh' \| bash -s -- --base 'https?:\/\/[^/']+\/host'$/,
+  );
+  await expect(
+    notice.getByRole("button", { name: "Copy install snippet" }),
+  ).toBeVisible();
+  expect(await commandPayloads(page, "deploy_to_host")).toHaveLength(0);
+
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  await page.getByTestId("open-settings").click();
+  await page.getByTestId("profile-popover-settings").click();
+  await page.getByTestId("settings-nav-agents").click();
+  const machines = page.getByTestId("settings-machines");
+  await expect(machines.getByTestId(`machine-setup-${ALPHA}`)).toContainText(
+    "Missing Claude adapter — re-run the install snippet",
+  );
+  await expect(machines.getByTestId(`machine-setup-${BRAVO}`)).toHaveCount(0);
 });
 
 test("settings machines list and forget machine", async ({ page }) => {

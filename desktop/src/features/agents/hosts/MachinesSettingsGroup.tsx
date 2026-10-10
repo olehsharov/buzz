@@ -23,8 +23,10 @@ import { AddMachineDialog } from "./AddMachineDialog";
 import {
   describeHost,
   describeHostClaude,
+  describeHostSetupProblem,
   hostAvailability,
 } from "./hostRunOptions";
+import { HostRepairNotice } from "./HostRepairNotice";
 import {
   useAgentHostsWithPresence,
   useForgetHostMutation,
@@ -105,6 +107,7 @@ export function MachinesSettingsGroup() {
               host.pubkey,
             );
             const onHost = agentsOn(host);
+            const setupProblem = describeHostSetupProblem(host.status);
             return (
               <li data-testid={`machine-row-${host.pubkey}`} key={host.pubkey}>
                 <SettingsOptionRow>
@@ -130,6 +133,14 @@ export function MachinesSettingsGroup() {
                           ? "No agents"
                           : `Agents: ${onHost.map((agent) => agent.name).join(", ")}`}
                       </p>
+                      {setupProblem ? (
+                        <div className="pt-1.5">
+                          <HostRepairNotice
+                            message={setupProblem}
+                            testId={`machine-setup-${host.pubkey}`}
+                          />
+                        </div>
+                      ) : null}
                     </div>
                   </div>
                   <Button

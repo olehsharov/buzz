@@ -41,42 +41,42 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-/// The one command shown in "Add machine": download the installer from the
-/// relay, install `buzz host`, then pair with `pairing_uri`. It never passes
-/// `--relay` — that would override the pairing relay in the URI.
-/// The machine names itself (its hostname) unless the user passes `--name`.
-pub(crate) fn host_install_command(base: &str, pairing_uri: &str) -> String {
-    format!(
-        "curl -fsSL {} | bash -s -- --base {} --uri {}",
+/// The one line shown in "Add machine": download the installer from the
+/// relay, install `buzz host` and everything a Claude agent needs, then pair
+/// with `pairing_uri`. Without a URI it is the repair line for an already
+/// paired machine (upgrade, reinstall tools, restart the daemon). It never
+/// passes `--relay`, which would override the pairing relay in the URI.
+/// The machine names itself (its hostname) unless the user adds `--name`.
+pub(crate) fn host_install_command(base: &str, pairing_uri: Option<&str>) -> String {
+    let mut command = format!(
+        "curl -fsSL {} | bash -s -- --base {}",
         shell_quote(&format!("{base}/install.sh")),
         shell_quote(base),
-        shell_quote(pairing_uri),
-    )
-}
-
-/// For machines that already have `buzz host`.
-pub(crate) fn host_up_command(pairing_uri: &str) -> String {
-    format!("buzz host up --uri {}", shell_quote(pairing_uri))
+    );
+    if let Some(uri) = pairing_uri.filter(|uri| !uri.is_empty()) {
+        command.push_str(" --uri ");
+        command.push_str(&shell_quote(uri));
+    }
+    command
 }
 
 #[derive(serde::Serialize)]
 pub struct HostInstallInfo {
     pub base_url: String,
     pub command: String,
-    pub up_command: String,
     pub session_ttl_secs: u64,
 }
 
-/// The "Add machine" commands for one pairing session.
+/// The install line for one pairing session, or (no `pairing_uri`) the
+/// repair line for machines that are already paired.
 #[tauri::command]
 pub fn get_host_install_info(
     relay: crate::window_relay::WindowRelay,
-    pairing_uri: String,
+    pairing_uri: Option<String>,
 ) -> HostInstallInfo {
     let base_url = host_install_base(&community_relay(&relay));
     HostInstallInfo {
-        command: host_install_command(&base_url, &pairing_uri),
-        up_command: host_up_command(&pairing_uri),
+        command: host_install_command(&base_url, pairing_uri.as_deref()),
         base_url,
         session_ttl_secs: super::pairing::PAIRING_SESSION_TIMEOUT.as_secs(),
     }
@@ -274,7 +274,7 @@ pub(crate) fn summary_for(
 
 #[cfg(test)]
 mod tests {
-    use super::{host_install_base, host_install_command, host_up_command};
+    use super::{host_install_base, host_install_command};
 
     const URI: &str = "nostrpair://abc?relay=wss%3A%2F%2Fpair.example&secret=s&v=1";
 
@@ -302,27 +302,32 @@ mod tests {
     #[test]
     fn install_command_is_one_bash_pipeline_from_the_relay() {
         let base = host_install_base("wss://buzz.example");
+        let command = host_install_command(&base, Some(URI));
         assert_eq!(
-            host_install_command(&base, URI),
+            command,
             format!(
                 "curl -fsSL 'https://buzz.example/host/install.sh' | bash -s -- \
                  --base 'https://buzz.example/host' --uri '{URI}'"
             )
         );
-        let command = host_install_command(&base, URI);
         assert!(!command.contains("--relay"), "{command}");
         assert!(!command.contains("| sh "), "{command}");
+        assert!(!command.contains('\n'), "one line: {command}");
+    }
+
+    #[test]
+    fn repair_command_is_the_same_line_without_a_uri() {
+        let base = host_install_base("wss://buzz.example");
+        let expected = "curl -fsSL 'https://buzz.example/host/install.sh' | bash -s -- \
+                        --base 'https://buzz.example/host'";
+        assert_eq!(host_install_command(&base, None), expected);
+        assert_eq!(host_install_command(&base, Some("")), expected);
     }
 
     #[test]
     fn commands_quote_hostile_values() {
         let hostile = "x'; rm -rf ~";
-        assert!(
-            host_install_command("https://r/host", hostile).ends_with(r"--uri 'x'\''; rm -rf ~'")
-        );
-        assert_eq!(
-            host_up_command(hostile),
-            r"buzz host up --uri 'x'\''; rm -rf ~'"
-        );
+        assert!(host_install_command("https://r/host", Some(hostile))
+            .ends_with(r"--uri 'x'\''; rm -rf ~'"));
     }
 }

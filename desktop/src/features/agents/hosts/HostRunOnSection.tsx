@@ -8,8 +8,10 @@ import { hostPubkeyFromRunOn } from "../ui/whereToRunIntent";
 import {
   buildHostRunOnOptions,
   describeHost,
+  describeHostSetupProblem,
   hostAvailability,
 } from "./hostRunOptions";
+import { HostDeployError, HostRepairNotice } from "./HostRepairNotice";
 import { HostWorkdirField } from "./HostWorkdirField";
 import {
   useAgentHostsWithPresence,
@@ -54,6 +56,7 @@ export function HostRunOnSection({
     (host) => normalizePubkey(host.pubkey) === normalizePubkey(hostPubkey),
   );
   const availability = hostAvailability(presence, presenceLoaded, hostPubkey);
+  const setupProblem = describeHostSetupProblem(current?.status ?? null);
   const moveOptions = buildHostRunOnOptions(
     hosts.filter((host) => host !== current),
     presence,
@@ -94,6 +97,12 @@ export function HostRunOnSection({
             <p className="text-xs text-muted-foreground">
               {describeHost(current, availability, now)}
             </p>
+          ) : null}
+          {setupProblem ? (
+            <HostRepairNotice
+              message={setupProblem}
+              testId="edit-agent-run-on-setup"
+            />
           ) : null}
           <p
             className="break-all text-xs text-muted-foreground"
@@ -140,9 +149,10 @@ export function HostRunOnSection({
             </Button>
           </HostWorkdirField>
           {setWorkdir.error ? (
-            <p className="text-xs text-destructive" role="alert">
-              {errorText(setWorkdir.error)}
-            </p>
+            <HostDeployError
+              message={errorText(setWorkdir.error)}
+              testId="edit-agent-host-workdir-error"
+            />
           ) : null}
         </div>
       ) : null}
@@ -182,9 +192,10 @@ export function HostRunOnSection({
             </Button>
           </div>
           {deploy.error ? (
-            <p className="text-xs text-destructive" role="alert">
-              {errorText(deploy.error)}
-            </p>
+            <HostDeployError
+              message={errorText(deploy.error)}
+              testId="edit-agent-move-host-error"
+            />
           ) : null}
         </div>
       ) : null}

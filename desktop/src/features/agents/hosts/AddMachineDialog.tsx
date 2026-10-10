@@ -87,7 +87,7 @@ export function AddMachineDialog({
     step.kind === "waiting" || step.kind === "sas" ? step.startedAt : null;
   const installQuery = useQuery({
     queryKey: ["agent-host-install-info", pairingUri],
-    queryFn: () => getHostInstallInfo(pairingUri ?? ""),
+    queryFn: () => getHostInstallInfo(pairingUri),
     enabled: open && pairingUri !== null,
   });
   const install = pairingUri ? installQuery.data : undefined;
@@ -256,21 +256,10 @@ export function AddMachineDialog({
                     />
                   </div>
                   <p className="text-xs text-muted-foreground">
-                    Already installed? Run
+                    Linux or macOS. It installs everything agents need (Node,
+                    Claude Code), pairs, and starts in the background. Safe to
+                    re-run on a machine that already has it.
                   </p>
-                  <div className="flex items-start gap-2">
-                    <code
-                      className="min-w-0 flex-1 break-all rounded-xl bg-muted/50 px-3 py-1.5 font-mono text-xs text-muted-foreground"
-                      data-testid="add-machine-up-command"
-                    >
-                      {install.upCommand}
-                    </code>
-                    <CopyButton
-                      iconOnly
-                      label="Copy buzz host up command"
-                      value={install.upCommand}
-                    />
-                  </div>
                 </>
               ) : (
                 <p className="flex items-center gap-2 text-muted-foreground">
